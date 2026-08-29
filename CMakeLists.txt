@@ -148,3 +148,23 @@ add_test(NAME static_import_cases
           $<TARGET_FILE:rs2_static_import_harness>
           $<TARGET_FILE:rs2_faultrep_bootstrap>
           $<TARGET_FILE:rs2_server_fix_companion>)
+
+add_executable(rs2_deployment_preflight
+  tools/deployment_preflight.cpp
+  tools/pe_reader.cpp)
+rs2_configure_target(rs2_deployment_preflight)
+target_include_directories(rs2_deployment_preflight PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+
+add_executable(rs2_preflight_fixture_test
+  tests/preflight_fixture_test.cpp)
+rs2_configure_target(rs2_preflight_fixture_test)
+add_dependencies(
+  rs2_preflight_fixture_test
+  rs2_deployment_preflight
+  rs2_static_import_harness)
+
+add_test(NAME preflight_fixture
+  COMMAND rs2_preflight_fixture_test
+          $<TARGET_FILE:rs2_deployment_preflight>
+          $<TARGET_FILE:rs2_static_import_harness>)
