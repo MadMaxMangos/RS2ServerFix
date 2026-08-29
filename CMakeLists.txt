@@ -92,3 +92,19 @@ if(BUILD_TESTING)
 endif()
 
 add_test(NAME core COMMAND rs2_core_tests)
+
+add_executable(rs2_pe_contract
+  tools/pe_contract.cpp
+  tools/pe_reader.cpp)
+rs2_configure_target(rs2_pe_contract)
+target_include_directories(rs2_pe_contract PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+
+add_test(NAME pe_bootstrap_contract
+  COMMAND rs2_pe_contract
+          bootstrap
+          $<TARGET_FILE:rs2_faultrep_bootstrap>)
+add_test(NAME pe_companion_contract
+  COMMAND rs2_pe_contract
+          companion
+          $<TARGET_FILE:rs2_server_fix_companion>)
