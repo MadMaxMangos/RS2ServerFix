@@ -1,1 +1,5 @@
 /.worktrees/
+/build*/
+*.suo
+*.user
+RS2ServerFix.loader.*.log
