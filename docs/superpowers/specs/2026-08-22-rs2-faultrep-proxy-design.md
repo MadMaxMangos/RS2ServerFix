@@ -19,6 +19,11 @@ The proof establishes a reversible loader for a later ADF crash mitigation. Stag
 - Preserved pre-full-dump baseline SHA-256:
   `5820F0DA82D7C2903DE31E0865320D9E70A0BF74F78F83C83DB4F9DEEAEB1DEF`
 - The only functional difference between those executables is the dump-type byte at file offset `0x00a6a313` changing from `0x40` to `0x42`; the other changed byte, at `0x000001e1`, is the PE checksum.
+- Newly shipped/current stock executable SHA-256, copied from another VM and locally labelled PR3:
+  `F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3`
+- Full-dump-modified copy of that current executable SHA-256:
+  `0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393`
+- Those current-build files likewise differ only at file offset `0x00a6bb43` (`0x40` to `0x42`) plus the PE checksum byte at `0x000001e1` (`0xf7` to `0xf9`).
 - The preserved PR1 executable is AMD64 and imports `ReportFault` from `faultrep.dll` by name.
 - The PR1 crash dump captured `Faultrep.dll` loaded from the operating-system `System32` directory.
 - `faultrep.dll` was not listed under KnownDLLs on the examined host. This is host-specific and must be rechecked by the static-import test on the disposable target.
@@ -34,7 +39,7 @@ The proof establishes a reversible loader for a later ADF crash mitigation. Stag
 
 - The examined Windows 11 System32 DLL exports `ReportFault` by name at ordinal 13. The host imports by name, so the name is the required contract and the ordinal is a separately checked compatibility detail.
 
-The patched PR1 executable was no longer present in the former analysis directory at the time of this revision. The preserved baseline remains available. Tests may construct a temporary derived copy from the baseline using the two verified byte changes above and must verify that the result has the crash-producing SHA-256. The baseline itself must never be edited.
+The patched PR1 executable was no longer present in the former analysis directory at the time of this revision. The preserved baseline remains available. Tests may construct a temporary derived copy from the baseline using the two verified byte changes above and must verify that the result has the crash-producing SHA-256. The baseline itself must never be edited. Both current-build files are present under `D:\Documents\RisingStorm2\Binaries`; their PR3 filenames are local analysis labels, not different game editions.
 
 ## Design constraints from Windows behavior
 
@@ -64,7 +69,7 @@ Stage 0 delivers:
 2. A single public export, `ReportFault`, with the documented ABI.
 3. Worker-only resolution and validation of genuine `System32\faultrep.dll!ReportFault`.
 4. Crash-path forwarding through one atomically published function pointer.
-5. SHA-256 host identification with four explicit classifications.
+5. SHA-256 host identification with explicit historical/current build identities and fail-closed unknown states.
 6. Privacy-minimal marker and debug-milestone diagnostics.
 7. Unit, integration, static-import, PE-contract, and deployment-preflight tests.
 8. Manual disposable-server smoke-test and rollback instructions.
@@ -187,8 +192,9 @@ The worker:
 6. obtains the actual candidate path with `GetModuleFileNameW`;
 7. opens the expected System32 file and candidate file for attributes using all three share flags and compares volume serial plus file index, avoiding case, junction, short-name, and prefix-sensitive string identity;
 8. resolves `ReportFault` by name with `GetProcAddress`;
-9. uses `VirtualQuery` on the returned address and rejects it if the allocation base is `g_selfModule`;
-10. atomically publishes the pointer only after every validation succeeds.
+9. rejects a null `GetProcAddress` result;
+10. uses `VirtualQuery` on the returned address and rejects it if `VirtualQuery` fails or the allocation base is `g_selfModule`;
+11. atomically publishes the pointer only after every validation succeeds.
 
 No code path uses name-only `LoadLibraryW(L"faultrep.dll")` or `GetModuleHandleW(L"faultrep.dll")` to find the genuine module. The candidate module path may be recorded as the constant classification `system32` but is not copied verbatim into the marker.
 
@@ -206,7 +212,7 @@ The exported function:
 
 The forwarder performs no lazy initialization, loader call, allocation, lock, logging, file access, hash work, exception swallowing, or retry. It does not promise a compiler tail call; behavioral ABI fidelity is the requirement. On x64, both parameters and the return value must pass unchanged under the platform calling convention.
 
-### Host hashing and classification
+### Host hashing and build identity
 
 After reporter publication, the worker:
 
@@ -220,14 +226,16 @@ After reporter publication, the worker:
 
 The soft budget cannot interrupt a blocked `ReadFile`; it only prevents continued work after control returns. The target executable is approximately 24 MB, so exceeding the budget is diagnostic rather than expected.
 
-Classifications are distinct:
+Build identities are distinct:
 
-- `supported`: exact crash-producing full-dump PR1 hash;
-- `known-baseline`: exact preserved pre-full-dump PR1 hash;
-- `unsupported`: hashing succeeded but the digest is neither known value;
+- `pr1-crash-full-dump`: exact historical crash-producing PR1 hash;
+- `pr1-stock-baseline`: exact preserved pre-full-dump PR1 hash;
+- `current-stock`: exact newly shipped/current stock hash;
+- `current-full-dump`: exact full-dump-modified current hash;
+- `unknown`: hashing succeeded but the digest is not a known build;
 - `indeterminate`: path, file, size, CNG, read, or time-budget failure prevented a verified digest.
 
-Only `supported` may ever enable a later-stage patch. Stage 0 performs no patch for any classification.
+These values identify builds; they do not grant patch compatibility. Stage 0 performs no patch for any identity. A later ADF stage must independently analyze the newly shipped executable and declare the exact eligible hash; it must not inherit eligibility from the historical PR1 result.
 
 ### Diagnostics and marker
 
@@ -253,7 +261,7 @@ Marker schema version 1 contains only:
 - process ID;
 - executable leaf filename and size;
 - SHA-256 when available;
-- one of the four host classifications;
+- one of the six host build identities;
 - proxy leaf filename and whether it is in the executable directory;
 - resolver status code;
 - genuine module classification (`system32` or `unavailable`);
@@ -273,11 +281,11 @@ If both marker locations fail, debug milestones remain the only diagnostic. If n
 | Worker creation | Process continues; target stays null; no marker is possible; `ReportFault` returns `frrvErrNoDW`. |
 | Genuine DLL load/identity/export | Leave target null permanently; record reason when worker diagnostics are available. |
 | Early `ReportFault` | Return `frrvErrNoDW` immediately; never attempt initialization. |
-| Hash/path/read/CNG/time | Classify `indeterminate`; forwarding result is unaffected. |
-| Unknown digest | Classify `unsupported`; forwarding result is unaffected. |
+| Hash/path/read/CNG/time | Identify as `indeterminate`; forwarding result is unaffected. |
+| Unknown digest | Identify as `unknown`; forwarding result is unaffected. |
 | Primary marker write | Attempt temporary-directory fallback once. |
 | Both marker writes | Emit debug failure milestone and exit worker. |
-| Process termination | No detach cleanup or wait; operating system tears down retained handles/mappings. |
+| Process termination | No detach cleanup or wait; operating system tears down retained handles/mappings. Exit may briefly wait if the worker is already inside an in-flight loader operation. |
 
 No proxy-controlled failure shows UI, performs network access, edits the executable, calls `ReportFault` recursively, or attempts to repair state.
 
@@ -287,14 +295,14 @@ Implementation proceeds test-first. Tests use fresh temporary directories and ne
 
 ### Unit tests
 
-1. **Hash classification:** exact supported, known-baseline, arbitrary unknown, and indeterminate cases remain distinct.
+1. **Build identity:** the four exact historical/current hashes, arbitrary unknown, and indeterminate cases remain distinct.
 2. **SHA-256:** a fixed small file and the preserved baseline produce expected digests.
-3. **Derived supported fixture:** copy the baseline to a temporary file, apply only the two verified byte changes, verify the resulting supported SHA-256, and delete the temporary copy. Never alter the baseline.
+3. **Derived full-dump fixtures:** copy each stock executable to a temporary file, apply only its two verified byte changes, verify the corresponding full-dump SHA-256, and delete the temporary copy. Never alter either stock input.
 4. **Path bounds:** System32, host, marker, and oversized/truncated path cases fail closed without buffer overrun.
 5. **File identity:** identical file, alternate path to the same file, and different file exercise volume/file-index comparison.
 6. **Resolver validation:** self `HMODULE`, self allocation base, missing export, wrong file identity, and genuine success paths leave/publish the pointer as required.
 7. **Marker schema/privacy:** required fields, terminal completion record, primary/fallback errors, no full paths, no `\Users\` fragment, and no environment expansion.
-8. **No patch behavior:** every Stage 0 classification leaves game code/data untouched.
+8. **No patch behavior:** every Stage 0 build identity leaves game code/data untouched.
 
 ### Built-PE contract test
 
@@ -380,7 +388,7 @@ Stage 0 succeeds only when current evidence proves all of the following:
 - unit, PE-contract, and static-import tests pass on AMD64;
 - the static-import control loads System32, the proxy case loads locally and validates System32 forwarding, and rollback returns to System32;
 - `ReportFault` contains no lazy initialization path;
-- supported/baseline/unsupported/indeterminate classifications are verified;
+- all four known build identities plus unknown and indeterminate states are verified;
 - the exact deployment tree contains no incompatible importer;
 - a disposable server starts, initializes its normal services, stops, and restarts after removal;
 - pre/post hashes prove no existing executable, configuration, `dbghelp.dll`, or shipped DLL changed;
