@@ -16,6 +16,13 @@ offline suite:
 - `faultrep.dll` — bootstrap and `ReportFault` forwarder.
 - `RS2ServerFix.dll` — passive Stage 0 companion and marker writer.
 
+Final offline-verified Release SHA-256 values:
+
+```text
+faultrep.dll     C4213202671F6E31031A828FD7C375DA6966E7F0C0B750211975BCC6110777B6
+RS2ServerFix.dll FF8CE4E5BA9E90FAE0E204132AC692CEF45C0C3D445FB8E88D92976CFDDC17B2
+```
+
 Do not rename, rebuild, edit, sign, compress, or substitute either file between
 offline verification and this test. Record their hashes before continuing:
 
