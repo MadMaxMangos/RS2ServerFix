@@ -13,6 +13,11 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 include(CTest)
 
+set(RS2_PR1_BASELINE_PATH "" CACHE FILEPATH
+  "Preserved PR1 stock executable used by verification tests")
+set(RS2_CURRENT_STOCK_PATH "" CACHE FILEPATH
+  "Current stock executable used by verification tests")
+
 function(rs2_configure_target target)
   target_compile_definitions(${target} PRIVATE
     UNICODE
@@ -29,7 +34,21 @@ endfunction()
 
 add_executable(rs2_core_tests
   src/companion/build_identity.cpp
+  src/companion/marker.cpp
+  src/companion/sha256.cpp
   tests/core_tests.cpp)
 rs2_configure_target(rs2_core_tests)
+target_link_libraries(rs2_core_tests PRIVATE bcrypt)
+
+if(BUILD_TESTING)
+  if(RS2_PR1_BASELINE_PATH STREQUAL "" OR
+     RS2_CURRENT_STOCK_PATH STREQUAL "")
+    message(FATAL_ERROR
+      "BUILD_TESTING requires RS2_PR1_BASELINE_PATH and RS2_CURRENT_STOCK_PATH")
+  endif()
+  target_compile_definitions(rs2_core_tests PRIVATE
+    RS2_PR1_BASELINE_PATH=L\"${RS2_PR1_BASELINE_PATH}\"
+    RS2_CURRENT_STOCK_PATH=L\"${RS2_CURRENT_STOCK_PATH}\")
+endif()
 
 add_test(NAME core COMMAND rs2_core_tests)
