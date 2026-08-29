@@ -194,6 +194,11 @@ The one worker performs a non-retrying sequence:
 
 Publishing genuine forwarding precedes all companion work. No companion failure causes a retry or clears a published genuine pointer.
 
+The 32,768-character path and marker scratch workspaces are obtained with
+`VirtualAlloc` only on the bootstrap worker/companion initializer and released
+before return. They are never placed in the host thread's stack frame and are
+never touched by exported `ReportFault`.
+
 ### Genuine reporter resolution
 
 The worker:

@@ -5,6 +5,11 @@
 namespace rs2fix {
 namespace {
 
+struct CompanionLoaderWorkspace {
+    wchar_t expectedPath[kPathCapacity];
+    wchar_t candidatePath[kPathCapacity];
+};
+
 DWORD CompanionValidationError(
     const CompanionLoadStatus status) noexcept {
     switch (status) {
@@ -82,21 +87,35 @@ bool BuildCompanionPath(
         return false;
     }
 
-    wchar_t bootstrapPath[kPathCapacity]{};
-    wchar_t directory[kPathCapacity]{};
-    wchar_t leaf[260]{};
     DWORD localError = ERROR_SUCCESS;
     if (!GetBoundedModulePath(
-            bootstrap, bootstrapPath, kPathCapacity, &localError) ||
-        !ExtractDirectoryAndLeaf(
-            bootstrapPath,
-            directory,
-            kPathCapacity,
-            leaf,
-            260,
-            &localError) ||
-        !AppendPathLeaf(
-            directory,
+            bootstrap, output, capacity, &localError)) {
+        if (error != nullptr) {
+            *error = localError;
+        }
+        return false;
+    }
+
+    const std::size_t length = wcsnlen_s(output, capacity);
+    std::size_t separator = length;
+    while (separator != 0) {
+        --separator;
+        if (output[separator] == L'\\' || output[separator] == L'/') {
+            break;
+        }
+    }
+    if (length == 0 || length >= capacity ||
+        (output[separator] != L'\\' && output[separator] != L'/') ||
+        separator + 1 >= length) {
+        output[0] = L'\0';
+        if (error != nullptr) {
+            *error = ERROR_INVALID_NAME;
+        }
+        return false;
+    }
+    output[separator] = L'\0';
+    if (!AppendPathLeaf(
+            output,
             L"RS2ServerFix.dll",
             output,
             capacity,
@@ -123,24 +142,40 @@ CompanionLoadResult LoadAndInitializeCompanion(
         return result;
     }
 
-    wchar_t expectedPath[kPathCapacity]{};
+    auto* workspace = static_cast<CompanionLoaderWorkspace*>(VirtualAlloc(
+        nullptr,
+        sizeof(CompanionLoaderWorkspace),
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE));
+    if (workspace == nullptr) {
+        result.status = CompanionLoadStatus::PathFailed;
+        result.win32Error = ERROR_NOT_ENOUGH_MEMORY;
+        return result;
+    }
+
     DWORD localError = ERROR_SUCCESS;
     if (!BuildCompanionPath(
-            bootstrap, expectedPath, kPathCapacity, &localError)) {
+            bootstrap,
+            workspace->expectedPath,
+            kPathCapacity,
+            &localError)) {
         result.status = CompanionLoadStatus::PathFailed;
         result.win32Error = localError;
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
     HMODULE candidate = LoadLibraryExW(
-        expectedPath, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        workspace->expectedPath,
+        nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (candidate == nullptr) {
         result.status = CompanionLoadStatus::LoadFailed;
         result.win32Error = GetLastError();
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
-    wchar_t candidatePath[kPathCapacity]{};
     FileIdentity expectedIdentity{};
     FileIdentity candidateIdentity{};
     FARPROC initializer = nullptr;
@@ -148,19 +183,28 @@ CompanionLoadResult LoadAndInitializeCompanion(
     bool queried = false;
 
     if (!GetBoundedModulePath(
-            candidate, candidatePath, kPathCapacity, &localError)) {
+            candidate,
+            workspace->candidatePath,
+            kPathCapacity,
+            &localError)) {
         result.status = CompanionLoadStatus::CandidatePathFailed;
         result.win32Error = localError;
         FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
     if (!QueryFileIdentity(
-            expectedPath, &expectedIdentity, &localError) ||
+            workspace->expectedPath,
+            &expectedIdentity,
+            &localError) ||
         !QueryFileIdentity(
-            candidatePath, &candidateIdentity, &localError)) {
+            workspace->candidatePath,
+            &candidateIdentity,
+            &localError)) {
         result.status = CompanionLoadStatus::FileIdentityFailed;
         result.win32Error = localError;
         FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
@@ -193,10 +237,19 @@ CompanionLoadResult LoadAndInitializeCompanion(
             ? localError
             : CompanionValidationError(validation);
         FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
+    if (initializer == nullptr) {
+        result.status = CompanionLoadStatus::ExportMissing;
+        result.win32Error = ERROR_PROC_NOT_FOUND;
+        FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
+        return result;
+    }
     const auto initialize = reinterpret_cast<InitializeV1Fn>(initializer);
+    VirtualFree(workspace, 0, MEM_RELEASE);
     result.initializeResult = initialize(&context);
     result.module = candidate;
     result.status =

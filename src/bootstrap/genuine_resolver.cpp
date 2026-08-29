@@ -5,6 +5,11 @@
 namespace rs2fix {
 namespace {
 
+struct GenuineResolverWorkspace {
+    wchar_t expectedPath[kPathCapacity];
+    wchar_t candidatePath[kPathCapacity];
+};
+
 DWORD ValidationError(const GenuineResolverStatus status) noexcept {
     switch (status) {
     case GenuineResolverStatus::Ok:
@@ -63,24 +68,39 @@ GenuineResolverStatus ValidateGenuineEvidence(
 GenuineResolverResult ResolveGenuineReportFault(
     HMODULE bootstrap) noexcept {
     GenuineResolverResult result{};
-    wchar_t expectedPath[kPathCapacity]{};
+    auto* workspace = static_cast<GenuineResolverWorkspace*>(VirtualAlloc(
+        nullptr,
+        sizeof(GenuineResolverWorkspace),
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE));
+    if (workspace == nullptr) {
+        result.status = GenuineResolverStatus::SystemPathFailed;
+        result.win32Error = ERROR_NOT_ENOUGH_MEMORY;
+        return result;
+    }
+
     DWORD localError = ERROR_SUCCESS;
     if (!BuildSystemFaultrepPath(
-            expectedPath, kPathCapacity, &localError)) {
+            workspace->expectedPath,
+            kPathCapacity,
+            &localError)) {
         result.status = GenuineResolverStatus::SystemPathFailed;
         result.win32Error = localError;
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
     HMODULE candidate = LoadLibraryExW(
-        expectedPath, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        workspace->expectedPath,
+        nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (candidate == nullptr) {
         result.status = GenuineResolverStatus::LoadFailed;
         result.win32Error = GetLastError();
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
-    wchar_t candidatePath[kPathCapacity]{};
     FileIdentity expectedIdentity{};
     FileIdentity candidateIdentity{};
     FARPROC function = nullptr;
@@ -88,19 +108,28 @@ GenuineResolverResult ResolveGenuineReportFault(
     bool queried = false;
 
     if (!GetBoundedModulePath(
-            candidate, candidatePath, kPathCapacity, &localError)) {
+            candidate,
+            workspace->candidatePath,
+            kPathCapacity,
+            &localError)) {
         result.status = GenuineResolverStatus::CandidatePathFailed;
         result.win32Error = localError;
         FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
     if (!QueryFileIdentity(
-            expectedPath, &expectedIdentity, &localError) ||
+            workspace->expectedPath,
+            &expectedIdentity,
+            &localError) ||
         !QueryFileIdentity(
-            candidatePath, &candidateIdentity, &localError)) {
+            workspace->candidatePath,
+            &candidateIdentity,
+            &localError)) {
         result.status = GenuineResolverStatus::FileIdentityFailed;
         result.win32Error = localError;
         FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
@@ -131,6 +160,7 @@ GenuineResolverResult ResolveGenuineReportFault(
             ? localError
             : ValidationError(status);
         FreeLibrary(candidate);
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return result;
     }
 
@@ -138,6 +168,7 @@ GenuineResolverResult ResolveGenuineReportFault(
     result.function = reinterpret_cast<ReportFaultFn>(function);
     result.status = GenuineResolverStatus::Ok;
     result.win32Error = ERROR_SUCCESS;
+    VirtualFree(workspace, 0, MEM_RELEASE);
     return result;
 }
 

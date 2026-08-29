@@ -42,8 +42,8 @@ DWORD WINAPI BootstrapWorker(void* parameter) noexcept {
 } // namespace
 
 extern "C" EFaultRepRetVal APIENTRY ReportFault(
-    LPEXCEPTION_POINTERS pointers,
-    const DWORD options) {
+    _In_ LPEXCEPTION_POINTERS pointers,
+    _In_ const DWORD options) {
     const auto function = reinterpret_cast<rs2fix::ReportFaultFn>(
         InterlockedCompareExchangePointer(
             &g_reportFault, nullptr, nullptr));

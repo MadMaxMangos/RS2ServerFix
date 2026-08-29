@@ -13,6 +13,17 @@
 namespace rs2fix {
 namespace {
 
+struct InitializationWorkspace {
+    wchar_t executablePath[kPathCapacity];
+    wchar_t executableDirectory[kPathCapacity];
+    wchar_t bootstrapDirectory[kPathCapacity];
+    wchar_t companionDirectory[kPathCapacity];
+    wchar_t fallbackDirectory[kPathCapacity];
+    wchar_t executableLeaf[260];
+    wchar_t scratchLeaf[260];
+    MarkerWriteResult markerWrite;
+};
+
 DWORD FinishInitialization(
     LONG volatile* state,
     const DWORD result) noexcept {
@@ -25,16 +36,53 @@ bool GetModuleDirectory(
     wchar_t* directory,
     wchar_t* leaf,
     DWORD* error) noexcept {
-    wchar_t path[kPathCapacity]{};
-    return GetBoundedModulePath(
-               module, path, kPathCapacity, error) &&
-           ExtractDirectoryAndLeaf(
-               path,
-               directory,
-               kPathCapacity,
-               leaf,
-               260,
-               error);
+    if (directory == nullptr || leaf == nullptr) {
+        if (error != nullptr) {
+            *error = ERROR_INVALID_PARAMETER;
+        }
+        return false;
+    }
+    if (!GetBoundedModulePath(
+            module, directory, kPathCapacity, error)) {
+        return false;
+    }
+
+    const std::size_t length = wcsnlen_s(directory, kPathCapacity);
+    std::size_t separator = length;
+    while (separator != 0) {
+        --separator;
+        if (directory[separator] == L'\\' ||
+            directory[separator] == L'/') {
+            break;
+        }
+    }
+    if (length == 0 || length >= kPathCapacity ||
+        (directory[separator] != L'\\' &&
+         directory[separator] != L'/') ||
+        separator + 1 >= length) {
+        directory[0] = L'\0';
+        leaf[0] = L'\0';
+        if (error != nullptr) {
+            *error = ERROR_INVALID_NAME;
+        }
+        return false;
+    }
+    const std::size_t leafLength = length - separator - 1;
+    if (leafLength >= 260) {
+        directory[0] = L'\0';
+        leaf[0] = L'\0';
+        if (error != nullptr) {
+            *error = ERROR_INSUFFICIENT_BUFFER;
+        }
+        return false;
+    }
+    std::wmemcpy(leaf, directory + separator + 1, leafLength);
+    leaf[leafLength] = L'\0';
+    directory[separator] = L'\0';
+    if (error != nullptr) {
+        *error = ERROR_SUCCESS;
+    }
+    return true;
 }
 
 HMODULE ModuleFromInitializerAddress() noexcept {
@@ -110,47 +158,51 @@ DWORD RunCompanionInitialization(
 
     OutputDebugStringW(L"[RS2ServerFix] companion-start\n");
 
-    wchar_t executablePath[kPathCapacity]{};
-    wchar_t executableDirectory[kPathCapacity]{};
-    wchar_t executableLeaf[260]{};
+    auto* workspace = static_cast<InitializationWorkspace*>(VirtualAlloc(
+        nullptr,
+        sizeof(InitializationWorkspace),
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE));
+    if (workspace == nullptr) {
+        OutputDebugStringW(L"[RS2ServerFix] workspace-allocation-failed\n");
+        return FinishInitialization(state, kInitHostIdentityFailed);
+    }
+
     DWORD error = ERROR_SUCCESS;
     if (!GetBoundedModulePath(
             context.hostModule,
-            executablePath,
+            workspace->executablePath,
             kPathCapacity,
             &error) ||
         !ExtractDirectoryAndLeaf(
-            executablePath,
-            executableDirectory,
+            workspace->executablePath,
+            workspace->executableDirectory,
             kPathCapacity,
-            executableLeaf,
+            workspace->executableLeaf,
             260,
             &error)) {
         OutputDebugStringW(L"[RS2ServerFix] host-path-failed\n");
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return FinishInitialization(state, kInitHostIdentityFailed);
     }
 
     const FileHashResult hash = HashFileSha256(
-        executablePath, GetTickCount64() + 10000);
+        workspace->executablePath, GetTickCount64() + 10000);
     const BuildIdentity identity =
         ClassifyBuild(hash.digest, hash.digestValid);
 
-    wchar_t bootstrapDirectory[kPathCapacity]{};
-    wchar_t bootstrapLeaf[260]{};
     const bool bootstrapPathValid = GetModuleDirectory(
         context.bootstrapModule,
-        bootstrapDirectory,
-        bootstrapLeaf,
+        workspace->bootstrapDirectory,
+        workspace->scratchLeaf,
         &error);
 
     const HMODULE companionModule = ModuleFromInitializerAddress();
-    wchar_t companionDirectory[kPathCapacity]{};
-    wchar_t companionLeaf[260]{};
     const bool companionPathValid = companionModule != nullptr &&
         GetModuleDirectory(
             companionModule,
-            companionDirectory,
-            companionLeaf,
+            workspace->companionDirectory,
+            workspace->scratchLeaf,
             &error);
 
     const DWORD provisionalResult = hash.digestValid
@@ -167,34 +219,44 @@ DWORD RunCompanionInitialization(
     marker.resolverError = context.resolverError;
     marker.initializeResult = provisionalResult;
     marker.bootstrapBesideExecutable = bootstrapPathValid &&
-        _wcsicmp(bootstrapDirectory, executableDirectory) == 0;
+        _wcsicmp(
+            workspace->bootstrapDirectory,
+            workspace->executableDirectory) == 0;
     marker.companionBesideExecutable = companionPathValid &&
-        _wcsicmp(companionDirectory, executableDirectory) == 0;
+        _wcsicmp(
+            workspace->companionDirectory,
+            workspace->executableDirectory) == 0;
     marker.complete = hash.digestValid &&
         marker.resolverStatus == GenuineResolverStatus::Ok &&
         marker.bootstrapBesideExecutable &&
         marker.companionBesideExecutable;
     std::wmemcpy(
         marker.executableLeaf,
-        executableLeaf,
-        std::wcslen(executableLeaf) + 1);
+        workspace->executableLeaf,
+        std::wcslen(workspace->executableLeaf) + 1);
 
-    wchar_t fallbackDirectory[kPathCapacity]{};
     const DWORD fallbackLength = GetTempPathW(
-        static_cast<DWORD>(kPathCapacity), fallbackDirectory);
+        static_cast<DWORD>(kPathCapacity),
+        workspace->fallbackDirectory);
     if (fallbackLength == 0 || fallbackLength >= kPathCapacity) {
         OutputDebugStringW(L"[RS2ServerFix] temp-path-failed\n");
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return FinishInitialization(state, kInitMarkerWriteFailed);
     }
 
-    const MarkerWriteResult write = WriteMarkerWithFallback(
-        executableDirectory, fallbackDirectory, marker);
-    if (!write.written) {
+    const bool markerWritten = WriteMarkerWithFallback(
+        workspace->executableDirectory,
+        workspace->fallbackDirectory,
+        marker,
+        &workspace->markerWrite);
+    if (!markerWritten || !workspace->markerWrite.written) {
         OutputDebugStringW(L"[RS2ServerFix] marker-failed\n");
+        VirtualFree(workspace, 0, MEM_RELEASE);
         return FinishInitialization(state, kInitMarkerWriteFailed);
     }
 
     OutputDebugStringW(L"[RS2ServerFix] companion-complete\n");
+    VirtualFree(workspace, 0, MEM_RELEASE);
     return FinishInitialization(state, provisionalResult);
 }
 

@@ -42,9 +42,10 @@ bool FormatMarkerUtf8(
     std::size_t capacity,
     std::size_t* bytesUsed) noexcept;
 
-MarkerWriteResult WriteMarkerWithFallback(
+bool WriteMarkerWithFallback(
     const wchar_t* primaryDirectory,
     const wchar_t* fallbackDirectory,
-    const MarkerData& data) noexcept;
+    const MarkerData& data,
+    MarkerWriteResult* result) noexcept;
 
 } // namespace rs2fix

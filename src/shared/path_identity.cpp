@@ -112,7 +112,7 @@ bool GetBoundedModulePath(
         StoreError(error, GetLastError());
         return false;
     }
-    if (length >= capacity - 1) {
+    if (length >= capacity) {
         output[0] = L'\0';
         StoreError(error, ERROR_INSUFFICIENT_BUFFER);
         return false;

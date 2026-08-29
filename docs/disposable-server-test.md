@@ -20,7 +20,7 @@ Do not rename, rebuild, edit, sign, compress, or substitute either file between
 offline verification and this test. Record their hashes before continuing:
 
 ```powershell
-$ArtifactRoot = 'D:\Documents\RisingStorm2\RS2ServerFix\.worktrees\two-dll-stage0\build-verify\Release'
+$ArtifactRoot = 'D:\Documents\RisingStorm2\RS2ServerFix\.worktrees\two-dll-stage0\build-final-verify\Release'
 $BootstrapSource = Join-Path $ArtifactRoot 'faultrep.dll'
 $CompanionSource = Join-Path $ArtifactRoot 'RS2ServerFix.dll'
 
@@ -45,7 +45,7 @@ directory outside the server tree.
 $ServerExe = 'E:\serverone\Binaries\Win64\VNGame\_pr1.exe'
 $ExeDir = Split-Path -Parent $ServerExe
 $ConfigRoot = 'D:\Documents\RisingStorm2\Server1\Config'
-$Preflight = 'D:\Documents\RisingStorm2\RS2ServerFix\.worktrees\two-dll-stage0\build-verify\Release\rs2_deployment_preflight.exe'
+$Preflight = 'D:\Documents\RisingStorm2\RS2ServerFix\.worktrees\two-dll-stage0\build-final-verify\Release\rs2_deployment_preflight.exe'
 $EvidenceRoot = Join-Path 'D:\Documents\RisingStorm2\Stage0-Evidence' (Get-Date -Format 'yyyyMMdd-HHmmss')
 $ObservationMinutes = 10 # agree and record this before the control run
 
@@ -229,7 +229,21 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 8080 |
 
 10. Confirm the process is gone and retain the control log. Do not proceed if
     any required service failed in the control; the pass would not be
-    comparable.
+    comparable. Capture an `after-control` manifest and prove that the clean
+    control itself changed no tracked file:
+
+```powershell
+Write-Stage0Manifest -Name 'after-control' -OutputDirectory $EvidenceRoot
+$beforeControl = Import-Csv -LiteralPath `
+    (Join-Path $EvidenceRoot 'before-control-hashes.csv')
+$afterControl = Import-Csv -LiteralPath `
+    (Join-Path $EvidenceRoot 'after-control-hashes.csv')
+$controlDiff = Compare-Object $beforeControl $afterControl `
+    -Property Path, Length, LastWriteTimeUtc, SHA256
+$controlDiff | Export-Csv -NoTypeInformation -Encoding UTF8 `
+    -LiteralPath (Join-Path $EvidenceRoot 'control-integrity-diff.csv')
+if ($controlDiff) { throw 'The clean control changed a tracked file' }
+```
 
 ## Phase 2 — two-file passive pass
 
@@ -334,7 +348,7 @@ completion=complete
 
 ```powershell
 Write-Stage0Manifest -Name 'after-pass' -OutputDirectory $EvidenceRoot
-$before = Import-Csv -LiteralPath (Join-Path $EvidenceRoot 'before-control-hashes.csv')
+$before = Import-Csv -LiteralPath (Join-Path $EvidenceRoot 'after-control-hashes.csv')
 $after = Import-Csv -LiteralPath (Join-Path $EvidenceRoot 'after-pass-hashes.csv')
 $integrityDiff = Compare-Object $before $after `
     -Property Path, Length, LastWriteTimeUtc, SHA256

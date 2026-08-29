@@ -290,9 +290,9 @@ void TestMarker() {
     missing += L"RS2ServerFix-missing-";
     missing += std::to_wstring(GetCurrentProcessId());
 
-    const rs2fix::MarkerWriteResult writeResult =
-        rs2fix::WriteMarkerWithFallback(
-            missing.c_str(), temp.c_str(), data);
+    rs2fix::MarkerWriteResult writeResult{};
+    RS2_CHECK(rs2fix::WriteMarkerWithFallback(
+        missing.c_str(), temp.c_str(), data, &writeResult));
     RS2_CHECK(writeResult.written);
     RS2_CHECK(writeResult.usedFallback);
     RS2_CHECK(writeResult.primaryError != ERROR_SUCCESS);
@@ -671,6 +671,36 @@ std::wstring SiblingModulePath(const wchar_t* leafName) {
     return siblingPath;
 }
 
+bool MarkerIsComplete(const std::wstring& path) {
+    const HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    char marker[8192]{};
+    DWORD bytesRead = 0;
+    const bool read = ReadFile(
+        file,
+        marker,
+        static_cast<DWORD>(sizeof(marker) - 1),
+        &bytesRead,
+        nullptr) != FALSE;
+    const bool closed = CloseHandle(file) != FALSE;
+    constexpr char kTerminal[] = "completion=complete\r\n";
+    return read && closed &&
+           bytesRead >= sizeof(kTerminal) - 1 &&
+           std::memcmp(
+               marker + bytesRead - (sizeof(kTerminal) - 1),
+               kTerminal,
+               sizeof(kTerminal) - 1) == 0;
+}
+
 void TestCompanionInitialization() {
     rs2fix::BootstrapContextV1 valid{};
     valid.size = sizeof(valid);
@@ -806,13 +836,11 @@ void TestBuiltDllSmoke() {
     RS2_CHECK(GetProcAddress(bootstrap, "ReportFault") != nullptr);
 
     const ULONGLONG deadline = GetTickCount64() + 15000;
-    while (GetFileAttributesW(markerPath.c_str()) ==
-               INVALID_FILE_ATTRIBUTES &&
+    while (!MarkerIsComplete(markerPath) &&
            GetTickCount64() < deadline) {
         Sleep(10);
     }
-    RS2_CHECK(GetFileAttributesW(markerPath.c_str()) !=
-              INVALID_FILE_ATTRIBUTES);
+    RS2_CHECK(MarkerIsComplete(markerPath));
 
     const HMODULE companion = GetModuleHandleW(L"RS2ServerFix.dll");
     RS2_CHECK(companion != nullptr);
@@ -821,7 +849,14 @@ void TestBuiltDllSmoke() {
             companion, "RS2ServerFix_InitializeV1") != nullptr);
     }
 
-    RS2_CHECK(DeleteFileW(markerPath.c_str()) != FALSE);
+    bool deleted = false;
+    while (!deleted && GetTickCount64() < deadline) {
+        deleted = DeleteFileW(markerPath.c_str()) != FALSE;
+        if (!deleted) {
+            Sleep(10);
+        }
+    }
+    RS2_CHECK(deleted);
 }
 
 } // namespace

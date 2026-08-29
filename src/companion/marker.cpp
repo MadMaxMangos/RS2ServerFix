@@ -14,6 +14,13 @@ namespace {
 
 constexpr std::size_t kMarkerCapacity = 8192;
 
+struct MarkerWorkspace {
+    std::array<char, kMarkerCapacity> formatted;
+    wchar_t primaryPath[kMarkerPathCapacity];
+    wchar_t fallbackPath[kMarkerPathCapacity];
+    MarkerData fallbackData;
+};
+
 class BufferWriter {
 public:
     BufferWriter(char* output, const std::size_t capacity) noexcept
@@ -370,69 +377,94 @@ bool FormatMarkerUtf8(
     return true;
 }
 
-MarkerWriteResult WriteMarkerWithFallback(
+bool WriteMarkerWithFallback(
     const wchar_t* primaryDirectory,
     const wchar_t* fallbackDirectory,
-    const MarkerData& data) noexcept {
-    MarkerWriteResult result{};
-    std::array<char, kMarkerCapacity> formatted{};
+    const MarkerData& data,
+    MarkerWriteResult* result) noexcept {
+    if (result == nullptr) {
+        return false;
+    }
+    result->written = false;
+    result->usedFallback = false;
+    result->primaryError = ERROR_SUCCESS;
+    result->finalError = ERROR_SUCCESS;
+    result->writtenPath[0] = L'\0';
+    auto* workspace = static_cast<MarkerWorkspace*>(VirtualAlloc(
+        nullptr,
+        sizeof(MarkerWorkspace),
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE));
+    if (workspace == nullptr) {
+        result->primaryError = ERROR_NOT_ENOUGH_MEMORY;
+        result->finalError = ERROR_NOT_ENOUGH_MEMORY;
+        return false;
+    }
+
     std::size_t formattedSize = 0;
 
-    wchar_t primaryPath[kMarkerPathCapacity]{};
     if (BuildMarkerPath(
             primaryDirectory,
             data.processId,
-            primaryPath,
+            workspace->primaryPath,
             kMarkerPathCapacity) &&
         FormatMarkerUtf8(
-            data, formatted.data(), formatted.size(), &formattedSize) &&
+            data,
+            workspace->formatted.data(),
+            workspace->formatted.size(),
+            &formattedSize) &&
         WriteMarkerFile(
-            primaryPath,
-            formatted.data(),
+            workspace->primaryPath,
+            workspace->formatted.data(),
             formattedSize,
-            &result.primaryError)) {
-        result.written = true;
-        CopyPath(primaryPath, result.writtenPath, kMarkerPathCapacity);
-        return result;
+            &result->primaryError)) {
+        result->written = true;
+        CopyPath(
+            workspace->primaryPath,
+            result->writtenPath,
+            kMarkerPathCapacity);
+        VirtualFree(workspace, 0, MEM_RELEASE);
+        return true;
     }
-    if (result.primaryError == ERROR_SUCCESS) {
-        result.primaryError = GetLastError();
-        if (result.primaryError == ERROR_SUCCESS) {
-            result.primaryError = ERROR_INVALID_NAME;
-        }
+    if (result->primaryError == ERROR_SUCCESS) {
+        result->primaryError = ERROR_INVALID_NAME;
     }
 
-    MarkerData fallbackData = data;
-    fallbackData.primaryWriteError = result.primaryError;
-    formatted.fill('\0');
+    workspace->fallbackData = data;
+    workspace->fallbackData.primaryWriteError = result->primaryError;
+    workspace->formatted.fill('\0');
     formattedSize = 0;
-    wchar_t fallbackPath[kMarkerPathCapacity]{};
     if (!BuildMarkerPath(
             fallbackDirectory,
             data.processId,
-            fallbackPath,
+            workspace->fallbackPath,
             kMarkerPathCapacity) ||
         !FormatMarkerUtf8(
-            fallbackData,
-            formatted.data(),
-            formatted.size(),
+            workspace->fallbackData,
+            workspace->formatted.data(),
+            workspace->formatted.size(),
             &formattedSize) ||
         !WriteMarkerFile(
-            fallbackPath,
-            formatted.data(),
+            workspace->fallbackPath,
+            workspace->formatted.data(),
             formattedSize,
-            &result.finalError)) {
-        if (result.finalError == ERROR_SUCCESS) {
-            result.finalError = ERROR_INVALID_NAME;
+            &result->finalError)) {
+        if (result->finalError == ERROR_SUCCESS) {
+            result->finalError = ERROR_INVALID_NAME;
         }
-        return result;
+        VirtualFree(workspace, 0, MEM_RELEASE);
+        return false;
     }
 
-    result.written = true;
-    result.usedFallback = true;
-    result.finalError = ERROR_SUCCESS;
-    CopyPath(fallbackPath, result.writtenPath, kMarkerPathCapacity);
-    return result;
+    result->written = true;
+    result->usedFallback = true;
+    result->finalError = ERROR_SUCCESS;
+    CopyPath(
+        workspace->fallbackPath,
+        result->writtenPath,
+        kMarkerPathCapacity);
+    VirtualFree(workspace, 0, MEM_RELEASE);
+    return true;
 }
 
 } // namespace rs2fix

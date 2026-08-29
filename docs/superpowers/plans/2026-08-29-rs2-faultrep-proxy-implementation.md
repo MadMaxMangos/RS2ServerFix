@@ -22,6 +22,9 @@
 - Worker resolves and publishes genuine `ReportFault` before loading/calling the companion.
 - Exported `ReportFault` performs only an atomic pointer read and direct call-through; null returns `frrvErrNoDW`.
 - A missing/rejected companion never clears genuine forwarding and never triggers a retry.
+- Large path/marker scratch workspaces use `VirtualAlloc` on the worker or
+  companion initializer and are released before return; they are not large
+  automatic stack frames.
 - Stage 0 performs no hook, detour, game-memory write, ADF work, anti-cheat interaction, deliberate crash, or server deployment.
 - Builds and tests write only below ignored build directories or unique validated system-temporary directories.
 
@@ -278,10 +281,11 @@ struct MarkerWriteResult {
 bool FormatMarkerUtf8(
     const MarkerData&, char*, std::size_t,
     std::size_t* bytesUsed) noexcept;
-MarkerWriteResult WriteMarkerWithFallback(
+bool WriteMarkerWithFallback(
     const wchar_t* primaryDirectory,
     const wchar_t* fallbackDirectory,
-    const MarkerData&) noexcept;
+    const MarkerData&,
+    MarkerWriteResult*) noexcept;
 } // namespace rs2fix
 ```
 
