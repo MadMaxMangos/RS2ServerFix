@@ -33,9 +33,12 @@ function(rs2_configure_target target)
 endfunction()
 
 add_executable(rs2_core_tests
+  src/bootstrap/forwarder.cpp
+  src/bootstrap/genuine_resolver.cpp
   src/companion/build_identity.cpp
   src/companion/marker.cpp
   src/companion/sha256.cpp
+  src/shared/path_identity.cpp
   tests/core_tests.cpp)
 rs2_configure_target(rs2_core_tests)
 target_link_libraries(rs2_core_tests PRIVATE bcrypt)

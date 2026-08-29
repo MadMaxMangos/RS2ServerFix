@@ -1,8 +1,11 @@
 #include "bootstrap/bootstrap_types.h"
+#include "bootstrap/forwarder.h"
+#include "bootstrap/genuine_resolver.h"
 #include "companion/build_identity.h"
 #include "companion/marker.h"
 #include "companion/sha256.h"
 #include "shared/bootstrap_abi.h"
+#include "shared/path_identity.h"
 
 #include "test_framework.h"
 
@@ -296,6 +299,213 @@ void TestMarker() {
     RS2_CHECK(DeleteFileW(writeResult.writtenPath) != FALSE);
 }
 
+bool EndsWithInsensitive(
+    const wchar_t* value,
+    const wchar_t* suffix) {
+    const std::size_t valueLength = std::wcslen(value);
+    const std::size_t suffixLength = std::wcslen(suffix);
+    if (suffixLength > valueLength) {
+        return false;
+    }
+    return _wcsicmp(
+        value + valueLength - suffixLength,
+        suffix) == 0;
+}
+
+void TestPathAndFileIdentity() {
+    wchar_t systemFaultrep[rs2fix::kPathCapacity]{};
+    DWORD error = 99;
+    RS2_CHECK(rs2fix::BuildSystemFaultrepPath(
+        systemFaultrep, rs2fix::kPathCapacity, &error));
+    RS2_CHECK(error == ERROR_SUCCESS);
+    RS2_CHECK(EndsWithInsensitive(systemFaultrep, L"\\faultrep.dll"));
+
+    wchar_t tiny[1]{L'x'};
+    error = ERROR_SUCCESS;
+    RS2_CHECK(!rs2fix::BuildSystemFaultrepPath(tiny, 1, &error));
+    RS2_CHECK(tiny[0] == L'\0');
+    RS2_CHECK(error == ERROR_INSUFFICIENT_BUFFER);
+
+    wchar_t modulePath[rs2fix::kPathCapacity]{};
+    error = 99;
+    RS2_CHECK(rs2fix::GetBoundedModulePath(
+        nullptr, modulePath, rs2fix::kPathCapacity, &error));
+    RS2_CHECK(error == ERROR_SUCCESS);
+    RS2_CHECK(modulePath[0] != L'\0');
+
+    wchar_t directory[rs2fix::kPathCapacity]{};
+    wchar_t leaf[260]{};
+    RS2_CHECK(rs2fix::ExtractDirectoryAndLeaf(
+        modulePath,
+        directory,
+        rs2fix::kPathCapacity,
+        leaf,
+        260,
+        &error));
+    RS2_CHECK(directory[0] != L'\0');
+    RS2_CHECK(leaf[0] != L'\0');
+
+    wchar_t recombined[rs2fix::kPathCapacity]{};
+    RS2_CHECK(rs2fix::AppendPathLeaf(
+        directory,
+        leaf,
+        recombined,
+        rs2fix::kPathCapacity,
+        &error));
+    RS2_CHECK(_wcsicmp(modulePath, recombined) == 0);
+    RS2_CHECK(!rs2fix::AppendPathLeaf(
+        directory, leaf, recombined, 2, &error));
+    RS2_CHECK(error == ERROR_INSUFFICIENT_BUFFER);
+
+    const std::wstring original = MakeTemporaryFile(L"R2I");
+    const char originalData[] = "identity";
+    WriteBytesToFile(
+        original,
+        originalData,
+        static_cast<DWORD>(sizeof(originalData)));
+    const std::wstring hardLink = original + L".link";
+    RS2_CHECK(CreateHardLinkW(
+        hardLink.c_str(), original.c_str(), nullptr) != FALSE);
+    const std::wstring different = MakeTemporaryFile(L"R2J");
+    const char differentData[] = "different";
+    WriteBytesToFile(
+        different,
+        differentData,
+        static_cast<DWORD>(sizeof(differentData)));
+
+    rs2fix::FileIdentity originalIdentity{};
+    rs2fix::FileIdentity linkIdentity{};
+    rs2fix::FileIdentity differentIdentity{};
+    RS2_CHECK(rs2fix::QueryFileIdentity(
+        original.c_str(), &originalIdentity, &error));
+    RS2_CHECK(rs2fix::QueryFileIdentity(
+        hardLink.c_str(), &linkIdentity, &error));
+    RS2_CHECK(rs2fix::QueryFileIdentity(
+        different.c_str(), &differentIdentity, &error));
+    RS2_CHECK(rs2fix::SameFileIdentity(
+        originalIdentity, linkIdentity));
+    RS2_CHECK(!rs2fix::SameFileIdentity(
+        originalIdentity, differentIdentity));
+
+    RS2_CHECK(DeleteFileW(hardLink.c_str()) != FALSE);
+    RS2_CHECK(DeleteFileW(original.c_str()) != FALSE);
+    RS2_CHECK(DeleteFileW(different.c_str()) != FALSE);
+}
+
+HMODULE FakeModule(const std::uintptr_t value) {
+    return reinterpret_cast<HMODULE>(value);
+}
+
+FARPROC FakeFunction(const std::uintptr_t value) {
+    return reinterpret_cast<FARPROC>(value);
+}
+
+void TestGenuineValidationAndResolution() {
+    const HMODULE bootstrap = FakeModule(0x1000);
+    const HMODULE candidate = FakeModule(0x2000);
+    const FARPROC function = FakeFunction(0x3000);
+    const rs2fix::FileIdentity expected{1, 2, 3, true};
+    const rs2fix::FileIdentity matching{1, 2, 3, true};
+    const rs2fix::FileIdentity different{1, 2, 4, true};
+    const void* otherBase = reinterpret_cast<const void*>(0x4000);
+
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        nullptr,
+        function,
+        expected,
+        matching,
+        true,
+        otherBase) == rs2fix::GenuineResolverStatus::LoadFailed);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        bootstrap,
+        function,
+        expected,
+        matching,
+        true,
+        otherBase) == rs2fix::GenuineResolverStatus::SelfModule);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        candidate,
+        function,
+        {},
+        matching,
+        true,
+        otherBase) == rs2fix::GenuineResolverStatus::FileIdentityFailed);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        candidate,
+        function,
+        expected,
+        different,
+        true,
+        otherBase) == rs2fix::GenuineResolverStatus::WrongFile);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        candidate,
+        nullptr,
+        expected,
+        matching,
+        true,
+        otherBase) == rs2fix::GenuineResolverStatus::ExportMissing);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        candidate,
+        function,
+        expected,
+        matching,
+        false,
+        otherBase) == rs2fix::GenuineResolverStatus::QueryAddressFailed);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        candidate,
+        function,
+        expected,
+        matching,
+        true,
+        bootstrap) == rs2fix::GenuineResolverStatus::SelfAddress);
+    RS2_CHECK(rs2fix::ValidateGenuineEvidence(
+        bootstrap,
+        candidate,
+        function,
+        expected,
+        matching,
+        true,
+        otherBase) == rs2fix::GenuineResolverStatus::Ok);
+
+    const rs2fix::GenuineResolverResult actual =
+        rs2fix::ResolveGenuineReportFault(GetModuleHandleW(nullptr));
+    RS2_CHECK(actual.status == rs2fix::GenuineResolverStatus::Ok);
+    RS2_CHECK(actual.module != nullptr);
+    RS2_CHECK(actual.function != nullptr);
+    RS2_CHECK(actual.win32Error == ERROR_SUCCESS);
+    if (actual.module != nullptr) {
+        RS2_CHECK(FreeLibrary(actual.module) != FALSE);
+    }
+}
+
+LPEXCEPTION_POINTERS g_stubPointers = nullptr;
+DWORD g_stubOptions = 0;
+
+EFaultRepRetVal APIENTRY ForwardingStub(
+    LPEXCEPTION_POINTERS pointers,
+    const DWORD options) {
+    g_stubPointers = pointers;
+    g_stubOptions = options;
+    return frrvOkQueued;
+}
+
+void TestForwarder() {
+    RS2_CHECK(rs2fix::ForwardOrFail(nullptr, nullptr, 7) == frrvErrNoDW);
+    auto* const pointers = reinterpret_cast<LPEXCEPTION_POINTERS>(0x12340);
+    const EFaultRepRetVal result =
+        rs2fix::ForwardOrFail(&ForwardingStub, pointers, 0x55aa);
+    RS2_CHECK(result == frrvOkQueued);
+    RS2_CHECK(g_stubPointers == pointers);
+    RS2_CHECK(g_stubOptions == 0x55aa);
+}
+
 } // namespace
 
 int main() {
@@ -303,6 +513,9 @@ int main() {
     TestBuildIdentity();
     TestSha256();
     TestMarker();
+    TestPathAndFileIdentity();
+    TestGenuineValidationAndResolution();
+    TestForwarder();
     std::cout << "checks=" << rs2fix::test::g_checks
               << " failures=" << rs2fix::test::g_failures << '\n';
     return rs2fix::test::g_failures == 0 ? 0 : 1;
