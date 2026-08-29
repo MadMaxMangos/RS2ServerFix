@@ -32,6 +32,37 @@ function(rs2_configure_target target)
   target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endfunction()
 
+function(rs2_configure_hardened_dll target output_name)
+  rs2_configure_target(${target})
+  set_target_properties(${target} PROPERTIES
+    OUTPUT_NAME "${output_name}")
+  target_link_options(${target} PRIVATE
+    /DYNAMICBASE
+    /NXCOMPAT
+    /HIGHENTROPYVA)
+endfunction()
+
+add_library(rs2_server_fix_companion SHARED
+  src/companion/RS2ServerFix.def
+  src/companion/build_identity.cpp
+  src/companion/companion_init.cpp
+  src/companion/companion_main.cpp
+  src/companion/marker.cpp
+  src/companion/sha256.cpp
+  src/shared/path_identity.cpp)
+rs2_configure_hardened_dll(
+  rs2_server_fix_companion RS2ServerFix)
+target_link_libraries(rs2_server_fix_companion PRIVATE bcrypt)
+
+add_library(rs2_faultrep_bootstrap SHARED
+  src/bootstrap/bootstrap_main.cpp
+  src/bootstrap/companion_loader.cpp
+  src/bootstrap/faultrep.def
+  src/bootstrap/forwarder.cpp
+  src/bootstrap/genuine_resolver.cpp
+  src/shared/path_identity.cpp)
+rs2_configure_hardened_dll(rs2_faultrep_bootstrap faultrep)
+
 add_executable(rs2_core_tests
   src/bootstrap/companion_loader.cpp
   src/bootstrap/forwarder.cpp
@@ -44,6 +75,10 @@ add_executable(rs2_core_tests
   tests/core_tests.cpp)
 rs2_configure_target(rs2_core_tests)
 target_link_libraries(rs2_core_tests PRIVATE bcrypt)
+add_dependencies(
+  rs2_core_tests
+  rs2_faultrep_bootstrap
+  rs2_server_fix_companion)
 
 if(BUILD_TESTING)
   if(RS2_PR1_BASELINE_PATH STREQUAL "" OR

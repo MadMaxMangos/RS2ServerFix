@@ -1,0 +1,3 @@
+LIBRARY RS2ServerFix
+EXPORTS
+    RS2ServerFix_InitializeV1

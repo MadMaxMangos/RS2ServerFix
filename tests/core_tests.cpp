@@ -646,6 +646,31 @@ std::wstring MarkerPathForCurrentProcess() {
     return markerPath;
 }
 
+std::wstring SiblingModulePath(const wchar_t* leafName) {
+    wchar_t modulePath[rs2fix::kPathCapacity]{};
+    wchar_t directory[rs2fix::kPathCapacity]{};
+    wchar_t ownLeaf[260]{};
+    wchar_t siblingPath[rs2fix::kPathCapacity]{};
+    DWORD error = ERROR_SUCCESS;
+    RS2_CHECK(leafName != nullptr);
+    RS2_CHECK(rs2fix::GetBoundedModulePath(
+        nullptr, modulePath, rs2fix::kPathCapacity, &error));
+    RS2_CHECK(rs2fix::ExtractDirectoryAndLeaf(
+        modulePath,
+        directory,
+        rs2fix::kPathCapacity,
+        ownLeaf,
+        260,
+        &error));
+    RS2_CHECK(rs2fix::AppendPathLeaf(
+        directory,
+        leafName,
+        siblingPath,
+        rs2fix::kPathCapacity,
+        &error));
+    return siblingPath;
+}
+
 void TestCompanionInitialization() {
     rs2fix::BootstrapContextV1 valid{};
     valid.size = sizeof(valid);
@@ -757,6 +782,48 @@ void TestMissingCompanionFailsSoftly() {
     RS2_CHECK(result.win32Error != ERROR_SUCCESS);
 }
 
+void TestBuiltDllSmoke() {
+    const std::wstring bootstrapPath = SiblingModulePath(L"faultrep.dll");
+    const std::wstring companionPath = SiblingModulePath(L"RS2ServerFix.dll");
+    const std::wstring markerPath = MarkerPathForCurrentProcess();
+    DeleteFileW(markerPath.c_str());
+
+    RS2_CHECK(GetFileAttributesW(bootstrapPath.c_str()) !=
+              INVALID_FILE_ATTRIBUTES);
+    RS2_CHECK(GetFileAttributesW(companionPath.c_str()) !=
+              INVALID_FILE_ATTRIBUTES);
+
+    const HMODULE bootstrap = LoadLibraryExW(
+        bootstrapPath.c_str(),
+        nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+            LOAD_LIBRARY_SEARCH_SYSTEM32);
+    RS2_CHECK(bootstrap != nullptr);
+    if (bootstrap == nullptr) {
+        return;
+    }
+
+    RS2_CHECK(GetProcAddress(bootstrap, "ReportFault") != nullptr);
+
+    const ULONGLONG deadline = GetTickCount64() + 15000;
+    while (GetFileAttributesW(markerPath.c_str()) ==
+               INVALID_FILE_ATTRIBUTES &&
+           GetTickCount64() < deadline) {
+        Sleep(10);
+    }
+    RS2_CHECK(GetFileAttributesW(markerPath.c_str()) !=
+              INVALID_FILE_ATTRIBUTES);
+
+    const HMODULE companion = GetModuleHandleW(L"RS2ServerFix.dll");
+    RS2_CHECK(companion != nullptr);
+    if (companion != nullptr) {
+        RS2_CHECK(GetProcAddress(
+            companion, "RS2ServerFix_InitializeV1") != nullptr);
+    }
+
+    RS2_CHECK(DeleteFileW(markerPath.c_str()) != FALSE);
+}
+
 } // namespace
 
 int main() {
@@ -770,6 +837,7 @@ int main() {
     TestCompanionPathAndValidation();
     TestCompanionInitialization();
     TestMissingCompanionFailsSoftly();
+    TestBuiltDllSmoke();
     std::cout << "checks=" << rs2fix::test::g_checks
               << " failures=" << rs2fix::test::g_failures << '\n';
     return rs2fix::test::g_failures == 0 ? 0 : 1;
