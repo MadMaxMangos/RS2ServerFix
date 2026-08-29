@@ -108,3 +108,43 @@ add_test(NAME pe_companion_contract
   COMMAND rs2_pe_contract
           companion
           $<TARGET_FILE:rs2_server_fix_companion>)
+
+add_executable(rs2_static_import_harness
+  src/shared/path_identity.cpp
+  tests/static_import_harness.cpp)
+rs2_configure_target(rs2_static_import_harness)
+set(_rs2_windows_kits_roots
+  "$ENV{ProgramFiles\(x86\)}/Windows Kits/10"
+  "$ENV{ProgramFiles}/Windows Kits/10")
+find_library(RS2_SYSTEM_FAULTREP_IMPORT_LIBRARY
+  NAMES FaultRep
+  PATHS ${_rs2_windows_kits_roots}
+  PATH_SUFFIXES
+    "Lib/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/um/x64"
+  NO_DEFAULT_PATH
+  REQUIRED)
+target_link_libraries(rs2_static_import_harness PRIVATE
+  "${RS2_SYSTEM_FAULTREP_IMPORT_LIBRARY}")
+target_link_options(rs2_static_import_harness PRIVATE
+  /DYNAMICBASE
+  /NXCOMPAT
+  /HIGHENTROPYVA)
+
+add_executable(rs2_static_import_runner
+  tests/static_import_runner.cpp)
+rs2_configure_target(rs2_static_import_runner)
+add_dependencies(
+  rs2_static_import_runner
+  rs2_static_import_harness
+  rs2_faultrep_bootstrap
+  rs2_server_fix_companion)
+
+add_test(NAME pe_harness_contract
+  COMMAND rs2_pe_contract
+          harness
+          $<TARGET_FILE:rs2_static_import_harness>)
+add_test(NAME static_import_cases
+  COMMAND rs2_static_import_runner
+          $<TARGET_FILE:rs2_static_import_harness>
+          $<TARGET_FILE:rs2_faultrep_bootstrap>
+          $<TARGET_FILE:rs2_server_fix_companion>)
