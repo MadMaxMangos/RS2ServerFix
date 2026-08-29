@@ -1,61 +1,75 @@
-# RS2 Passive `faultrep.dll` Proxy Design
+# RS2 Two-DLL Passive Loader Design
 
 Date: 2026-08-22
 
-Revised: 2026-08-29 after external design review
+Revised: 2026-08-29 for reviewed safety fixes, current-build evidence, and the bootstrap/companion split
 
-Stage: 0 - loader and forwarding proof only
+Stage: 0 - loader, companion initialization, diagnostics, and forwarding proof only
 
 ## Goal
 
-Prove that an x64 DLL named `faultrep.dll`, placed beside the dedicated-server executable on a disposable server copy, can load at process startup, preserve the operating system's `ReportFault` behavior after one-pass asynchronous initialization, identify the host executable, and record a minimal diagnostic marker without modifying game memory or any existing file.
+Prove on an offline harness and then a user-operated disposable server copy that:
 
-The proof establishes a reversible loader for a later ADF crash mitigation. Stage 0 contains no engine hooks, detours, byte patches, allocator changes, ADF logic, anti-cheat interaction, or live-server deployment.
+1. a minimal AMD64 `faultrep.dll` bootstrap can be selected through the server's existing load-time import;
+2. it can resolve, validate, and publish genuine `System32\faultrep.dll!ReportFault` without doing loader work on the crash path;
+3. after genuine forwarding is available, it can load an explicitly named companion `RS2ServerFix.dll` from the bootstrap directory and call one versioned initialization export outside loader-lock context;
+4. the companion can identify the host and write privacy-minimal diagnostics without changing game memory or any existing file; and
+5. both added files can be removed while the process is stopped to restore the original System32 path.
+
+Stage 0 contains no game hook, detour, byte patch, allocator change, ADF mutation, anti-cheat interaction, deliberate crash, or server deployment by Codex.
+
+## Why two DLLs
+
+`faultrep.dll` is a fragile load-time compatibility boundary. Keeping it limited to Windows crash-report forwarding and one explicit companion call reduces the code that can prevent process startup or run near an exceptional path.
+
+`RS2ServerFix.dll` owns build identification, marker output, and all future mitigation code. It is loaded dynamically after genuine `ReportFault` is published. A missing or rejected companion therefore disables only our optional functionality; the bootstrap remains able to forward Windows crash reporting. Future mitigation releases can replace the companion while the stable bootstrap contract remains unchanged.
+
+The cost is a two-file deployment and rollback. Stage 0 tests partial installations explicitly.
 
 ## Evidence and fixed inputs
 
-- Crash-producing executable SHA-256:
+Historical crash lineage:
+
+- crash-producing/full-dump PR1 SHA-256:
   `155EBC77D2FA574F0A94709839EF1DF6A3DA82B278C846F14223967B058C4622`
-- Preserved pre-full-dump baseline SHA-256:
+- preserved stock PR1 SHA-256:
   `5820F0DA82D7C2903DE31E0865320D9E70A0BF74F78F83C83DB4F9DEEAEB1DEF`
-- The only functional difference between those executables is the dump-type byte at file offset `0x00a6a313` changing from `0x40` to `0x42`; the other changed byte, at `0x000001e1`, is the PE checksum.
-- Newly shipped/current stock executable SHA-256, copied from another VM and locally labelled PR3:
+- the files differ at dump-type offset `0x00a6a313` (`0x40` to `0x42`) plus PE checksum offset `0x000001e1` (`0x39` to `0x3b`).
+
+Newly shipped/current lineage, locally labelled PR3 after processing on another VM:
+
+- current stock SHA-256:
   `F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3`
-- Full-dump-modified copy of that current executable SHA-256:
+- current full-dump-modified SHA-256:
   `0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393`
-- Those current-build files likewise differ only at file offset `0x00a6bb43` (`0x40` to `0x42`) plus the PE checksum byte at `0x000001e1` (`0xf7` to `0xf9`).
-- The preserved PR1 executable is AMD64 and imports `ReportFault` from `faultrep.dll` by name.
-- The PR1 crash dump captured `Faultrep.dll` loaded from the operating-system `System32` directory.
-- `faultrep.dll` was not listed under KnownDLLs on the examined host. This is host-specific and must be rechecked by the static-import test on the disposable target.
-- `dinput8.dll` was neither imported nor loaded by PR1.
-- The server-directory `dbghelp.dll` must remain untouched because existing full-dump handling uses it.
-- The Windows SDK declares:
+- the files differ at dump-type offset `0x00a6bb43` (`0x40` to `0x42`) plus PE checksum offset `0x000001e1` (`0xf7` to `0xf9`).
 
-  ```cpp
-  EFaultRepRetVal APIENTRY ReportFault(
-      LPEXCEPTION_POINTERS exceptionPointers,
-      DWORD options);
-  ```
+Loader evidence:
 
-- The examined Windows 11 System32 DLL exports `ReportFault` by name at ordinal 13. The host imports by name, so the name is the required contract and the ordinal is a separately checked compatibility detail.
+- both examined executables are AMD64 and import named `ReportFault` from `faultrep.dll`;
+- the PR1 crash dump captured `Faultrep.dll` from System32;
+- `dinput8.dll` was neither imported nor loaded by PR1;
+- `faultrep.dll` was not listed as a KnownDLL on the examined host, but the actual target is rechecked by the static-import harness and loaded-module path;
+- the existing server-directory `dbghelp.dll` participates in full-dump handling and must not be altered, proxied, or imported by either new DLL;
+- the SDK declares `EFaultRepRetVal APIENTRY ReportFault(LPEXCEPTION_POINTERS, DWORD)`;
+- the examined System32 DLL exports named `ReportFault` at ordinal 13; the server imports by name, so the name is the hard contract.
 
-The patched PR1 executable was no longer present in the former analysis directory at the time of this revision. The preserved baseline remains available. Tests may construct a temporary derived copy from the baseline using the two verified byte changes above and must verify that the result has the crash-producing SHA-256. The baseline itself must never be edited. Both current-build files are present under `D:\Documents\RisingStorm2\Binaries`; their PR3 filenames are local analysis labels, not different game editions.
+The patched historical executable is no longer present at its former analysis path. Tests may derive a temporary copy from the preserved stock file using the two verified byte changes and must reproduce its exact SHA-256 without altering the stock input. Both current-lineage files are present under `D:\Documents\RisingStorm2\Binaries`.
 
-## Design constraints from Windows behavior
+## Windows constraints
 
-- `DllMain` runs while the loader lock is held. It must not call `LoadLibrary`, wait for another thread, perform hashing, write diagnostics, or invoke APIs with uncertain loader dependencies.
-- Creating a thread from `DllMain` is documented as risky but can work when no synchronization with that thread occurs. Because the host exposes no explicit post-start initialization callback, one minimal `CreateThread` is the selected compromise and is tested under the same load-time-import conditions as the server.
-- `InitOnceExecuteOnce` is synchronous: competing callers block until the initializer completes. It must not guard work that may need the loader lock while a caller can already hold that lock.
-- `ReportFault` runs on an exceptional and potentially heap-corrupt path. It must remain allocation-free, lock-free, file-free, and loader-free.
-- A local load-time import can prevent process creation if the proxy is missing a dependency, has the wrong architecture, is blocked by policy, or fails initialization. Stage 0 cannot promise graceful System32 fallback after the loader selects an invalid local file.
-- The proxy uses the static CRT (`/MT`). Microsoft explicitly says not to call `DisableThreadLibraryCalls` from a DLL linked with the static CRT, so Stage 0 does not call it.
-- Two DLLs with the same basename in different fully qualified paths are distinct modules for run-time loading. A fully qualified System32 load is still followed by identity checks so redirection or an implementation error cannot publish the proxy itself.
+- `DllMain` runs while the loader lock is held. It must not call `LoadLibrary`, wait for another thread, hash files, write diagnostics, or invoke the companion.
+- `CreateThread` from `DllMain` is documented as risky but workable if there is no synchronization with the created thread. The host exposes no safer explicit initialization callback, so the bootstrap performs one non-joined `CreateThread` and tests the exact load-time scenario.
+- `InitOnceExecuteOnce` is synchronous and blocks competing callers. It is not used.
+- `ReportFault` may run in a process with corrupt heap/stack state. The exported path must be allocation-free, lock-free, loader-free, file-free, and log-free.
+- A bad local load-time `faultrep.dll` can prevent process creation. There is no promised System32 fallback after Windows selects an invalid local file.
+- Both DLLs use static CRT. Microsoft says not to call `DisableThreadLibraryCalls` from a static-CRT DLL, so neither DLL calls it.
+- A fully qualified path identifies a distinct same-basename module, but both the System32 DLL and companion are still validated by module, file, and function identity before use.
 
 Primary references:
 
 - [Dynamic-Link Library Best Practices](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices)
 - [DllMain entry point](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain)
-- [One-Time Initialization](https://learn.microsoft.com/en-us/windows/win32/sync/one-time-initialization)
 - [Dynamic-Link Library Search Order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order)
 - [LoadLibraryEx](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw)
 - [DisableThreadLibraryCalls](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-disablethreadlibrarycalls)
@@ -65,186 +79,194 @@ Primary references:
 
 Stage 0 delivers:
 
-1. A small native AMD64 proxy built as `faultrep.dll`.
-2. A single public export, `ReportFault`, with the documented ABI.
-3. Worker-only resolution and validation of genuine `System32\faultrep.dll!ReportFault`.
-4. Crash-path forwarding through one atomically published function pointer.
-5. SHA-256 host identification with explicit historical/current build identities and fail-closed unknown states.
-6. Privacy-minimal marker and debug-milestone diagnostics.
-7. Unit, integration, static-import, PE-contract, and deployment-preflight tests.
-8. Manual disposable-server smoke-test and rollback instructions.
+1. minimal AMD64 bootstrap `faultrep.dll`;
+2. AMD64 companion `RS2ServerFix.dll`;
+3. one shared versioned POD initialization ABI;
+4. worker-only validated System32 resolution and crash-path forwarding;
+5. explicit companion-path construction, validation, loading, and initialization;
+6. historical/current SHA-256 build identity with fail-closed unknown states;
+7. UTF-8 privacy-minimal marker plus debug milestones;
+8. unit, PE-contract, static-import, partial-installation, and deployment-preflight tests;
+9. manual disposable-server control/proxy/rollback instructions.
 
 ## Non-goals
 
 Stage 0 will not:
 
-- alter or replace either PR1 executable;
-- alter, rename, proxy, or import the local `dbghelp.dll`;
-- hook ADF or any other game function;
-- inspect or modify player, Steam, EOS, EAC, network, or mutator state;
-- suppress, evade, or interact with anti-cheat checks;
-- inject into another process;
-- deploy files to a production or public server;
-- deliberately crash the live or disposable game server;
-- repair, reconstruct, or otherwise touch the captured ADF pool;
-- guarantee forwarding during the brief interval before worker resolution completes;
-- support an unknown executable for future patch behavior.
+- alter either server executable or any shipped DLL/configuration;
+- alter, rename, proxy, or import local `dbghelp.dll`;
+- hook or inspect ADF/game/player/Steam/EOS/EAC/network/mutator state;
+- suppress or evade anti-cheat or integrity controls;
+- inject remotely or load into a client;
+- deploy to a production/public server;
+- deliberately call genuine `ReportFault` with fabricated exception data;
+- guarantee forwarding in the brief interval before worker resolution;
+- treat any known hash as automatically eligible for a later ADF patch.
 
-## Build and binary contract
+## Binary contracts
 
-The project uses CMake and the installed MSVC AMD64 toolchain.
+### Bootstrap `faultrep.dll`
 
-Required proxy properties:
+- AMD64 native DLL, output filename exactly `faultrep.dll`;
+- Release `/MT`, Debug `/MTd`;
+- direct imports limited to `KERNEL32.dll`;
+- no CNG, diagnostics formatting, companion static import, `dbghelp.dll`, managed, network, shell, COM, dynamic Visual C++ runtime, user TLS, or dynamic global constructor;
+- `/DYNAMICBASE`, `/NXCOMPAT`, `/HIGHENTROPYVA`;
+- one public export: named `ReportFault`, also assigned observed ordinal 13 without `NONAME`;
+- no `DisableThreadLibraryCalls`.
 
-- AMD64 PE DLL;
-- Release static CRT (`/MT`), never `/MD`;
-- no external package or managed-runtime dependency;
-- no user-defined static TLS, `thread_local`, function-local static, or C++ object requiring dynamic construction/destruction;
-- no call to `DisableThreadLibraryCalls`;
-- expected direct-import allowlist of `KERNEL32.dll` and `bcrypt.dll` only;
-- explicitly no import of `dbghelp.dll`, User32, Shell, COM, networking, or a Visual C++ runtime DLL;
-- `/DYNAMICBASE`, `/NXCOMPAT`, and `/HIGHENTROPYVA` enabled;
-- `ReportFault` exported by name;
-- ordinal 13 may also identify that named export, without `NONAME`; ordinal mismatch is reported separately and does not override the required name check;
-- no additional public exports in the production DLL.
+### Companion `RS2ServerFix.dll`
 
-If the compiler emits a dependency outside the expected allowlist, the build/test gate fails. The dependency is investigated rather than silently added to the allowlist.
+- AMD64 native DLL, output filename exactly `RS2ServerFix.dll`;
+- Release `/MT`, Debug `/MTd`;
+- direct imports limited to `KERNEL32.dll` and `bcrypt.dll`;
+- no `dbghelp.dll`, managed, network, shell, COM, dynamic Visual C++ runtime, user TLS, or dynamic global constructor;
+- `/DYNAMICBASE`, `/NXCOMPAT`, `/HIGHENTROPYVA`;
+- one public export: named `RS2ServerFix_InitializeV1`;
+- user `DllMain` always returns `TRUE` and performs no work;
+- no worker thread of its own and no `DisableThreadLibraryCalls`.
 
-Repository layout:
+If either built image has an unexpected dependency/export, its PE contract test fails. The allowlist is investigated rather than silently expanded.
 
-```text
-RS2ServerFix/
-  .gitignore
-  CMakeLists.txt
-  docs/
-    superpowers/specs/
-    disposable-server-test.md
-  src/
-    faultrep_proxy/
-  tests/
-  tools/
+No build/install/test target copies either DLL outside repository build directories or unique system-temporary test directories.
+
+## Shared initialization ABI
+
+Both DLLs compile this exact C-compatible contract from one header:
+
+```cpp
+constexpr std::uint32_t kBootstrapAbiVersion = 1;
+
+struct BootstrapContextV1 {
+    std::uint32_t size;
+    std::uint32_t abiVersion;
+    HMODULE hostModule;
+    HMODULE bootstrapModule;
+    HMODULE genuineFaultrepModule;
+    FARPROC genuineReportFault;
+    std::uint32_t resolverStatus;
+    DWORD resolverError;
+};
+
+static_assert(sizeof(BootstrapContextV1) == 48);
+
+using InitializeV1Fn = DWORD(WINAPI*)(const BootstrapContextV1* context);
 ```
 
-Build products remain under an ignored `build/` directory or another explicitly selected output directory. No build, test, install, or packaging target copies a DLL into a game/server directory.
+The bootstrap sets `size=48`, `abiVersion=1`, passes `GetModuleHandleW(nullptr)` as host, its saved `hinstDLL`, and the genuine module/function/status evidence. The companion validates size/version/non-null host/bootstrap before doing work.
+
+Initialization return values are stable `DWORD` constants:
+
+```text
+0 = initialized
+1 = already initialized
+2 = invalid context
+3 = host identity failed
+4 = marker write failed
+```
+
+The companion uses a zero-initialized interlocked state (`0` unstarted, `1` running, `2` finished) so duplicate calls never run initialization concurrently and never wait.
 
 ## Runtime architecture
 
-### Static state
+### Bootstrap `DllMain`
 
-All writable global state is zero-initialized plain data:
+On `DLL_PROCESS_ATTACH` only:
 
-- `HMODULE g_selfModule`;
-- atomically accessed `ReportFault` function pointer `g_reportFault`;
-- optional integer milestone/error codes used by in-process unit seams.
+1. store `hinstDLL` in a zero-initialized POD global;
+2. call `CreateThread` once with the module handle as parameter;
+3. close a successful thread handle without waiting;
+4. return `TRUE` regardless of worker creation.
 
-There are no global constructors, destructors, locks, `INIT_ONCE` objects, heap-backed containers, or function-local statics.
+All thread/detach notifications perform no user work. There is no load, file access, formatting, debug output, CRT call, synchronization wait, cleanup, or `FreeLibrary` in user `DllMain`.
 
-### `DllMain`
+### Bootstrap worker order
 
-On `DLL_PROCESS_ATTACH`, `DllMain` performs only:
+The one worker performs a non-retrying sequence:
 
-1. store `hinstDLL` in `g_selfModule`;
-2. call Win32 `CreateThread` once for the worker;
-3. close the returned thread handle without waiting if creation succeeded;
-4. return `TRUE` on every path.
+1. emit a leaf-name/status-only debug milestone;
+2. resolve and validate genuine System32 `ReportFault`;
+3. atomically publish a validated non-null pointer, or leave it null permanently;
+4. derive the bootstrap directory and absolute `RS2ServerFix.dll` path;
+5. load and validate the companion;
+6. call `RS2ServerFix_InitializeV1` once with `BootstrapContextV1`;
+7. emit terminal status and return.
 
-It does not call `DisableThreadLibraryCalls`, `LoadLibrary`, CNG, file APIs, debug-output APIs, path APIs, the CRT, or any synchronization wait. A worker-creation failure does not fail process attach. It leaves the forwarding pointer null.
+Publishing genuine forwarding precedes all companion work. No companion failure causes a retry or clears a published genuine pointer.
 
-`DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH` do nothing. `DLL_PROCESS_DETACH` does nothing, including during process termination. It never waits and never calls `FreeLibrary`.
-
-The design accepts the documented residual risk of calling `CreateThread` from `DllMain`; there is no safe host callback available and the rejected alternatives are worse:
-
-- loading the genuine DLL inside `DllMain` can deadlock under the loader lock;
-- resolving lazily inside `ReportFault` performs loader/heap work on the crash path;
-- thread-pool, COM, shell, or managed scheduling introduces additional loader dependencies;
-- copying or renaming an operating-system DLL creates servicing and provenance problems.
-
-### Module lifetime
-
-In the production scenario, `faultrep.dll` is a load-time import of the server executable and remains mapped for process lifetime. The worker therefore does not permanently pin the proxy and does not add a self-reference.
-
-Integration tests run the loader in a fresh process and end the process after the terminal marker is observed. They never call `FreeLibrary` while the worker may execute. Unit tests exercise independently compiled core functions rather than dynamically unloading the production DLL.
-
-After successful genuine resolution, its `LoadLibraryExW` reference is intentionally retained until process termination so the published function pointer cannot dangle. Failed candidates are released from the worker after validation has completed.
-
-### Worker ordering
-
-The worker performs one non-retrying pass in this order; hashing has the soft budget defined below, while operating-system loader and file calls are not falsely described as time-bounded:
-
-1. emit a leaf-name-only `worker-start` debug milestone;
-2. resolve and validate genuine `ReportFault`;
-3. atomically publish the validated pointer, or leave it permanently null and record a resolver error;
-4. resolve the host path and hash/classify the executable;
-5. write one marker, first beside the executable and then to the process temporary directory if the primary location fails;
-6. emit a terminal `worker-complete` debug milestone and return.
-
-Genuine reporter resolution precedes hashing so the crash-forwarding gap is as short as practicable. There is no retry loop. A failure remains fail-closed for the life of the process.
-
-### Genuine `ReportFault` resolution
+### Genuine reporter resolution
 
 The worker:
 
-1. obtains the System32 directory with `GetSystemDirectoryW` into an explicitly bounded wide-character buffer;
-2. appends `\faultrep.dll` only after checking capacity;
-3. calls `LoadLibraryExW(absolutePath, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)`;
-4. rejects a null handle;
-5. rejects `candidateModule == g_selfModule`;
-6. obtains the actual candidate path with `GetModuleFileNameW`;
-7. opens the expected System32 file and candidate file for attributes using all three share flags and compares volume serial plus file index, avoiding case, junction, short-name, and prefix-sensitive string identity;
-8. resolves `ReportFault` by name with `GetProcAddress`;
-9. rejects a null `GetProcAddress` result;
-10. uses `VirtualQuery` on the returned address and rejects it if `VirtualQuery` fails or the allocation base is `g_selfModule`;
-11. atomically publishes the pointer only after every validation succeeds.
+1. builds bounded absolute `System32\faultrep.dll` using `GetSystemDirectoryW`;
+2. calls `LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)`;
+3. rejects null or `candidate == bootstrapModule`;
+4. obtains candidate path;
+5. compares the expected and candidate files by volume serial plus file index, not path string;
+6. resolves named `ReportFault` and rejects null;
+7. calls `VirtualQuery` and rejects query failure or allocation base equal to the bootstrap;
+8. publishes only after all validation succeeds.
 
-No code path uses name-only `LoadLibraryW(L"faultrep.dll")` or `GetModuleHandleW(L"faultrep.dll")` to find the genuine module. The candidate module path may be recorded as the constant classification `system32` but is not copied verbatim into the marker.
+Rejected non-null candidate references are released on the worker. A successful reference is retained until process termination so the published pointer cannot dangle. No name-only load/handle call finds the genuine module.
 
-If module identity or target-address validation fails, the worker releases only the extra candidate reference, records the reason, leaves the function pointer null, and never retries.
+### Companion loading
+
+The worker derives its own module path into a 32,768-wide-character bounded buffer, removes only the final leaf component, and appends exact leaf `RS2ServerFix.dll` after capacity checks.
+
+It calls:
+
+```cpp
+LoadLibraryExW(
+    absoluteCompanionPath,
+    nullptr,
+    LOAD_LIBRARY_SEARCH_SYSTEM32);
+```
+
+The full path selects the companion; the flag restricts its dependencies to System32. Stage 0 permits no local dynamic dependency.
+
+Validation requires:
+
+- non-null module distinct from bootstrap and genuine System32 module;
+- candidate file identity equal to the explicitly constructed companion file;
+- named `RS2ServerFix_InitializeV1` export present;
+- successful `VirtualQuery` whose allocation base equals the candidate module, so forwarded initializers are rejected.
+
+Only then is the ABI context passed. A validated/called companion reference is retained until process exit even if initialization returns a failure code, avoiding unload after partial initialization. Candidates rejected before the call are released.
+
+Missing, malformed, wrong-architecture, wrong-file, missing-export, or initialization-return failure leaves genuine crash forwarding intact and is reported only through bounded debug milestones or a partial companion marker when one was produced.
 
 ### Exported `ReportFault`
 
-The exported function:
+The export atomically reads one function pointer with an interlocked operation. If null, it immediately returns documented `frrvErrNoDW`; otherwise it calls the genuine function with both original arguments and returns its result unchanged.
 
-1. atomically reads the published function pointer using an interlocked operation;
-2. returns `frrvErrNoDW` immediately if it is null;
-3. otherwise calls the genuine function with the original two arguments and returns its value unchanged.
+It performs no lazy resolution, companion call, allocation, lock, load, file access, logging, hashing, SEH swallowing, or retry. Behavioral x64 ABI fidelity is required; a compiler tail call is not.
 
-`frrvErrNoDW` is the documented result for an error-reporting client that could not be launched, allowing the system to perform its default action. It is more accurate than `frrvErr`, which states that the reporting client was launched but failed.
+### Companion initialization
 
-The forwarder performs no lazy initialization, loader call, allocation, lock, logging, file access, hash work, exception swallowing, or retry. It does not promise a compiler tail call; behavioral ABI fidelity is the requirement. On x64, both parameters and the return value must pass unchanged under the platform calling convention.
+The companion's exported initializer:
 
-### Host hashing and build identity
+1. validates context pointer, size, ABI version, resolver fields, and module handles;
+2. atomically claims its non-waiting initialization state;
+3. verifies `context->hostModule == GetModuleHandleW(nullptr)`;
+4. resolves the host executable path;
+5. hashes it with SHA-256 using CNG and a 64 KiB `VirtualAlloc` buffer;
+6. classifies build identity;
+7. writes one marker beside the executable, with one temporary-directory fallback;
+8. emits terminal debug status;
+9. marks initialization finished and returns a stable result.
 
-After reporter publication, the worker:
+Hashing opens with all three share flags and `FILE_FLAG_SEQUENTIAL_SCAN`, uses a 10-second soft budget checked between reads, and distinguishes:
 
-1. gets the host image path with `GetModuleFileNameW(nullptr, ...)` into a bounded buffer large enough for the Win32 extended path limit;
-2. opens it with `GENERIC_READ`, `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`, and `FILE_FLAG_SEQUENTIAL_SCAN`;
-3. reads 64 KiB chunks from a `VirtualAlloc` buffer;
-4. computes SHA-256 using Windows CNG;
-5. compares the 32 raw digest bytes against compile-time byte arrays;
-6. checks a 10-second soft budget between reads, abandoning further hashing if exceeded;
-7. closes all file, CNG, and virtual-memory resources before returning.
+- `pr1-crash-full-dump`;
+- `pr1-stock-baseline`;
+- `current-stock`;
+- `current-full-dump`;
+- `unknown` (valid different digest);
+- `indeterminate` (path/read/CNG/time failure).
 
-The soft budget cannot interrupt a blocked `ReadFile`; it only prevents continued work after control returns. The target executable is approximately 24 MB, so exceeding the budget is diagnostic rather than expected.
+These identify builds only. Stage 0 never patches any identity.
 
-Build identities are distinct:
-
-- `pr1-crash-full-dump`: exact historical crash-producing PR1 hash;
-- `pr1-stock-baseline`: exact preserved pre-full-dump PR1 hash;
-- `current-stock`: exact newly shipped/current stock hash;
-- `current-full-dump`: exact full-dump-modified current hash;
-- `unknown`: hashing succeeded but the digest is not a known build;
-- `indeterminate`: path, file, size, CNG, read, or time-budget failure prevented a verified digest.
-
-These values identify builds; they do not grant patch compatibility. Stage 0 performs no patch for any identity. A later ADF stage must independently analyze the newly shipped executable and declare the exact eligible hash; it must not inherit eligibility from the historical PR1 result.
-
-### Diagnostics and marker
-
-The worker uses two bounded channels:
-
-- `OutputDebugStringW` milestones for load/resolution/hash/marker outcomes;
-- one UTF-8 marker file.
-
-No diagnostics occur inside `DllMain` or `ReportFault`.
+### Marker and privacy
 
 Marker name:
 
@@ -252,158 +274,141 @@ Marker name:
 RS2ServerFix.loader.<pid>.log
 ```
 
-The worker attempts the executable directory once. If opening or writing fails, it attempts the directory returned by `GetTempPathW` once. It records the primary Win32 error when the fallback succeeds. There is no retry loop and no directory creation.
+The companion attempts the executable directory once, then `GetTempPathW` once. It creates no directory and has no retry loop.
 
-Marker schema version 1 contains only:
+UTF-8 schema version 1 contains only:
 
-- schema version;
-- UTC timestamp;
+- schema version and UTC timestamp;
 - process ID;
-- executable leaf filename and size;
-- SHA-256 when available;
-- one of the six host build identities;
-- proxy leaf filename and whether it is in the executable directory;
-- resolver status code;
-- genuine module classification (`system32` or `unavailable`);
-- primary marker-write error when fallback was required;
-- terminal `completion=complete` or `completion=partial` written last.
+- executable leaf name, size, SHA-256 if valid, and build identity;
+- bootstrap/companion leaf names and same-directory booleans;
+- genuine resolver status/error and `system32`/`unavailable` classification;
+- initialization result and primary marker error if fallback was required;
+- terminal `completion=complete` or `completion=partial` line written last.
 
-It excludes full executable/proxy paths, command line, environment variables, account identifiers, usernames, network addresses, tokens, player data, exception data, and memory contents. Tests inspect content for forbidden path/account fragments, not only field names.
+It excludes full paths, username/account identifiers, command line, environment values, network addresses, tokens, player/exception/memory data. A truncated file lacks the terminal record and fails tests.
 
-If both marker locations fail, debug milestones remain the only diagnostic. If no debugger is listening, this failure is silent by design and the static-import test treats marker absence as failure.
+## Lifetime and failure behavior
 
-## Failure behavior
+Production bootstrap lifetime is guaranteed by the server's load-time import. Tests run in fresh processes and never call `FreeLibrary` while a worker can execute. The successful genuine and companion references remain until process termination.
 
-| Failure | Required behavior |
+Process exit may briefly wait if the worker is inside a loader operation. Normal tests wait for terminal marker before child exit. No detach handler waits or frees modules.
+
+| Failure | Required result |
 |---|---|
-| Local proxy rejected/missing dependency/wrong bitness | Windows may fail process creation; preflight must prevent deployment. |
-| User `DllMain` path | Always returns `TRUE`; performs no wait or diagnostic. |
-| Worker creation | Process continues; target stays null; no marker is possible; `ReportFault` returns `frrvErrNoDW`. |
-| Genuine DLL load/identity/export | Leave target null permanently; record reason when worker diagnostics are available. |
-| Early `ReportFault` | Return `frrvErrNoDW` immediately; never attempt initialization. |
-| Hash/path/read/CNG/time | Identify as `indeterminate`; forwarding result is unaffected. |
-| Unknown digest | Identify as `unknown`; forwarding result is unaffected. |
-| Primary marker write | Attempt temporary-directory fallback once. |
-| Both marker writes | Emit debug failure milestone and exit worker. |
-| Process termination | No detach cleanup or wait; operating system tears down retained handles/mappings. Exit may briefly wait if the worker is already inside an in-flight loader operation. |
+| Companion present without bootstrap | Ignored; server uses System32 exactly as before. |
+| Bootstrap absent | Server uses System32 exactly as before. |
+| Invalid bootstrap/wrong bootstrap bitness/dependency | Windows may fail process creation; preflight must prevent deployment. |
+| Bootstrap worker creation | Process continues; target remains null; no companion/marker; early fault returns `frrvErrNoDW`. |
+| Genuine reporter validation | Target remains null; companion may still report resolver failure; no retry. |
+| Early `ReportFault` | Immediate `frrvErrNoDW`; no initialization attempt. |
+| Companion absent/load/identity/export | Published genuine forwarding remains; no companion functionality; no retry. |
+| Companion initializer returns failure | Published forwarding remains; companion stays mapped; partial marker/debug status when possible. |
+| Host hash fails | Build identity `indeterminate`; forwarding unaffected. |
+| Marker primary fails | One temporary-directory attempt. |
+| Both marker writes fail | Debug status only; initializer returns marker failure. |
+| Process termination | No explicit cleanup; OS tears down mappings/handles. |
 
-No proxy-controlled failure shows UI, performs network access, edits the executable, calls `ReportFault` recursively, or attempts to repair state.
+Neither DLL shows UI, performs network access, edits existing files, recursively calls `ReportFault`, or attempts recovery of game state.
 
 ## Test strategy
 
-Implementation proceeds test-first. Tests use fresh temporary directories and never copy artifacts to a game/server directory.
+All tests use repository build directories and unique system-temporary directories.
 
 ### Unit tests
 
-1. **Build identity:** the four exact historical/current hashes, arbitrary unknown, and indeterminate cases remain distinct.
-2. **SHA-256:** a fixed small file and the preserved baseline produce expected digests.
-3. **Derived full-dump fixtures:** copy each stock executable to a temporary file, apply only its two verified byte changes, verify the corresponding full-dump SHA-256, and delete the temporary copy. Never alter either stock input.
-4. **Path bounds:** System32, host, marker, and oversized/truncated path cases fail closed without buffer overrun.
-5. **File identity:** identical file, alternate path to the same file, and different file exercise volume/file-index comparison.
-6. **Resolver validation:** self `HMODULE`, self allocation base, missing export, wrong file identity, and genuine success paths leave/publish the pointer as required.
-7. **Marker schema/privacy:** required fields, terminal completion record, primary/fallback errors, no full paths, no `\Users\` fragment, and no environment expansion.
-8. **No patch behavior:** every Stage 0 build identity leaves game code/data untouched.
+1. all four known hashes plus unknown/indeterminate identity;
+2. fixed SHA-256 fixture and both stock files;
+3. temporary derived full-dump copies reproduce both expected hashes while stock files remain unchanged;
+4. bounded path construction and file identity, including hard-link/same-file and different-file cases;
+5. genuine resolver failures: self module, wrong identity, null export, failed `VirtualQuery`, self address;
+6. companion loader failures: self/genuine module, wrong identity, null export, forwarded/wrong allocation base;
+7. atomic forwarder null/stub semantics and argument fidelity;
+8. initialization ABI size/version and duplicate non-waiting claim;
+9. marker schema, fallback, short write, terminal record, and forbidden-content scan;
+10. no Stage 0 build identity permits patch behavior.
 
-### Built-PE contract test
+### Built-PE contracts
 
-Parse the production DLL and fail unless:
+Parse both outputs and fail unless machine/DLL/security flags, exports, and direct-import allowlists match their separate contracts. Parse the static harness and require named `faultrep.dll!ReportFault`, not ordinal import.
 
-- machine is AMD64;
-- it is a DLL;
-- ASLR, NX, and high-entropy VA flags are present;
-- `ReportFault` is exported by name;
-- no unexpected public export exists;
-- ordinal 13 is reported separately;
-- all direct imports are within the reviewed allowlist;
-- no dynamic Visual C++ runtime or `dbghelp.dll` import exists.
+Ordinal 13 is reported for bootstrap compatibility but named export is the hard gate.
 
-The export name and import allowlist are hard gates. Ordinal 13 is compatibility information unless an observed target importer requires it.
+### Static-import process cases
 
-### Static-import harness
+Each case runs in a fresh unique temporary directory; no real `ReportFault` call occurs:
 
-A small AMD64 executable links against `Faultrep.lib` so its import table contains a name import for `ReportFault`, but it never calls the function with fabricated exception data.
+1. **System control:** harness only; System32 module must load.
+2. **Companion only:** harness plus `RS2ServerFix.dll`; System32 still loads and no companion marker appears.
+3. **Bootstrap only:** harness plus `faultrep.dll`; local bootstrap loads and child process remains healthy despite missing companion.
+4. **Both files:** local bootstrap loads, marker proves genuine System32 validation and companion initialization.
+5. **Invalid companion:** local bootstrap plus malformed companion; child still starts and forwarding bootstrap stays loaded, with no valid complete marker.
+6. **Invalid bootstrap:** malformed local `faultrep.dll`; process creation or loader termination must fail, proving no fallback claim.
+7. **Rollback:** remove both while no child runs; System32 control succeeds again.
 
-Each case runs in a new process:
+The harness does not unload modules. The runner disables critical-error UI and bounds child waits.
 
-1. **System control:** no local proxy; process must start and report that loaded `faultrep.dll` is under System32.
-2. **Local proxy:** tested proxy beside the harness; process must start, report that the loaded import is the local proxy, observe a complete marker within a fixed timeout, and confirm the marker reports a validated System32 target.
-3. **Rollback:** remove the proxy while no harness process is running; repeat the system control.
-4. **Invalid-local negative:** in a temporary directory only, place an intentionally invalid file as `faultrep.dll` and confirm that process startup fails. This records the static-import failure mode rather than pretending System32 fallback occurs.
+### Deployment preflight
 
-The harness never calls `FreeLibrary`. Process exit ends each case. No deliberate crash is generated.
+A read-only scanner examines the exact user-selected deployment tree, without following directory reparse points, and records every PE machine plus all `faultrep.dll` imports. It fails on malformed PE extensions, incompatible `faultrep` importers, ordinal-only/unexpected required exports, or executable `.local` redirection.
 
-### Deployment preflight scanner
+Another VM's file list is contextual only; the disposable target must be scanned directly.
 
-Before a disposable server test, a read-only tool scans every PE file in the exact executable directory/tree selected by the user and records:
+## Disposable-server procedure
 
-- path relative to the selected root;
-- machine type;
-- every import from `faultrep.dll`, by name or ordinal;
-- whether an executable redirection artifact such as `<exe>.local` is present.
-
-The gate fails if any relevant importer is not AMD64, requires an export other than named `ReportFault`, or cannot be parsed. A file list from a different VM is not sufficient evidence.
-
-### Optional diagnostic checks
-
-- Run the static-import harness under Application Verifier loader checks if available.
-- Capture loader events with Process Monitor or loader snaps in the disposable test environment if the local-path assertion fails.
-- Confirm AV/EDR, WDAC, and AppLocker disposition before placing the unsigned test DLL.
-
-## Disposable-server smoke test
-
-The test is manual, performed by the user on a stopped disposable copy with no public players. Codex does not deploy the DLL.
+Codex prepares but does not execute deployment.
 
 ### Control
 
-1. Confirm the disposable executable path and SHA-256.
-2. Confirm no local `faultrep.dll`, executable `.local` redirection, or prior marker remains.
-3. Run the deployment preflight scanner and retain its report.
-4. Record AV/EDR, WDAC, and AppLocker status relevant to unsigned DLL loading.
-5. Capture a recursive directory listing and SHA-256 manifest for at least the executable, `dbghelp.dll`, and root-level PE files.
-6. Start the server with its normal command line, wait for Steam, EOS/EAC, networking, map and WebAdmin initialization, capture the log, then stop normally.
+1. User selects a stopped disposable server copy with no public players.
+2. Confirm no local `faultrep.dll`, `RS2ServerFix.dll`, executable `.local`, or prior marker.
+3. Run deployment preflight and retain its report.
+4. Record AV/EDR, WDAC, and AppLocker disposition for both unsigned DLLs.
+5. Capture recursive listing and hashes for executable, `dbghelp.dll`, configurations, and root PE files.
+6. Start using the normal command, verify Steam/EOS/EAC/network/map/WebAdmin initialization, capture logs, then stop normally.
 
-### Proxy pass
+### Two-file pass
 
-1. With the server stopped, copy only the exact offline-tested `faultrep.dll` beside the executable.
-2. Start with the same command line and environment as the control.
-3. Confirm the local proxy is the loaded `faultrep.dll` and the marker reports validated System32 resolution.
-4. Compare startup behavior and logs against the control for Steam, EOS/EAC, networking, map and WebAdmin initialization.
-5. Observe idle operation for a bounded period agreed before the test.
-6. Stop normally and capture the same listing/hash manifest.
-7. Diff logs and manifests. The executable, `dbghelp.dll`, configurations, and shipped DLLs must be unchanged.
+1. While stopped, copy the exact tested `RS2ServerFix.dll` and `faultrep.dll` beside the executable.
+2. Start with identical command/environment.
+3. Require loaded local bootstrap plus complete marker proving genuine System32 resolution, companion file identity/ABI, and host identity.
+4. Compare services and logs against control.
+5. Observe idle operation for a pre-agreed bounded period.
+6. Stop normally, capture identical listing/hash manifest, and diff. No existing file may differ.
 
 ### Rollback
 
-1. Ensure the server process is stopped; a mapped DLL cannot be removed reliably while it is running.
-2. Remove the local proxy and its marker files.
-3. Restart once with the original command and confirm System32 resolution and normal initialization.
-4. Retain the control, proxy, rollback logs, manifests, preflight report, and tested proxy hash together.
+1. Confirm process stopped.
+2. Remove both added DLLs and marker files.
+3. Restart once and prove System32 `faultrep.dll` plus normal initialization.
+4. Retain control/pass/rollback logs, manifests, preflight report, and both tested DLL hashes.
 
-Any startup failure, security-product intervention, unexpected import, missing/partial marker, genuine-resolution failure, service regression, integrity difference, shutdown hang, or rollback failure stops Stage 0. Do not continue to ADF work.
+Any startup failure, security intervention, incompatible importer, missing/partial marker, genuine/companion validation failure, service regression, integrity change, shutdown hang, or rollback failure stops Stage 0.
 
 ## Success criteria
 
-Stage 0 succeeds only when current evidence proves all of the following:
+Stage 0 succeeds only when:
 
-- unit, PE-contract, and static-import tests pass on AMD64;
-- the static-import control loads System32, the proxy case loads locally and validates System32 forwarding, and rollback returns to System32;
-- `ReportFault` contains no lazy initialization path;
-- all four known build identities plus unknown and indeterminate states are verified;
-- the exact deployment tree contains no incompatible importer;
-- a disposable server starts, initializes its normal services, stops, and restarts after removal;
-- pre/post hashes prove no existing executable, configuration, `dbghelp.dll`, or shipped DLL changed;
-- runtime artifacts are limited to the manually placed proxy and diagnostic marker/log captures;
-- no deliberate crash, public player traffic, anti-cheat bypass, or production deployment occurred.
+- all unit, two-image PE-contract, static-import/partial-installation, and preflight tests pass in Release AMD64;
+- bootstrap contains no crash-path initialization and companion is not a static dependency;
+- control/companion-only/rollback cases use System32;
+- bootstrap-only and malformed-companion cases keep the child process healthy;
+- both-file case proves local bootstrap, genuine System32 target, companion ABI, marker privacy, and correct host identity;
+- exact disposable tree has no incompatible importer/redirection;
+- disposable control/pass/rollback completes with all expected services;
+- pre/post hashes prove no existing executable, `dbghelp.dll`, configuration, or shipped DLL changed;
+- artifacts are limited to two manually placed DLLs plus diagnostic evidence;
+- no client, public player, production server, deliberate crash, anti-cheat bypass, or game-memory patch is involved.
 
-## Later stage, explicitly excluded
+## Later ADF stage
 
-After Stage 0 is proven, a separate reviewed design may add ADF mitigation. The intended direction remains:
+A separate reviewed design may place the mitigation exclusively in `RS2ServerFix.dll`. Current required direction remains:
 
-- one single-flight pack guard;
-- chunk-index, state, count, raw-length, cycle, visit-count, and destination-capacity validation;
-- fail-closed abort and diagnostics on corruption;
+- current executable independently analyzed and exact-hash gated;
+- pack-wide single-flight guard;
+- index/state/count/raw-length/cycle/visit/destination validation;
+- fail-closed abort and diagnostics;
 - no live free-list reconstruction;
-- exact executable-hash gating and original-byte validation;
-- independent rollback and concurrency testing.
+- original-byte validation, concurrency testing, and independent rollback.
 
-Stage 0 does not reserve implementation details or claim that the later hook is safe merely because the loader works.
+Stage 0 proves only the two-DLL loader boundary. It does not prove a later hook safe.
