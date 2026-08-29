@@ -37,6 +37,7 @@ add_executable(rs2_core_tests
   src/bootstrap/forwarder.cpp
   src/bootstrap/genuine_resolver.cpp
   src/companion/build_identity.cpp
+  src/companion/companion_init.cpp
   src/companion/marker.cpp
   src/companion/sha256.cpp
   src/shared/path_identity.cpp

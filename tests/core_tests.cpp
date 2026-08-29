@@ -3,6 +3,7 @@
 #include "bootstrap/forwarder.h"
 #include "bootstrap/genuine_resolver.h"
 #include "companion/build_identity.h"
+#include "companion/companion_init.h"
 #include "companion/marker.h"
 #include "companion/sha256.h"
 #include "shared/bootstrap_abi.h"
@@ -616,6 +617,146 @@ void TestCompanionPathAndValidation() {
         candidate) == rs2fix::CompanionLoadStatus::Ok);
 }
 
+std::wstring MarkerPathForCurrentProcess() {
+    wchar_t modulePath[rs2fix::kPathCapacity]{};
+    wchar_t directory[rs2fix::kPathCapacity]{};
+    wchar_t leaf[260]{};
+    DWORD error = ERROR_SUCCESS;
+    RS2_CHECK(rs2fix::GetBoundedModulePath(
+        nullptr, modulePath, rs2fix::kPathCapacity, &error));
+    RS2_CHECK(rs2fix::ExtractDirectoryAndLeaf(
+        modulePath,
+        directory,
+        rs2fix::kPathCapacity,
+        leaf,
+        260,
+        &error));
+    wchar_t markerLeaf[64]{};
+    RS2_CHECK(swprintf_s(
+        markerLeaf,
+        L"RS2ServerFix.loader.%lu.log",
+        static_cast<unsigned long>(GetCurrentProcessId())) > 0);
+    wchar_t markerPath[rs2fix::kPathCapacity]{};
+    RS2_CHECK(rs2fix::AppendPathLeaf(
+        directory,
+        markerLeaf,
+        markerPath,
+        rs2fix::kPathCapacity,
+        &error));
+    return markerPath;
+}
+
+void TestCompanionInitialization() {
+    rs2fix::BootstrapContextV1 valid{};
+    valid.size = sizeof(valid);
+    valid.abiVersion = rs2fix::kBootstrapAbiVersion;
+    valid.hostModule = GetModuleHandleW(nullptr);
+    valid.bootstrapModule = valid.hostModule;
+    valid.resolverStatus = static_cast<std::uint32_t>(
+        rs2fix::GenuineResolverStatus::Ok);
+
+    const rs2fix::GenuineResolverResult resolver =
+        rs2fix::ResolveGenuineReportFault(valid.bootstrapModule);
+    RS2_CHECK(resolver.status == rs2fix::GenuineResolverStatus::Ok);
+    valid.genuineFaultrepModule = resolver.module;
+    valid.genuineReportFault = reinterpret_cast<FARPROC>(resolver.function);
+    valid.resolverError = resolver.win32Error;
+
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(nullptr) ==
+              rs2fix::kInitInvalidContext);
+
+    rs2fix::BootstrapContextV1 invalid = valid;
+    invalid.size = 0;
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitInvalidContext);
+    invalid = valid;
+    invalid.abiVersion = 99;
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitInvalidContext);
+    invalid = valid;
+    invalid.hostModule = nullptr;
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitInvalidContext);
+    invalid = valid;
+    invalid.bootstrapModule = nullptr;
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitInvalidContext);
+    invalid = valid;
+    invalid.genuineReportFault = nullptr;
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitInvalidContext);
+    invalid = valid;
+    invalid.resolverStatus = static_cast<std::uint32_t>(
+        rs2fix::GenuineResolverStatus::LoadFailed);
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitInvalidContext);
+    invalid = valid;
+    invalid.hostModule = FakeModule(0x5000);
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&invalid) ==
+              rs2fix::kInitHostIdentityFailed);
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&valid) ==
+              rs2fix::kInitOk);
+
+    rs2fix::BootstrapContextV1 validFailure = valid;
+    validFailure.resolverStatus = static_cast<std::uint32_t>(
+        rs2fix::GenuineResolverStatus::LoadFailed);
+    validFailure.genuineFaultrepModule = nullptr;
+    validFailure.genuineReportFault = nullptr;
+    validFailure.resolverError = ERROR_MOD_NOT_FOUND;
+    RS2_CHECK(rs2fix::ValidateBootstrapContextV1(&validFailure) ==
+              rs2fix::kInitOk);
+
+    LONG claimState = 0;
+    RS2_CHECK(rs2fix::ClaimInitialization(&claimState) ==
+              rs2fix::InitializationClaim::Claimed);
+    RS2_CHECK(claimState == 1);
+    RS2_CHECK(rs2fix::ClaimInitialization(&claimState) ==
+              rs2fix::InitializationClaim::Running);
+    InterlockedExchange(&claimState, 2);
+    RS2_CHECK(rs2fix::ClaimInitialization(&claimState) ==
+              rs2fix::InitializationClaim::Finished);
+
+    const std::wstring markerPath = MarkerPathForCurrentProcess();
+    DeleteFileW(markerPath.c_str());
+    LONG initializationState = 0;
+    const DWORD initialization =
+        rs2fix::RunCompanionInitialization(valid, &initializationState);
+    RS2_CHECK(initialization == rs2fix::kInitOk);
+    RS2_CHECK(initializationState == 2);
+    RS2_CHECK(GetFileAttributesW(markerPath.c_str()) !=
+              INVALID_FILE_ATTRIBUTES);
+    RS2_CHECK(rs2fix::RunCompanionInitialization(
+        valid, &initializationState) ==
+        rs2fix::kInitAlreadyInitialized);
+    RS2_CHECK(DeleteFileW(markerPath.c_str()) != FALSE);
+
+    if (resolver.module != nullptr) {
+        RS2_CHECK(FreeLibrary(resolver.module) != FALSE);
+    }
+}
+
+void TestMissingCompanionFailsSoftly() {
+    const HMODULE systemBootstrap = GetModuleHandleW(L"kernel32.dll");
+    RS2_CHECK(systemBootstrap != nullptr);
+
+    rs2fix::BootstrapContextV1 context{};
+    context.size = sizeof(context);
+    context.abiVersion = rs2fix::kBootstrapAbiVersion;
+    context.hostModule = GetModuleHandleW(nullptr);
+    context.bootstrapModule = systemBootstrap;
+    context.resolverStatus = static_cast<std::uint32_t>(
+        rs2fix::GenuineResolverStatus::LoadFailed);
+    context.resolverError = ERROR_MOD_NOT_FOUND;
+
+    const rs2fix::CompanionLoadResult result =
+        rs2fix::LoadAndInitializeCompanion(
+            systemBootstrap, context);
+    RS2_CHECK(result.status == rs2fix::CompanionLoadStatus::LoadFailed);
+    RS2_CHECK(result.module == nullptr);
+    RS2_CHECK(result.initializeResult == rs2fix::kInitInvalidContext);
+    RS2_CHECK(result.win32Error != ERROR_SUCCESS);
+}
+
 } // namespace
 
 int main() {
@@ -627,6 +768,8 @@ int main() {
     TestGenuineValidationAndResolution();
     TestForwarder();
     TestCompanionPathAndValidation();
+    TestCompanionInitialization();
+    TestMissingCompanionFailsSoftly();
     std::cout << "checks=" << rs2fix::test::g_checks
               << " failures=" << rs2fix::test::g_failures << '\n';
     return rs2fix::test::g_failures == 0 ? 0 : 1;
