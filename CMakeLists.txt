@@ -33,6 +33,7 @@ function(rs2_configure_target target)
 endfunction()
 
 add_executable(rs2_core_tests
+  src/bootstrap/companion_loader.cpp
   src/bootstrap/forwarder.cpp
   src/bootstrap/genuine_resolver.cpp
   src/companion/build_identity.cpp

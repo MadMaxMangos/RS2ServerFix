@@ -1,4 +1,5 @@
 #include "bootstrap/bootstrap_types.h"
+#include "bootstrap/companion_loader.h"
 #include "bootstrap/forwarder.h"
 #include "bootstrap/genuine_resolver.h"
 #include "companion/build_identity.h"
@@ -506,6 +507,115 @@ void TestForwarder() {
     RS2_CHECK(g_stubOptions == 0x55aa);
 }
 
+void TestCompanionPathAndValidation() {
+    DWORD error = 99;
+    wchar_t companionPath[rs2fix::kPathCapacity]{};
+    RS2_CHECK(rs2fix::BuildCompanionPath(
+        GetModuleHandleW(nullptr),
+        companionPath,
+        rs2fix::kPathCapacity,
+        &error));
+    RS2_CHECK(error == ERROR_SUCCESS);
+    RS2_CHECK(EndsWithInsensitive(
+        companionPath, L"\\RS2ServerFix.dll"));
+
+    wchar_t tiny[2]{L'x', L'\0'};
+    RS2_CHECK(!rs2fix::BuildCompanionPath(
+        GetModuleHandleW(nullptr), tiny, 2, &error));
+    RS2_CHECK(tiny[0] == L'\0');
+    RS2_CHECK(error == ERROR_INSUFFICIENT_BUFFER);
+
+    const HMODULE bootstrap = FakeModule(0x1000);
+    const HMODULE genuine = FakeModule(0x2000);
+    const HMODULE candidate = FakeModule(0x3000);
+    const FARPROC initializer = FakeFunction(0x3100);
+    const rs2fix::FileIdentity expected{1, 2, 3, true};
+    const rs2fix::FileIdentity matching{1, 2, 3, true};
+    const rs2fix::FileIdentity different{1, 2, 4, true};
+
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        nullptr,
+        initializer,
+        expected,
+        matching,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::LoadFailed);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        bootstrap,
+        initializer,
+        expected,
+        matching,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::SelfModule);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        genuine,
+        initializer,
+        expected,
+        matching,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::GenuineModule);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        candidate,
+        initializer,
+        {},
+        matching,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::FileIdentityFailed);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        candidate,
+        initializer,
+        expected,
+        different,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::WrongFile);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        candidate,
+        nullptr,
+        expected,
+        matching,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::ExportMissing);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        candidate,
+        initializer,
+        expected,
+        matching,
+        false,
+        candidate) == rs2fix::CompanionLoadStatus::QueryAddressFailed);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        candidate,
+        initializer,
+        expected,
+        matching,
+        true,
+        bootstrap) == rs2fix::CompanionLoadStatus::WrongAddressBase);
+    RS2_CHECK(rs2fix::ValidateCompanionEvidence(
+        bootstrap,
+        genuine,
+        candidate,
+        initializer,
+        expected,
+        matching,
+        true,
+        candidate) == rs2fix::CompanionLoadStatus::Ok);
+}
+
 } // namespace
 
 int main() {
@@ -516,6 +626,7 @@ int main() {
     TestPathAndFileIdentity();
     TestGenuineValidationAndResolution();
     TestForwarder();
+    TestCompanionPathAndValidation();
     std::cout << "checks=" << rs2fix::test::g_checks
               << " failures=" << rs2fix::test::g_failures << '\n';
     return rs2fix::test::g_failures == 0 ? 0 : 1;
