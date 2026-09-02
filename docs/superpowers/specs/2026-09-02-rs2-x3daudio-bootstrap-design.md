@@ -6,9 +6,11 @@ Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
 Status: Approved by Claude Opus 5 Max after review round 6 and by the user on
-2026-09-02. Mechanically amended after implementation-plan review round 1 to
-separate ordinal DLL exports from by-name test imports and to make Git's CRLF
-custody check internally consistent; architecture and scope are unchanged.
+2026-09-02. The user-approved first-runtime console-status amendment is
+incorporated and awaits focused Claude Opus 5 Max review. Earlier mechanical
+implementation-plan amendments separated ordinal DLL exports from by-name test
+imports and made Git's CRLF custody check internally consistent; architecture
+and scope are unchanged.
 
 ## Goal
 
@@ -27,9 +29,9 @@ disposable server prove that:
    output behavior;
 4. the bootstrap loads an explicitly named `RS2ServerFix.dll` companion only
    outside loader-lock context;
-5. the companion identifies the host and writes one privacy-minimal marker
-   without changing game memory or any existing protected binary or
-   configuration file; and
+5. the companion identifies the host, writes one privacy-minimal marker, and
+   then emits one exact success-only console status line without changing game
+   memory or any existing protected binary or configuration file; and
 6. removing the two added DLLs while the process is stopped restores the
    original System32 load path.
 
@@ -51,9 +53,9 @@ VNGame.exe
 
 `X3DAudio1_7.dll` owns only genuine X3Audio resolution/forwarding and one
 asynchronous companion initialization attempt. `RS2ServerFix.dll` owns build
-identification, the marker, and all future functionality. A missing or rejected
-companion disables only optional RS2ServerFix behavior; genuine X3Audio
-forwarding remains available.
+identification, the marker, one success-only console confirmation, and all
+future functionality. A missing or rejected companion disables only optional
+RS2ServerFix behavior; genuine X3Audio forwarding remains available.
 
 The bootstrap and companion are separate because the bootstrap is a fragile
 load-time compatibility boundary. Future instrumentation or mitigation must
@@ -238,6 +240,8 @@ by the normal test suite or deployment preflight.
 - exactly one public export: `RS2ServerFix_InitializeV2`;
 - an honest VERSIONINFO resource identifying it as the `RS2ServerFix`
   companion;
+- one shared compile-time project-version source supplies both DLL VERSIONINFO
+  resources and the companion's success-only console status;
 - user `DllMain` always returns `TRUE` and performs no work;
 - no worker thread of its own in Milestone 1.
 
@@ -500,7 +504,7 @@ Duplicate calls use the existing zero-initialized interlocked state and never
 wait. `RS2ServerFix.dll` exports V2 only; the active CMake graph and PE tests
 fail if V1 or any second companion export is present.
 
-## Companion initialization and marker
+## Companion initialization, marker, and console status
 
 The companion reuses the reviewed Stage 0 sequence:
 
@@ -511,8 +515,10 @@ The companion reuses the reviewed Stage 0 sequence:
    unknown/indeterminate;
 5. verify bootstrap and companion locations;
 6. write one privacy-minimal marker beside the executable, with one temporary
-   directory fallback; and
-7. publish terminal initialization state.
+   directory fallback;
+7. after a complete marker and only for result `kInitOk`, make one best-effort
+   attempt to emit the exact success console status; and
+8. publish terminal initialization state.
 
 The primary marker leaf is exactly
 `RS2ServerFix.loader.<decimal-pid>.log` beside VNGame. The sole fallback uses
@@ -538,6 +544,44 @@ blindly deleting every match.
 
 Milestone 1 recognizes builds but grants none permission to patch or hook.
 
+### Success console status
+
+The companion emits exactly this 7-bit ASCII template, terminated by CRLF:
+
+```text
+[RS2ServerFix] v0.1.0.0 loaded; host=<build-identity>; X3Audio=System32; mode=passive; marker=complete\r\n
+```
+
+`<build-identity>` is the exact `BuildIdentityName` value. The only eligible
+values are `pr1-crash-full-dump`, `pr1-stock-baseline`, `current-stock`,
+`current-full-dump`, and `unknown`. `indeterminate` and an out-of-range enum can
+never accompany a complete marker and the formatter rejects them. The expected
+line for the planned current full-dump first runtime is therefore:
+
+```text
+[RS2ServerFix] v0.1.0.0 loaded; host=current-full-dump; X3Audio=System32; mode=passive; marker=complete
+```
+
+The project version comes from one shared header also consumed by both
+VERSIONINFO resources. Formatting uses a fixed `char[192]` stack buffer, no
+heap allocation, and a capacity-aware formatter. The production adapter calls
+`GetStdHandle(STD_OUTPUT_HANDLE)` once and, for a non-null/non-
+`INVALID_HANDLE_VALUE` handle, calls `WriteFile` exactly once for the complete
+line. A failed or short write returns false; there is no retry, stderr fallback,
+`OutputDebugString`, `WriteConsole`, Unreal logging call, iostream, CRT logging,
+allocation, or explicit wait.
+
+The attempt occurs only after `WriteMarkerWithFallback` has produced a terminal
+`completion=complete` marker and the initializer result is `kInitOk`. The
+existing atomic initialization claim makes the attempt exactly once even when
+initialization calls race. Console absence or write failure is observational
+and nonfatal: it does not change the successful initializer result or the
+already complete marker. The marker remains authoritative. The line may appear
+in an attached console or redirected standard output; this design does not
+claim that it enters Unreal's `Launch.log`.
+
+This diagnostic adds no marker field and does not change marker schema 2.
+
 ## Failure behavior
 
 | Failure | Required behavior |
@@ -553,11 +597,12 @@ Milestone 1 recognizes builds but grants none permission to patch or hook.
 | INIT_ONCE/dispatch-allocation failure after private genuine success | One claimant publishes the immutable static fallback; concurrent callers use complete private records without waiting and release their extra references after their current operation. Later calls reuse the permanent fallback instead of accumulating references. |
 | Early initialize races worker | Each may resolve privately without waiting; the normal INIT_ONCE path publishes exactly one success, the fallback path publishes at most one additional immutable success, and the genuine function is called only through a complete record. |
 | Early calculate races worker | Each may resolve privately without waiting; the normal INIT_ONCE path publishes exactly one success, the fallback path publishes at most one additional immutable success, and the genuine function is called only through a complete record. |
-| Companion missing/load/identity/export failure | Genuine X3Audio remains usable; no retry. |
-| Companion initializer fails | Genuine X3Audio remains usable; validated companion remains mapped after the call. |
+| Companion missing/load/identity/export failure | Genuine X3Audio remains usable; no retry, marker, or console status. |
+| Companion initializer fails | Genuine X3Audio remains usable; validated companion remains mapped after the call; no success console status. |
 | Host hash fails | Build identity is `indeterminate`; no hook/patch behavior exists. |
 | Marker primary path fails | One temporary-directory write attempt. |
-| Both marker writes fail | Debug milestone only; initializer returns marker failure. |
+| Both marker writes fail | Debug milestone only; initializer returns marker failure and emits no console status. |
+| Standard output is absent or its write fails/is short after a complete marker | Initialization remains successful, the complete marker remains authoritative, and there is no retry or alternate diagnostic. |
 | Normal process termination | No explicit unload or detach cleanup; Windows tears down mappings. |
 | Immediate `ExitProcess` while worker runs | Residual risk; bounded repetition must show no hang before disposable use. |
 
@@ -784,13 +829,20 @@ system-temporary directories.
    construction;
 8. marker schema 2, fallback, short-write cleanup, terminal line, and forbidden
    content scan;
-9. the shipped manifest parses to exactly the canonical qualified seed record
+9. success-console formatting for every eligible build identity, rejection of
+   indeterminate/out-of-range identities, exact current-full-dump bytes and
+   CRLF, fixed-buffer boundaries, null/invalid output handles, failed/zero/short
+   writes, exactly one write call, no sensitive content, nonfatal console
+   failure after a complete marker, no console attempt after marker failure,
+   and one status line under duplicate/concurrent initialization; the displayed
+   version must equal the shared VERSIONINFO source;
+10. the shipped manifest parses to exactly the canonical qualified seed record
    above; manifest size/line/entry bounds, fixed field order, every value domain,
    required final CRLF, malformed/duplicate/unknown/trailing rejection,
    provisional/qualified gate, qualification-evidence round-trip, no-overwrite,
    and short-write cleanup are covered; required absolute CLI paths have no
    fallback search; and
-10. proof that no known build identity permits hook/patch behavior.
+11. proof that no known build identity permits hook/patch behavior.
 
 ### Built-PE contracts
 
@@ -805,6 +857,9 @@ The PE tool fails unless:
 - the companion is AMD64 with its separate import/export contract;
 - the companion has the corresponding non-Microsoft `RS2ServerFix`
   VERSIONINFO identity;
+- both VERSIONINFO resources contain fixed and display version `0.1.0.0`; a
+  separate source/unit-test gate proves both resources and the console formatter
+  consume the same project-version definitions;
 - the static harness imports named
   `X3DAudio1_7.dll!X3DAudioInitialize`; and
 - no artifact has a TLS directory, unexpected export, or unexpected dynamic
@@ -864,7 +919,9 @@ Each case runs in a fresh, bounded child process:
    initialize/calculate vector matches the control digest, two distinct
    expected X3Audio full paths are enumerated, and no companion marker appears.
 4. **Both files:** local proxy plus companion; complete marker proves genuine,
-   companion, ABI, and host identity.
+   companion, ABI, and host identity, and captured stdout contains exactly one
+   success line with `host=unknown` because the harness executable is not a
+   preserved VNGame identity.
 5. **Invalid companion:** genuine calls still match control; no complete marker.
 6. **Missing genuine simulation:** a non-deployable test-only bootstrap is
    compiled with an absent System32 genuine leaf while retaining local output
@@ -874,12 +931,17 @@ Each case runs in a fresh, bounded child process:
    and calculate children must exit with exactly `0xC0000602` without modifying
    System32.
 7. **Concurrent first calls:** multiple initializer/calculate callers plus the
-   worker produce consistent control digests and no hang; publication count,
-   attempt count, and loser-cleanup assertions live in the injected unit test,
-   not in external-process inference.
+   worker produce consistent control digests, exactly one captured success line
+   with `host=unknown`, and no hang; publication count, attempt count, and
+   loser-cleanup assertions live in the injected unit test, not in
+   external-process inference.
 8. **Invalid bootstrap:** process creation or loader termination fails, proving
    there is no promised fallback after local selection.
 9. **Rollback:** remove both while no child runs; System32 control succeeds.
+
+Cases 01-03, 05-06, 08, and 09 must contain no success-console line. The runner
+parses that line independently from the one required `digest_sha256=` line so
+the diagnostic cannot weaken or contaminate the forwarding-fidelity check.
 
 `early_exit_cases` is separate from the nine functional cases. It repeatedly
 starts a bootstrap-plus-companion harness whose `main` immediately calls
@@ -932,7 +994,11 @@ user's explicit runtime authorization.
    `X3DAudio1_7.dll` and `RS2ServerFix.dll` beside VNGame.
 2. Start with the identical command and environment.
 3. Require both local bootstrap and genuine System32 X3Audio in the module
-   inventory plus one complete schema-2 marker.
+   inventory, one complete schema-2 marker, and one exact visible console status
+   whose host identity matches the selected VNGame hash. For the planned
+   current full-dump run this is the exact line shown above. Record the line as
+   evidence; its absence fails the two-file pass even though console output is
+   non-authoritative inside the DLL.
 4. Require Steam, EOS, EAC, client join/authentication, network, WebAdmin, map
    load/travel, and normal shutdown to match control.
 5. Observe a pre-agreed bounded idle/play interval.
@@ -951,7 +1017,8 @@ user's explicit runtime authorization.
    remove only the copied preflight executable, manifest, and named temporary
    child outputs from that directory.
 4. Restart once and prove the System32 X3Audio path and normal services.
-5. Retain control/pass/rollback evidence and exact tested hashes.
+5. Confirm that control and rollback show no RS2ServerFix success status.
+6. Retain control/pass/rollback evidence and exact tested hashes.
 
 Any startup failure, EAC/security intervention, unexpected module path,
 incompatible importer, genuine/companion validation failure, missing/partial
@@ -992,9 +1059,11 @@ Milestone 1 is complete only when:
   genuine module;
 - the exact disposable server proves local/bootstrap and System32/genuine
   coexistence and passes control/proxy/rollback with Steam, EOS, EAC, join,
-  travel, WebAdmin, and shutdown intact; forwarding fidelity remains an
-  offline-harness claim because VNGame imports only the initializer and the
-  exports intentionally emit no diagnostics;
+  travel, WebAdmin, and shutdown intact; the proxy pass also shows exactly one
+  success-console line matching the selected host identity while control and
+  rollback show none; forwarding fidelity remains an offline-harness claim
+  because VNGame imports only the initializer and the X3Audio exports
+  intentionally emit no diagnostics;
 - pre/post hashes prove no protected executable, shipped DLL, or configuration
   changed; expected runtime logs and named marker evidence are excluded from
   that invariant and retained separately;

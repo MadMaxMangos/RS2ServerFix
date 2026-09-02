@@ -5,12 +5,14 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-Status: Approved by Claude Opus 5 Max after implementation-plan review round 3
-on 2026-09-02; implementation and deployment have not begun
+Status: User-approved first-runtime console-status amendment incorporated on
+2026-09-02; awaiting focused Claude Opus 5 Max review. Implementation and
+deployment have not begun.
 
 **Goal:** Build and verify, without deployment, an AMD64
 `X3DAudio1_7.dll` bootstrap that preserves the qualified legacy X3Audio 1.7
 ABI, initializes an inert `RS2ServerFix.dll` companion outside loader lock,
+emits one exact success-only console confirmation after its complete marker,
 and supplies the bounded evidence tools needed for a later user-operated
 disposable-server control/pass/rollback experiment.
 
@@ -19,9 +21,10 @@ disposable-server control/pass/rollback experiment.
 System32 DLL through a non-waiting asynchronous `INIT_ONCE` publication with a
 bounded immutable fallback, forwards calls without observation, and starts one
 non-joined worker that validates and invokes `RS2ServerFix_InitializeV2`.
-The companion identifies the host and writes one schema-2 marker; separate
-offline tools own manifests, signature checks, PE/tree inspection, runtime
-module inventory, qualification evidence, and deployment reports.
+The companion identifies the host, writes one schema-2 marker, and makes one
+best-effort direct-standard-output write of its version/build/passive status;
+separate offline tools own manifests, signature checks, PE/tree inspection,
+runtime module inventory, qualification evidence, and deployment reports.
 
 **Tech Stack:** C++17, Win32, MSVC x64/Visual Studio 18 2026, Windows CNG
 (`bcrypt`), WinTrust, Version APIs, Tool Help, CMake 3.24+, CTest, and
@@ -62,6 +65,13 @@ serialization dependency is added.
   a basename-only handle lookup.
 - Exports never log, hash, invoke the companion, access game memory, catch a
   genuine exception, retry without bound, or fabricate X3Audio output.
+- The companion's only diagnostics are its schema-2 marker and, only after a
+  complete marker with result `kInitOk`, exactly one attempt to write this CRLF
+  line through standard output:
+  `[RS2ServerFix] v0.1.0.0 loaded; host=<eligible-build-identity>; X3Audio=System32; mode=passive; marker=complete`.
+  The write runs outside `DllMain` and all X3Audio exports, uses no heap or
+  logging framework, never retries or falls back, and cannot change the
+  initializer result or marker.
 - A worker makes one resolution attempt. An export retries exactly once only
   after a resource/API failure; validation failures fail fast immediately.
   Terminal failure is exactly `0xC0000602`.
@@ -113,6 +123,8 @@ serialization dependency is added.
   common `Sha256Digest` type.
 - `src/shared/bootstrap_abi.h` — exact 40-byte C-compatible V2 context and
   stable result values.
+- `src/shared/version.h` — one compile-time version quad/text source consumed
+  by both VERSIONINFO resources and the console formatter.
 - `src/shared/path_identity.h/.cpp` — correctly bounded path helpers, System32
   X3Audio path construction, and file identity.
 - `src/companion/sha256.h/.cpp` — existing CNG file hashing over the common
@@ -121,8 +133,10 @@ serialization dependency is added.
   no identity exposes or authorizes a mutation capability.
 - `src/companion/marker.h/.cpp` — schema-2 privacy-minimal marker, fallback,
   terminal record, and injectable short-write test seam.
+- `src/companion/console_status.h/.cpp` — fixed-buffer exact success-line
+  formatter and injectable one-attempt standard-output writer.
 - `src/companion/companion_init.h/.cpp` — V2 validation, non-waiting claim,
-  host hashing, location checks, and marker orchestration.
+  host hashing, location checks, marker orchestration, and success-line ordering.
 - `src/companion/companion_main.cpp`, `src/companion/RS2ServerFix.def`, and
   `src/companion/companion_version.rc` — inert `DllMain`, the sole V2 export,
   and honest project VERSIONINFO.
@@ -546,10 +560,13 @@ git commit -m "feat: add qualified x3audio manifest custody"
 - Modify: `src/shared/path_identity.h`
 - Modify: `src/shared/path_identity.cpp`
 - Modify: `src/shared/bootstrap_abi.h`
+- Create: `src/shared/version.h`
 - Modify: `src/companion/build_identity.h`
 - Modify: `src/companion/build_identity.cpp`
 - Modify: `src/companion/marker.h`
 - Modify: `src/companion/marker.cpp`
+- Create: `src/companion/console_status.h`
+- Create: `src/companion/console_status.cpp`
 - Modify: `src/companion/companion_init.h`
 - Modify: `src/companion/companion_init.cpp`
 - Modify: `src/companion/companion_main.cpp`
@@ -570,6 +587,8 @@ git commit -m "feat: add qualified x3audio manifest custody"
 - Produces: bounded `AppendPathLeaf` and `ExtractDirectoryAndLeaf` signatures.
 - Produces: `BootstrapContextV2`, `InitializeV2Fn`, and V2 validation.
 - Produces: schema-2 `MarkerData` and `RS2ServerFix_InitializeV2`.
+- Produces: shared `0.1.0.0` version definitions and an exact one-attempt
+  success-console writer.
 - Consumes: common digest type and existing CNG/build-identity behavior.
 
 - [ ] **Step 1: Write the exact path-boundary and V2 failure tests**
@@ -717,7 +736,88 @@ assert partial deletion. Keep one fallback attempt and captured
 `const MarkerFileOps&`; companion production code passes
 `ProductionMarkerFileOps()` explicitly.
 
-- [ ] **Step 4: Migrate initialization and exports to V2 only**
+- [ ] **Step 4: Write exact console-status tests**
+
+Add one RC/C++-compatible shared version header with these single-source
+definitions:
+
+```cpp
+#define RS2FIX_VERSION_QUAD 0,1,0,0
+#define RS2FIX_VERSION_ASCII "0.1.0.0"
+#define RS2FIX_VERSION_WIDE L"0.1.0.0"
+```
+
+Declare the DLL-local seam:
+
+```cpp
+struct ConsoleStatusOps {
+    void* context{};
+    HANDLE (*getStdOutput)(void*, DWORD*) noexcept{};
+    bool (*write)(
+        void*, HANDLE, const void*, DWORD, DWORD*, DWORD*) noexcept{};
+};
+const ConsoleStatusOps& ProductionConsoleStatusOps() noexcept;
+
+bool FormatLoadedConsoleLine(
+    BuildIdentity identity,
+    char* output,
+    std::size_t capacity,
+    std::size_t* bytesUsed) noexcept;
+bool TryWriteLoadedConsoleLine(
+    BuildIdentity identity,
+    const ConsoleStatusOps& ops) noexcept;
+```
+
+`FormatLoadedConsoleLine` returns a byte count excluding the trailing NUL and
+requires room for that NUL. It emits exact 7-bit ASCII plus CRLF for each of
+`Pr1CrashFullDump`, `Pr1StockBaseline`, `CurrentStock`, `CurrentFullDump`, and
+`Unknown`; it rejects `Indeterminate` and an out-of-range enum. On failure it
+sets `*bytesUsed` to zero and, when capacity is nonzero, starts output with NUL.
+
+Tests assert every exact identity line, including the full current-full-dump
+line, and cover null pointers, capacity zero, one byte less than the required
+storage, exactly required storage, and the production `char[192]` bound; a
+compile-time assertion proves the longest allowed line plus NUL fits. The
+injected writer covers null operation callbacks, null and
+`INVALID_HANDLE_VALUE` handles, failed/zero/short/exact writes, exactly one
+`getStdOutput` call, at most one `write` call, and no retry. Scan all lines for
+paths, hashes, user/account/player/network, EOS/EAC, token, command-line, and
+environment content. Assert the displayed version is
+`RS2FIX_VERSION_ASCII`; the final source and PE gates prove both resource
+scripts consume the same header and produce the same version.
+
+- [ ] **Step 5: Implement and order the one-attempt console status**
+
+Build the line from bounded constant fragments and `BuildIdentityName` into one
+fixed `char[192]` stack buffer. Do not use heap allocation, iostream,
+`OutputDebugString`, `WriteConsole`, Unreal logging, or CRT logging. The
+production adapter calls `GetStdHandle(STD_OUTPUT_HANDLE)` once and calls
+`WriteFile` exactly once only for a valid handle; failed, zero, or short writes
+return false with no retry or stderr fallback.
+
+Make the injectable orchestration signature exact:
+
+```cpp
+DWORD RunCompanionInitialization(
+    const BootstrapContextV2& context,
+    LONG volatile* state,
+    const MarkerFileOps& markerOps,
+    const ConsoleStatusOps& consoleOps) noexcept;
+```
+
+The production V2 export supplies `ProductionMarkerFileOps()` and
+`ProductionConsoleStatusOps()`. After `WriteMarkerWithFallback` returns a
+successfully written terminal `completion=complete` marker and only when the
+initializer result is `kInitOk`, call `TryWriteLoadedConsoleLine` once, then
+publish the terminal initialization state. Ignore the console return value.
+Marker failure, a partial marker, indeterminate identity, invalid context, and
+duplicate/rejected initialization make no console call. Console failure leaves
+the result `kInitOk` and the complete marker untouched. Tests inject ordering
+and prove marker-before-console, no console after marker failure, one call after
+success, failure nonfatality, and one line under duplicate/concurrent calls.
+Do not add a marker field or increment schema 2 for this diagnostic.
+
+- [ ] **Step 6: Migrate initialization and exports to V2 only**
 
 Rename all V1 validation and invocation symbols to V2. The context guarantees
 the genuine module and both exports, so `RunCompanionInitialization` sets the
@@ -753,8 +853,9 @@ hash PR1/current stock before and after, derive full-dump copies only in unique
 temporary files, verify their expected hashes, and delete the copies. No test
 writes either configured source executable.
 
-Remove the existing `OutputDebugStringW` calls so the schema-2 marker is the
-companion's only diagnostic output in this milestone.
+Remove the existing `OutputDebugStringW` calls. The schema-2 marker and the
+exact success-only standard-output line are the companion's only diagnostics
+in this milestone; the X3Audio exports remain silent.
 
 In the same change, remove the complete CMake target/registration blocks for
 `rs2_faultrep_bootstrap`, `rs2_pe_contract`, `rs2_static_import_harness`,
@@ -774,6 +875,7 @@ source set is:
 ```text
 src/companion/build_identity.cpp
 src/companion/companion_init.cpp
+src/companion/console_status.cpp
 src/companion/marker.cpp
 src/companion/sha256.cpp
 src/shared/digest.cpp
@@ -817,17 +919,19 @@ foreach ($leaf in @(
 This is custody-limited cleanup of obsolete worktree build outputs, not a
 source, game-tree, or recursive deletion.
 
-- [ ] **Step 5: Add honest companion VERSIONINFO**
+- [ ] **Step 7: Add honest companion VERSIONINFO**
 
 Enable RC in the project and add a version resource whose fixed and string
 fields identify `RS2ServerFix Project`, product `RS2ServerFix`, description
 `RS2ServerFix Milestone 1 Companion`, and original filename
-`RS2ServerFix.dll`. Fixed, file-string, and product-string versions are all
-`0.1.0.0`. It must contain no Microsoft, Epic, or Tripwire authorship claim.
-Use one `0409/04B0` string table plus matching translation and add it to the
-companion target.
+`RS2ServerFix.dll`. Fixed, file-string, and product-string versions all consume
+`RS2FIX_VERSION_QUAD`, `RS2FIX_VERSION_ASCII`, or the resource-compatible
+equivalent from `src/shared/version.h`; their resulting value is `0.1.0.0`.
+It must contain no Microsoft, Epic, or Tripwire authorship claim. Use one
+`0409/04B0` string table plus matching translation and add it to the companion
+target.
 
-- [ ] **Step 6: Run the focused red/green cycle and commit**
+- [ ] **Step 8: Run the focused red/green cycle and commit**
 
 Run the changed tests first to capture the expected compile/assertion failures,
 then implement and rerun:
@@ -841,10 +945,13 @@ rg -n "BootstrapContextV1|InitializeV1|RS2ServerFix_InitializeV1" `
 rg -n "FaultRep|faultrep|ReportFault" CMakeLists.txt
 rg -n -i "WriteProcessMemory|VirtualProtectEx|detour|hook|patch" `
   src/companion src/shared/bootstrap_abi.h
+rg -n "OutputDebugString|WriteConsole|UE_LOG|GLog" src/companion
 git diff --check
 ```
 
-Expected final searches: no matches. Commit:
+Expected final searches: no matches. Direct `GetStdHandle` and `WriteFile`
+appear only in `console_status.cpp`; inspect those call sites for the one-call,
+no-retry contract. Commit:
 
 ```powershell
 git add -- CMakeLists.txt src/shared src/companion `
@@ -1387,8 +1494,9 @@ EXPORTS
 The bootstrap resource identifies company `RS2ServerFix Project`, product
 `RS2ServerFix`, description `RS2ServerFix Passive X3Audio Bootstrap`, and
 original filename `X3DAudio1_7.dll`. Fixed, file-string, and product-string
-versions are all `0.1.0.0`, with no third-party authorship claim. Use one
-`0409/04B0` string table plus matching translation.
+versions consume the same `src/shared/version.h` definitions as the companion
+resource and console formatter and resolve to `0.1.0.0`, with no third-party
+authorship claim. Use one `0409/04B0` string table plus matching translation.
 
 Create `rs2_x3audio_bootstrap` from bootstrap sources, the shared path source,
 the `.def`, and `.rc`; set output name `X3DAudio1_7`. Restore the core smoke
@@ -1997,7 +2105,8 @@ git commit -m "test: add legacy x3audio functional harness"
 **Interfaces:**
 
 - Produces: strict absolute-path helpers, captured child stdout, qualified host
-  gate, nine functional cases, exact digest comparison, and rollback proof.
+  gate, nine functional cases, exact digest/status-line comparison, and rollback
+  proof.
 - Consumes: Tasks 2, 6-8 manifest, evidence, DLL, and harness outputs.
 
 - [ ] **Step 1: Add strict tool-only path primitives and tests**
@@ -2063,7 +2172,8 @@ Extend `ProcessResult` with a bounded one-MiB stdout/stderr string. For each
 child create an inheritable output file inside that case directory, redirect
 both handles, wait at most 20 seconds, terminate only to clean up a timeout, read
 the file after handle closure, and include output in failure evidence. Reject
-truncation.
+truncation. Preserve raw bytes so CRLF and exact success-console bytes can be
+validated independently from the digest line.
 
 Healthy children must be created, not time out, and exit 0. Missing-genuine
 children must be created, not time out, and exit exactly `0xC0000602`.
@@ -2096,7 +2206,8 @@ Run in this exact order:
 04-both:
   harness + production proxy + companion; run --mode vector
   --expect-modules proxy-and-system --expect-marker complete;
-  require digest == reference
+  require digest == reference; require exactly one exact status line
+  (the single-line literal defined immediately below this matrix)
 
 05-invalid-companion:
   harness + production proxy + malformed RS2ServerFix.dll;
@@ -2112,7 +2223,7 @@ Run in this exact order:
 07-concurrent-first-calls:
   harness + production proxy + companion; run --mode concurrent
   --expect-modules proxy-and-system --expect-marker complete;
-  require digest == reference
+  require digest == reference; require exactly the same one status line
 
 08-invalid-bootstrap:
   harness + malformed X3DAudio1_7.dll; attempt --mode vector
@@ -2124,6 +2235,12 @@ Run in this exact order:
   proxy, and companion; run --mode vector --expect-modules system-only
   --expect-marker absent;
   require digest == reference
+```
+
+The exact case-04/case-07 status-line bytes, including terminal CRLF, are:
+
+```text
+[RS2ServerFix] v0.1.0.0 loaded; host=unknown; X3Audio=System32; mode=passive; marker=complete\r\n
 ```
 
 Before case 01, resolve the runner's own executable path and use the same child
@@ -2138,7 +2255,12 @@ the runner then creates its normal matrix root. These checks remain part of
 Do not infer fidelity from process success: parse exactly one
 `digest_sha256=` line from every functional child, reject duplicates/malformed
 hashes, and compare bytes to the control digest. Capture each child PID and
-delete only its named marker during cleanup.
+delete only its named marker during cleanup. Parse success-console lines by
+exact raw CRLF-delimited bytes and independently of digest order. Cases 04 and
+07 require exactly one line with `host=unknown`, because the harness executable
+is not a preserved VNGame identity. Cases 01-03, 05-06, 08, and 09 require zero
+lines beginning `[RS2ServerFix]`; any duplicate, malformed, wrong-version,
+wrong-identity, or partial line fails the matrix.
 
 - [ ] **Step 5: Register the normal matrix with explicit target paths**
 
@@ -2849,8 +2971,9 @@ Do not invoke `rs2_runtime_inventory` against a server during implementation.
 
 **Interfaces:**
 
-- Produces: the exact user-operated custody, preflight, control, two-file pass,
-  immediate-shutdown, integrity, quarantine, and rollback procedure.
+- Produces: the exact user-operated custody, preflight, control, one-line
+  console-status, two-file pass, immediate-shutdown, integrity, quarantine, and
+  rollback procedure.
 - Consumes: reviewed Release hashes and the two evidence executables, but starts
   or changes nothing during implementation.
 
@@ -2894,8 +3017,9 @@ The operator starts the ordinary server command with neither DLL present,
 verifies Steam/EOS/EAC/network/map/WebAdmin/join behavior, and supplies its PID
 to `rs2_runtime_inventory --expect system-control`. Require two stable snapshots,
 one System32 X3Audio, no local proxy/companion, VNGame sole importer, and a
-passing sanitized inventory report. Record normal and immediate-post-readiness
-shutdown bounds, then stop normally.
+passing sanitized inventory report. Confirm there is no `[RS2ServerFix]`
+success line. Record normal and immediate-post-readiness shutdown bounds, then
+stop normally.
 
 - [ ] **Step 4: Define the exact two-file pass**
 
@@ -2905,6 +3029,7 @@ starts the identical command/environment, and requires:
 ```text
 local bootstrap + qualified System32 genuine + companion in stable inventory
 one terminal schema-2 marker for that PID
+exactly one visible success line whose host identity matches the selected hash
 Steam/EOS/EAC/network/map/WebAdmin/join/travel behavior matching control
 no AV/EDR, WDAC, AppLocker, or EAC intervention
 one bounded agreed idle/play interval
@@ -2913,8 +3038,18 @@ a separate immediate-post-readiness normal shutdown inside the same bound
 ```
 
 Use `rs2_runtime_inventory --expect proxy-pass` for both repetitions. Preserve
-reports and the exact captured marker paths. Do not force termination and call
-a forced cleanup a pass.
+reports, the exact captured marker paths, and the exact console line. For the
+planned current full-dump run the required visible line is:
+
+```text
+[RS2ServerFix] v0.1.0.0 loaded; host=current-full-dump; X3Audio=System32; mode=passive; marker=complete
+```
+
+For a different selected executable, derive only the `host=` value from its
+already verified build identity. Direct standard output may be visible in the
+attached console or its redirection; do not promise that the line enters
+Unreal's `Launch.log`. Do not force termination and call a forced cleanup a
+pass.
 
 - [ ] **Step 5: Define integrity comparison and rollback**
 
@@ -2926,7 +3061,8 @@ While stopped, remove only the two added DLLs and captured task markers.
 Preserve reports elsewhere, then remove only the copied preflight executable,
 manifest, and named child outputs from the task evidence directory. Restart once
 with the ordinary command, require `system-control` inventory and normal
-services, then stop normally. Record exact control/pass/rollback hashes.
+services, confirm no RS2ServerFix success line, then stop normally. Record exact
+control/pass/rollback hashes.
 
 If security software quarantines either DLL, do not disable the control or add
 an exclusion. Stop, preserve the alert, remove the remaining exact task files,
@@ -3024,6 +3160,10 @@ git ls-files --eol config/qualified_x3audio_genuine.manifest
 rg -n -i "ReportFault|BootstrapContextV1|InitializeV1|rs2_faultrep_bootstrap|RS2_SYSTEM_FAULTREP" CMakeLists.txt src tests tools
 rg -n -i "faultrep\.dll" CMakeLists.txt src tests tools
 rg -n "x3daudio.h" src/bootstrap
+rg -n "RS2FIX_VERSION_(QUAD|ASCII|WIDE)" `
+  src/shared/version.h src/companion/console_status.cpp `
+  src/companion/companion_version.rc src/bootstrap/bootstrap_version.rc
+rg -n "OutputDebugString|WriteConsole|UE_LOG|GLog" src
 git diff --check
 git status --short
 ```
@@ -3032,7 +3172,10 @@ Required: exact export/ordinal/import/TLS/VERSIONINFO contracts pass; manifest
 reports `i/crlf w/crlf`; the first banned-symbol scan and bootstrap-header scan
 have no matches. Every `faultrep.dll` hit from the second scan must be an
 explicit preflight rejection or negative test, never a target, import, export,
-or runtime loader path. Diff check exits 0.
+or runtime loader path. The version scan proves both resource scripts and the
+console formatter use the shared definitions; the logging-framework scan has no
+matches. Direct `GetStdHandle`/`WriteFile` calls exist only in the reviewed
+console-status and marker/file adapters. Diff check exits 0.
 The only uncommitted paths permitted during this step are ignored
 `build-verify` outputs.
 
@@ -3112,6 +3255,7 @@ user instruction.
 | Async INIT_ONCE, immutable fallback, bounded references, no waits | Task 5; Task 10 early-exit evidence |
 | Minimal DllMain and one non-joined worker | Tasks 6, 10, 13 |
 | Companion V2, host identity, marker schema 2, privacy/fallback | Tasks 3, 6, 8, 9 |
+| Exact one-time success console line, shared version, and nonfatal failure | Tasks 3, 6, 9, 13, 14 |
 | Resource retry, validation fail-fast, exact 0xC0000602 | Tasks 4, 5, 9 |
 | Strict qualified manifest and non-circular qualification | Tasks 1, 2, 9, 10 |
 | Normal and delay import parsing, TLS, PE contracts, VERSIONINFO | Task 7 |
