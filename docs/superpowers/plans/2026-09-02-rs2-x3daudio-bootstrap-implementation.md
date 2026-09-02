@@ -5,8 +5,8 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-Status: Self-reviewed; awaiting Claude Opus 5 Max implementation-plan review
-round 1
+Status: Revised after Claude Opus 5 Max implementation-plan review round 1;
+awaiting focused review round 2
 
 **Goal:** Build and verify, without deployment, an AMD64
 `X3DAudio1_7.dll` bootstrap that preserves the qualified legacy X3Audio 1.7
@@ -75,7 +75,9 @@ serialization dependency is added.
   accept only `qualified` entries.
 - `.gitattributes` must be committed before the manifest is first staged. The
   manifest commit must also add its referenced seed evidence record. The
-  checked-in manifest must report `i/crlf w/crlf` from `git ls-files --eol`.
+  checked-in manifest must report `i/crlf w/crlf` from `git ls-files --eol`;
+  `/config/*.manifest -whitespace` makes `git diff --check` defer the exact byte
+  grammar to the strict parser/tests instead of flagging each preserved CR.
 - All CLI evidence paths are explicit absolute paths. There is no current
   directory, executable-directory, compiled-in, or basename fallback.
 - Each evidence CLI accepts `--help` as its sole argument, prints its complete
@@ -99,7 +101,7 @@ serialization dependency is added.
 ## Final File Map
 
 - `.gitattributes` — preserves the reviewed manifest bytes with
-  `/config/*.manifest -text`.
+  `/config/*.manifest -text -whitespace`.
 - `config/qualified_x3audio_genuine.manifest` — authoritative schema-1
   qualified/provisional System32 identity catalogue.
 - `docs/evidence/x3audio/9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446.md`
@@ -133,7 +135,7 @@ serialization dependency is added.
   the production fail-fast terminal.
 - `src/bootstrap/companion_loader.h/.cpp` — absolute sibling validation,
   V2 invocation, and persistent companion reference.
-- `src/bootstrap/bootstrap_main.cpp`, `src/bootstrap/X3Audio1_7.def`, and
+- `src/bootstrap/bootstrap_main.cpp`, `src/bootstrap/X3DAudio1_7.def`, and
   `src/bootstrap/bootstrap_version.rc` — two public exports, one worker,
   minimal `DllMain`, ordinals, and honest project VERSIONINFO.
 - `tools/genuine_manifest.h/.cpp` — strict manifest parser, qualified lookup,
@@ -163,6 +165,8 @@ serialization dependency is added.
 - `tests/normal_import_fixture.cpp` and `tests/delay_import_fixture.cpp` —
   non-executed PE parser/importer fixtures.
 - `tests/pe_reader_tests.cpp` — parser mutation cases and contract gates.
+- `tests/X3DAudio1_7_named_import.def` — ordinal-free, test-only source for the
+  by-name import library used by the fixtures and static harness.
 - `tests/static_import_harness.cpp` — real named legacy initializer import,
   fixed initialize/calculate vector, module proof, digest, concurrent mode,
   fail-fast modes, and immediate-exit mode.
@@ -193,7 +197,7 @@ serialization dependency is added.
 Use `apply_patch` to create `.gitattributes` with exactly:
 
 ```gitattributes
-/config/*.manifest -text
+/config/*.manifest -text -whitespace
 ```
 
 - [ ] **Step 2: Verify the attribute before any manifest exists or is staged**
@@ -201,7 +205,7 @@ Use `apply_patch` to create `.gitattributes` with exactly:
 Run:
 
 ```powershell
-git check-attr text -- config/qualified_x3audio_genuine.manifest
+git check-attr text whitespace -- config/qualified_x3audio_genuine.manifest
 git diff --check
 ```
 
@@ -209,6 +213,7 @@ Expected first command:
 
 ```text
 config/qualified_x3audio_genuine.manifest: text: unset
+config/qualified_x3audio_genuine.manifest: whitespace: unset
 ```
 
 Expected second command: exit 0.
@@ -253,7 +258,8 @@ Do not stage the manifest in this commit.
   `ParseQualificationEvidence`, and `WriteQualificationEvidenceCreateNew`.
 - Produces: validated temporary-root/file/process helpers shared by later test
   translation units.
-- Consumes: the Task 1 `-text` attribute and existing test framework.
+- Consumes: the Task 1 `-text -whitespace` attributes and existing test
+  framework.
 
 - [ ] **Step 1: Declare exact common digest and manifest types**
 
@@ -480,8 +486,9 @@ used for the byte-for-byte round-trip and Task 10 output verification.
 
 - [ ] **Step 5: Add the exact seed manifest and evidence in the same commit**
 
-The manifest's bytes are exactly the canonical record from specification lines
-667-680, with CRLF after all 14 lines. The evidence Markdown records:
+The manifest's bytes are exactly the 14 canonical record lines from
+specification lines 670-683 (excluding the surrounding fences), with CRLF after
+all 14 lines. The evidence Markdown records:
 
 ```text
 SHA-256: 9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446
@@ -548,6 +555,8 @@ git commit -m "feat: add qualified x3audio manifest custody"
 - Modify: `src/companion/RS2ServerFix.def`
 - Create: `src/companion/companion_version.rc`
 - Delete: `src/bootstrap/faultrep.def`
+- Delete: `tools/pe_contract.cpp` (Task 7 recreates it)
+- Delete: `tools/deployment_preflight.cpp` (Task 11 recreates it)
 - Delete: `tests/static_import_harness.cpp` (Task 8 recreates it)
 - Delete: `tests/static_import_runner.cpp` (Task 9 recreates it)
 - Delete: `tests/preflight_fixture_test.cpp` (Task 11 recreates it)
@@ -598,8 +607,12 @@ the supplied capacity, output starts empty on failure, and errors distinguish
 ends in `\\X3DAudio1_7.dll` and fits a 512-wide-character buffer.
 
 For the no-overread cases, place each input at the end of one committed page
-followed by a `PAGE_NOACCESS` guard page; an access violation is a test failure.
-Do not infer this property merely from a returned error code.
+followed by a `PAGE_NOACCESS` guard page. Invoke each helper through a
+test-only, no-RAII SEH leaf that uses `__try`/`__except`, handles only
+`EXCEPTION_ACCESS_VIOLATION`, records that exception as a failed assertion, and
+continues the parent `core` role; every other exception continues search. The
+allocation and cleanup stay outside the SEH leaf. Do not infer no-overread merely
+from a returned error code and do not let one overread terminate the whole role.
 
 Declare and test the exact ABI:
 
@@ -742,27 +755,66 @@ writes either configured source executable.
 Remove the existing `OutputDebugStringW` calls so the schema-2 marker is the
 companion's only diagnostic output in this milestone.
 
-In the same change, remove `rs2_faultrep_bootstrap`, the FaultRep import-library
-search, faultrep-specific sources in `rs2_core_tests`, and the old bootstrap,
-harness, static-runner, and preflight CTest registrations from `CMakeLists.txt`.
-Delete `src/bootstrap/faultrep.def`. The remaining old bootstrap `.cpp/.h`
-files are temporarily unreferenced inputs that Task 4 rewrites; no target may
-compile or emit faultrep code during that interval.
+In the same change, remove the complete CMake target/registration blocks for
+`rs2_faultrep_bootstrap`, `rs2_pe_contract`, `rs2_static_import_harness`,
+`rs2_static_import_runner`, `rs2_deployment_preflight`, and
+`rs2_preflight_fixture_test`, including the FaultRep import-library search and
+all five non-core CTest registrations. Delete `src/bootstrap/faultrep.def`, the
+three old process/preflight test sources, and the two old faultrep-specific tool
+mains listed in this task. Tasks 7, 8, 9, and 11 recreate those tools/tests only
+after their X3Audio contracts exist.
 
-Delete the three old faultrep-specific process/preflight test sources listed in
-this task; later tasks recreate them from their X3Audio contracts rather than
-incrementally preserving obsolete assumptions.
+Remove `src/bootstrap/companion_loader.cpp`, `forwarder.cpp`, and
+`genuine_resolver.cpp` from `rs2_core_tests` and remove every corresponding old
+resolver/forwarder/loader test plus `TestBuiltDllSmoke` and their calls from
+`tests/core_tests.cpp`. After Task 2 additions, the exact intermediate core
+source set is:
 
-Temporarily remove the stale PE-contract registrations as well; Task 7 restores
-them only after their X3Audio implementations exist. After this cutover,
-`ctest -N` lists only the passing `core` role until later tasks deliberately add
-the new roles. Do not leave a registered test that still asserts V1/faultrep.
+```text
+src/companion/build_identity.cpp
+src/companion/companion_init.cpp
+src/companion/marker.cpp
+src/companion/sha256.cpp
+src/shared/digest.cpp
+src/shared/path_identity.cpp
+tools/genuine_manifest.cpp
+tests/test_support.cpp
+tests/manifest_tests.cpp
+tests/companion_tests.cpp
+tests/core_tests.cpp
+```
+
+Its only target dependency is `rs2_server_fix_companion`. The remaining old
+bootstrap `.cpp/.h` files are temporarily unreferenced inputs that Tasks 4-6
+rewrite; no target compiles or emits faultrep code during that interval. After
+this cutover, `ctest -N` lists only the passing `core` role. Do not leave a
+target or registered test that still asserts V1/faultrep.
 
 Reconfigure the existing tree while deleting the obsolete cache entry:
 
 ```powershell
 cmake -U RS2_SYSTEM_FAULTREP_IMPORT_LIBRARY -S . -B build-plan
 ```
+
+CMake does not remove outputs of a deleted target. After reconfiguration,
+resolve `build-plan` and verify each candidate below is a direct file beneath
+its `Debug` child, then remove only the literal files that exist:
+
+```powershell
+$buildRoot = (Resolve-Path -LiteralPath 'build-plan').Path
+$debugRoot = Join-Path $buildRoot 'Debug'
+foreach ($leaf in @(
+    'faultrep.dll', 'faultrep.lib', 'faultrep.exp',
+    'faultrep.pdb', 'faultrep.ilk')) {
+  $candidate = Join-Path $debugRoot $leaf
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+    Remove-Item -LiteralPath $candidate
+  }
+}
+```
+
+This is custody-limited cleanup of obsolete worktree build outputs, not a
+source, game-tree, or recursive deletion.
 
 - [ ] **Step 5: Add honest companion VERSIONINFO**
 
@@ -795,7 +847,8 @@ Expected final searches: no matches. Commit:
 
 ```powershell
 git add -- CMakeLists.txt src/shared src/companion `
-  src/bootstrap/faultrep.def tests
+  src/bootstrap/faultrep.def tests tools/pe_contract.cpp `
+  tools/deployment_preflight.cpp
 git commit -m "feat: migrate companion to x3audio ABI v2"
 ```
 
@@ -817,6 +870,9 @@ git commit -m "feat: migrate companion to x3audio ABI v2"
   failure classification, injectable operations, and
   `ResolveGenuineX3AudioPrivate`.
 - Consumes: Task 3 path/file-identity functions.
+- Build graph: add `src/bootstrap/genuine_resolver.cpp` and
+  `tests/resolver_tests.cpp` to `rs2_core_tests`; the old companion loader and
+  forwarder remain absent until Tasks 6 and 5 respectively.
 
 - [ ] **Step 1: Lock the legacy ABI and result model in compile-time tests**
 
@@ -1007,6 +1063,8 @@ Expected source scan: no matches.
   `AcquireGenuineX3Audio`, `ReleaseGenuineX3AudioLease`,
   `TryForwardInitialize`, `TryForwardCalculate`, and `FailFastX3Audio`.
 - Consumes: Task 4 private resolver and operation table.
+- Build graph: add `src/bootstrap/forwarder.cpp` to `rs2_core_tests`; retain the
+  Task 4 resolver sources and tests, but do not add `companion_loader.cpp` yet.
 
 - [ ] **Step 1: Declare the zero-initialized state and value lease**
 
@@ -1028,15 +1086,28 @@ struct GenuineDispatchLease {
     bool valid{};
     bool releaseModuleOnClose{};
 };
+
+GenuineDispatchLease AcquireGenuineX3Audio(
+    GenuineResolverState* state,
+    HMODULE bootstrap,
+    const GenuineResolverOps& ops,
+    AcquireMode mode) noexcept;
+void ReleaseGenuineX3AudioLease(
+    GenuineDispatchLease* lease,
+    const GenuineResolverOps& ops) noexcept;
 ```
 
 The lease copies a complete immutable dispatch by value. Persistent normal or
 fallback leases set `releaseModuleOnClose=false`; a private current-operation
 lease sets it true. `ReleaseGenuineX3AudioLease` calls the injected
 `freeLibrary` exactly once only for a valid transient lease, then clears it.
-Assert at compile time and in the fallback test that every context address has
-the low `INIT_ONCE_CTX_RESERVED_BITS` bits clear. `VirtualAlloc` supplies the
-normal page alignment and `alignas(8)` supplies the static alignment.
+Define the required context alignment as
+`std::uintptr_t{1} << INIT_ONCE_CTX_RESERVED_BITS`; use `static_assert` on
+`alignof(GenuineResolverState)` and `offsetof(GenuineResolverState, fallback)`
+rather than attempting to assert a runtime address as a constant expression.
+Runtime unit assertions check the low reserved bits of both an allocated normal
+record and `&state.fallback`. `VirtualAlloc` supplies normal page alignment and
+`alignas(8)` supplies static alignment.
 
 - [ ] **Step 2: Write deterministic publication tests with fake operations**
 
@@ -1194,7 +1265,7 @@ Expected resolver wait-primitive scan: no matches.
 - Rewrite: `src/bootstrap/companion_loader.h`
 - Rewrite: `src/bootstrap/companion_loader.cpp`
 - Rewrite: `src/bootstrap/bootstrap_main.cpp`
-- Create: `src/bootstrap/X3Audio1_7.def`
+- Create: `src/bootstrap/X3DAudio1_7.def`
 - Create: `src/bootstrap/bootstrap_version.rc`
 - Modify: `tests/companion_tests.cpp`
 - Modify: `tests/core_tests.cpp`
@@ -1207,6 +1278,10 @@ Expected resolver wait-primitive scan: no matches.
 - Produces: `BuildCompanionPath`, V2 companion validation/load/invocation, the
   production bootstrap DLL, and the isolated missing-genuine test DLL.
 - Consumes: Tasks 3-5 V2 ABI, resolver state/leases, and forwarders.
+- Build graph: return `src/bootstrap/companion_loader.cpp` to
+  `rs2_core_tests`; create the production and isolated test bootstrap targets
+  from the Task 4/5 resolver and forwarder sources. No generated bootstrap
+  import library is linked into a test consumer.
 
 - [ ] **Step 1: Write companion-loader V2 tests**
 
@@ -1297,10 +1372,10 @@ extern "C" void WINAPI X3DAudioCalculate(
 }
 ```
 
-`X3Audio1_7.def` is exactly:
+`X3DAudio1_7.def` is exactly:
 
 ```def
-LIBRARY X3Audio1_7
+LIBRARY X3DAudio1_7
 EXPORTS
     X3DAudioCalculate @1
     X3DAudioInitialize @2
@@ -1317,7 +1392,9 @@ versions are all `0.1.0.0`, with no third-party authorship claim. Use one
 Create `rs2_x3audio_bootstrap` from bootstrap sources, the shared path source,
 the `.def`, and `.rc`; set output name `X3DAudio1_7`. Restore the core smoke
 dependency on this target and the companion. Remove the unreferenced old
-faultrep implementation completely.
+faultrep implementation completely. The ordinal-bearing target-generated import
+library is not a test linkage mechanism; Task 7 creates the separate by-name
+test import library.
 
 - [ ] **Step 6: Build the non-deployable missing-genuine variant in isolation**
 
@@ -1387,7 +1464,8 @@ git commit -m "feat: cut over to passive x3audio bootstrap"
 - Create: `tools/file_evidence.cpp`
 - Create: `tools/pe_contract_lib.h`
 - Create: `tools/pe_contract_lib.cpp`
-- Rewrite: `tools/pe_contract.cpp`
+- Create: `tools/pe_contract.cpp`
+- Create: `tests/X3DAudio1_7_named_import.def`
 - Create: `tests/normal_import_fixture.cpp`
 - Create: `tests/delay_import_fixture.cpp`
 - Create: `tests/pe_reader_tests.cpp`
@@ -1398,7 +1476,9 @@ git commit -m "feat: cut over to passive x3audio bootstrap"
 - Produces: complete bounded normal/delay import metadata, PE identity/TLS
   metadata, fixed-version evidence, embedded-signature result, and reusable PE
   contract checks.
-- Consumes: production DLLs and their generated X3Audio import library.
+- Consumes: production DLLs plus a separate test-only, by-name X3Audio import
+  library; no test consumer links the ordinal-bearing production import
+  library.
 
 - [ ] **Step 1: Extend the PE model before changing the parser**
 
@@ -1420,6 +1500,12 @@ struct Image {
 };
 ```
 
+Rename the old `imports` field to `normalImports` and update every retained
+consumer in the same step. Task 3 deleted the old faultrep-specific PE/preflight
+mains, so they are not deferred stale consumers; Task 11 creates the new
+preflight against `normalImports`/`delayImports`. A whole-tree
+`rg -n "\.imports\b" tools tests` must have no matches after this step.
+
 Store image base in the internal parsed headers so VA-form delay descriptors can
 be converted with checked subtraction. A data-directory entry is valid only
 when RVA and size are both zero or both nonzero.
@@ -1431,6 +1517,40 @@ directories/arrays must also fit the backing file before vector reservation.
 
 - [ ] **Step 2: Build real normal and delay fixtures**
 
+Create `tests/X3DAudio1_7_named_import.def` exactly as:
+
+```def
+LIBRARY X3DAudio1_7
+EXPORTS
+    X3DAudioCalculate
+    X3DAudioInitialize
+```
+
+Keep this ordinal-free file test-only. Generate its configuration-specific
+import library with the MSVC archiver rather than the bootstrap target:
+
+```cmake
+get_filename_component(_rs2_archiver_name "${CMAKE_AR}" NAME)
+if(NOT _rs2_archiver_name MATCHES "^lib(\\.exe)?$")
+  message(FATAL_ERROR "MSVC lib.exe is required for the named X3Audio test import library")
+endif()
+set(_rs2_named_import_dir
+  "${CMAKE_CURRENT_BINARY_DIR}/test-import/$<CONFIG>")
+set(RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY
+  "${_rs2_named_import_dir}/X3DAudio1_7_named.lib")
+add_custom_command(
+  OUTPUT "${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${_rs2_named_import_dir}"
+  COMMAND "${CMAKE_AR}" /NOLOGO
+    /DEF:${CMAKE_CURRENT_SOURCE_DIR}/tests/X3DAudio1_7_named_import.def
+    /NAME:X3DAudio1_7.dll /MACHINE:X64
+    /OUT:${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/X3DAudio1_7_named_import.def
+  VERBATIM)
+add_custom_target(rs2_x3audio_named_import_library
+  DEPENDS "${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}")
+```
+
 Both fixture executables declare the imported legacy initializer as:
 
 ```cpp
@@ -1440,10 +1560,12 @@ volatile auto g_x3audioImportAnchor = &X3DAudioInitialize;
 int main() { return g_x3audioImportAnchor == nullptr ? 1 : 0; }
 ```
 
-Link both to `rs2_x3audio_bootstrap`, which uses its generated import library.
-For the delay fixture additionally link `delayimp.lib` and pass
-`/DELAYLOAD:X3DAudio1_7.dll`. These PE fixtures are parser inputs and are not
-executed.
+Link both to the explicit `${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}` path and add a
+dependency on `rs2_x3audio_named_import_library`. Do not link either fixture to
+`rs2_x3audio_bootstrap`. For the delay fixture additionally link `delayimp.lib`
+and pass `/DELAYLOAD:X3DAudio1_7.dll`. These PE fixtures are parser inputs and
+are not executed. Their parsed imports must prove that this library generated a
+by-name rather than ordinal thunk.
 
 - [ ] **Step 3: Write parser mutation tests first**
 
@@ -1583,10 +1705,25 @@ and `bcrypt.dll`, no dynamic CRT, and VERSIONINFO exactly matching company
 identity value. Both project DLL contracts require fixed and display version
 `0.1.0.0` and exactly one `0409/04B0` translation.
 
-Harness requirements: AMD64 PE32+ executable with one normal
-`X3DAudio1_7.dll!X3DAudioInitialize` by-name import and no X3Audio delay
-import. The initial allowlists are exact; an observed API-set import is a
-failure requiring reviewed amendment, not a prefix wildcard.
+Harness requirements: AMD64 PE32+ executable with all three security flags,
+zero TLS, one normal `X3DAudio1_7.dll!X3DAudioInitialize` by-name import, no
+X3Audio delay import, and no dynamic Visual C++ runtime. Its exact initial
+direct-module allowlist is `KERNEL32.dll`, `bcrypt.dll`, and
+`X3DAudio1_7.dll`; an observed API-set import is a failure requiring reviewed
+amendment, not a prefix wildcard.
+
+The PE CLI has this exact named grammar:
+
+```text
+rs2_pe_contract
+  --kind <bootstrap|companion|harness>
+  --file <absolute existing plain file>
+```
+
+Each option occurs exactly once; relative, duplicate, unknown, missing, or
+quoted values return usage error 2 before a file is opened. Sole `--help`
+prints this complete grammar and returns 0 without file access; combining
+`--help` with anything returns 2.
 
 The CLI prints separate `normal_import_` and `delay_import_` evidence,
 metadata/TLS, VERSIONINFO identity, exports, all findings, and terminal
@@ -1612,12 +1749,28 @@ with these exact registrations:
 
 ```cmake
 add_test(NAME pe_bootstrap_contract
-  COMMAND rs2_pe_contract bootstrap
-          $<TARGET_FILE:rs2_x3audio_bootstrap>)
+  COMMAND rs2_pe_contract
+    --kind bootstrap
+    --file $<TARGET_FILE:rs2_x3audio_bootstrap>)
 add_test(NAME pe_companion_contract
-  COMMAND rs2_pe_contract companion
-          $<TARGET_FILE:rs2_server_fix_companion>)
+  COMMAND rs2_pe_contract
+    --kind companion
+    --file $<TARGET_FILE:rs2_server_fix_companion>)
 ```
+
+Pass the PE tool's absolute target path to `rs2_core_tests`:
+
+```cmake
+target_compile_definitions(rs2_core_tests PRIVATE
+  RS2_PE_CONTRACT_PATH=L\"$<TARGET_FILE:rs2_pe_contract>\")
+add_dependencies(rs2_core_tests rs2_pe_contract)
+```
+
+In `RunPeReaderTests`, launch that path once with sole `--help` and once with
+`--help --file <absolute-nonexistent-sentinel>`; require exit 0/2 respectively,
+require the first output to list every option/value, and prove neither
+invocation opens or creates the sentinel. This stays inside the existing `core`
+role.
 
 Run and commit:
 
@@ -1627,10 +1780,12 @@ cmake --build build-plan --config Debug --target rs2_core_tests `
 ctest --test-dir build-plan -C Debug `
   -R '^(core|pe_bootstrap_contract|pe_companion_contract)$' `
   --output-on-failure
-& 'build-plan\Debug\rs2_pe_contract.exe' bootstrap `
-  'build-plan\Debug\X3DAudio1_7.dll'
-& 'build-plan\Debug\rs2_pe_contract.exe' companion `
-  'build-plan\Debug\RS2ServerFix.dll'
+& 'build-plan\Debug\rs2_pe_contract.exe' `
+  --kind bootstrap --file `
+  (Resolve-Path 'build-plan\Debug\X3DAudio1_7.dll')
+& 'build-plan\Debug\rs2_pe_contract.exe' `
+  --kind companion --file `
+  (Resolve-Path 'build-plan\Debug\RS2ServerFix.dll')
 git diff --check
 git add -- CMakeLists.txt tools tests
 git commit -m "feat: enforce x3audio PE contracts"
@@ -1652,8 +1807,8 @@ git commit -m "feat: enforce x3audio PE contracts"
 - Produces: a real normal import of the legacy initializer, one deterministic
   functional vector/digest, exact module-set proof, concurrent/failure/exit
   modes, and the restored `pe_harness_contract` role.
-- Consumes: the production bootstrap's generated import library and Task 7 PE
-  contract code.
+- Consumes: Task 7's explicit by-name test import library and PE contract code;
+  it never links the production bootstrap target's ordinal import library.
 
 - [ ] **Step 1: Isolate the newer SDK declarations from the legacy import**
 
@@ -1754,12 +1909,12 @@ array element, or structure padding. Print exactly one uppercase line
 
 - [ ] **Step 4: Prove the complete X3Audio module set**
 
-Use a complete current-process Tool Help module snapshot and full paths. In
-`--expect-system-only` mode require exactly one X3Audio basename whose identity
-equals the constructed System32 path. In `--expect-proxy-and-system` mode
-require exactly two distinct identities: the executable-directory proxy and
-System32 genuine. Reject pathless entries, duplicate identities, extra
-X3Audio basenames, or basename-only matching.
+Use a complete current-process Tool Help module snapshot and full paths. With
+`--expect-modules system-only`, require exactly one X3Audio basename whose
+identity equals the constructed System32 path. With
+`--expect-modules proxy-and-system`, require exactly two distinct identities:
+the executable-directory proxy and System32 genuine. Reject pathless entries,
+duplicate identities, extra X3Audio basenames, or basename-only matching.
 
 After the vector, validate either a terminal schema-2 marker for the current PID
 or continuous absence for the bounded no-marker interval. The complete marker
@@ -1768,21 +1923,26 @@ initializer result 0, and terminal completion.
 
 - [ ] **Step 5: Add bounded harness modes**
 
-The argument parser accepts only:
+The complete grammar is:
 
 ```text
---mode vector
---mode concurrent
---mode fail-initialize
---mode fail-calculate
---mode immediate-exit
+rs2_static_import_harness
+  --mode <vector|concurrent|fail-initialize|fail-calculate|immediate-exit>
+  [--expect-modules <system-only|proxy-and-system>
+   --expect-marker <absent|complete>]
 ```
 
-`vector` requires a module expectation and marker expectation. `concurrent`
-creates 16 test threads behind one event; each owns separate zeroed vector data,
-runs initialize then calculate, and all 16 digests must equal before one digest
-is printed. Waits in harness test code are allowed and bounded to 20 seconds;
-they are not bootstrap synchronization.
+`vector` and `concurrent` require exactly one `--expect-modules` and one
+`--expect-marker`; every failure/immediate-exit mode forbids both. Every option
+occurs at most once and unknown, duplicate, missing, quoted, or mode-incompatible
+values return usage error 2 before a mode action. Sole `--help` prints the
+complete grammar and returns 0; any combination with `--help` returns 2 without
+running a vector or touching a marker.
+
+`concurrent` creates 16 test threads behind one event; each owns separate zeroed
+vector data, runs initialize then calculate, and all 16 digests must equal before
+one digest is printed. Waits in harness test code are allowed and bounded to 20
+seconds; they are not bootstrap synchronization.
 
 `fail-initialize` calls the imported initializer once. `fail-calculate` finds
 the exact local proxy and invokes its Calculate export once with zeroed opaque
@@ -1791,27 +1951,32 @@ expected not to return. `immediate-exit` calls `ExitProcess(0)` as the first
 mode action after argument validation. Disable critical-error UI for every
 mode.
 
-- [ ] **Step 6: Link by generated import library and enforce the harness PE**
+- [ ] **Step 6: Link the by-name test library and enforce the harness PE**
 
 ```cmake
 target_link_libraries(rs2_static_import_harness PRIVATE
-  rs2_x3audio_bootstrap bcrypt)
+  "${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}" bcrypt)
 add_dependencies(rs2_static_import_harness
+  rs2_x3audio_named_import_library
   rs2_server_fix_companion)
 add_test(NAME pe_harness_contract
-  COMMAND rs2_pe_contract harness
-          $<TARGET_FILE:rs2_static_import_harness>)
+  COMMAND rs2_pe_contract
+    --kind harness
+    --file $<TARGET_FILE:rs2_static_import_harness>)
 ```
 
-Do not search an SDK import library. Run:
+Do not search an SDK import library and do not link
+`rs2_x3audio_bootstrap`. Run:
 
 ```powershell
 cmake --build build-plan --config Debug --target rs2_static_import_harness `
   rs2_pe_contract
 ctest --test-dir build-plan -C Debug -R '^pe_harness_contract$' `
   --output-on-failure
-& 'build-plan\Debug\rs2_pe_contract.exe' harness `
-  'build-plan\Debug\rs2_static_import_harness.exe'
+& 'build-plan\Debug\rs2_static_import_harness.exe' --help
+& 'build-plan\Debug\rs2_pe_contract.exe' `
+  --kind harness --file `
+  (Resolve-Path 'build-plan\Debug\rs2_static_import_harness.exe')
 git diff --check
 git add -- CMakeLists.txt src/companion/sha256.* `
   tests/static_import_harness.cpp tools/pe_contract_lib.cpp
@@ -1871,7 +2036,10 @@ rs2_static_import_runner
 ```
 
 The parser rejects relative, duplicate, unknown, missing, or quoted values and
-never searches the current/executable directory.
+never searches the current/executable directory. Sole `--help` prints this
+complete normal-mode grammar and exits 0 before path, file, process, or marker
+work; combining it with any other token returns usage error 2. Task 10 extends
+the same help text when it adds the two disjoint modes.
 
 Before creating a case root:
 
@@ -1911,41 +2079,60 @@ Run in this exact order:
 
 ```text
 01-system-control:
-  harness only; expect System32 only; forbid marker; save reference digest
+  harness only; run --mode vector --expect-modules system-only
+  --expect-marker absent; save reference digest
 
 02-companion-only:
-  harness + RS2ServerFix.dll; expect System32 only; forbid marker;
+  harness + RS2ServerFix.dll; run --mode vector
+  --expect-modules system-only --expect-marker absent;
   require digest == reference
 
 03-bootstrap-only:
-  harness + production X3DAudio1_7.dll; expect proxy+System32;
-  forbid marker; require digest == reference
+  harness + production X3DAudio1_7.dll; run --mode vector
+  --expect-modules proxy-and-system --expect-marker absent;
+  require digest == reference
 
 04-both:
-  harness + production proxy + companion; expect proxy+System32;
-  require complete marker; require digest == reference
+  harness + production proxy + companion; run --mode vector
+  --expect-modules proxy-and-system --expect-marker complete;
+  require digest == reference
 
 05-invalid-companion:
   harness + production proxy + malformed RS2ServerFix.dll;
-  expect proxy+System32; forbid marker; require digest == reference
+  run --mode vector --expect-modules proxy-and-system
+  --expect-marker absent; require digest == reference
 
 06-missing-genuine:
   harness + isolated missing-genuine file named X3DAudio1_7.dll;
-  one fail-initialize child and one fail-calculate child;
+  run one child with --mode fail-initialize and one with
+  --mode fail-calculate; no expectation options;
   both exact exit 0xC0000602; no complete marker
 
 07-concurrent-first-calls:
-  harness + production proxy + companion; concurrent mode;
-  expect proxy+System32; require complete marker and digest == reference
+  harness + production proxy + companion; run --mode concurrent
+  --expect-modules proxy-and-system --expect-marker complete;
+  require digest == reference
 
 08-invalid-bootstrap:
-  harness + malformed X3DAudio1_7.dll; require documented loader rejection
+  harness + malformed X3DAudio1_7.dll; attempt --mode vector
+  --expect-modules proxy-and-system --expect-marker absent;
+  require documented loader rejection before a successful vector
 
 09-rollback:
   reuse stopped 04 directory after deleting only its captured PID marker,
-  proxy, and companion; expect System32 only, forbid marker,
+  proxy, and companion; run --mode vector --expect-modules system-only
+  --expect-marker absent;
   require digest == reference
 ```
+
+Before case 01, resolve the runner's own executable path and use the same child
+capture helper to verify runner `--help`/`--help --harness
+<absolute-nonexistent-sentinel>` exit 0/2 and harness `--help`/`--help
+--expect-marker complete` exit 0/2. Require both valid help outputs to enumerate
+their complete current grammar, prove the sentinel and current-PID marker remain
+absent, and require that no case root or ordinary output capture exists before
+the runner then creates its normal matrix root. These checks remain part of
+`static_import_cases`, not new CTest roles.
 
 Do not infer fidelity from process success: parse exactly one
 `digest_sha256=` line from every functional child, reject duplicates/malformed
@@ -2051,22 +2238,33 @@ requires: reviewed ABI evidence plus a provisional commit, this runner's
 sanitized evidence, maintainer review, and a separate commit changing only that
 entry to `qualified`. Catalogue-only signatures remain ineligible.
 
-- [ ] **Step 3: Test qualification mode with a temporary provisional record**
+- [ ] **Step 3: Host qualification tests inside `static_import_cases`**
 
-In a unique temporary directory, derive a provisional manifest by changing only
-the canonical seed state from `qualified` to `provisional` while preserving
-strict CRLF. Invoke the runner against the real qualified System32 file and
-harness, read the emitted evidence, parse it back, and assert all fixed fields,
-candidate identity, manifest hash, exit status, and control digest. Delete only
-that test output/root.
+The normal-mode `rs2_static_import_runner` is the qualification-test host, so no
+new executable or CTest role is introduced. After the nine normal cases and
+before printing their terminal pass, obtain the runner's own absolute path with
+`GetModuleFileNameW(nullptr, ...)`, reuse the already validated absolute harness
+and manifest paths, and run this qualification submatrix under a distinct
+validated child of the same temporary root.
 
-Negative CLI invocations independently use a qualified record, wrong requested
-hash, pre-existing output, wrong output leaf, relative path, and child failure.
+Derive a provisional manifest by changing only the canonical seed state from
+`qualified` to `provisional` while preserving strict CRLF. Spawn the runner's
+own absolute path with the exact qualification grammar, the real harness, that
+provisional manifest, and a non-existing correctly named output. Read the
+emitted evidence, parse it back, and assert all fixed fields, candidate identity,
+manifest hash, exit status, and control digest. Delete only that output and
+validated subroot after all assertions.
+
+Negative child invocations of that same absolute runner independently use a
+qualified record, wrong requested hash, pre-existing output, wrong output leaf,
+relative path, and a plain executable that returns nonzero in place of the
+harness. Each must return nonzero without a new evidence file.
 The extracted `RunQualificationMode(QualificationInputs, WinTrustOps,
 EvidenceFileOps)`
 in-process seam injects WinTrust failure, short/zero write, flush failure, and
 close failure. Every case must leave no newly created evidence file; no test
-modifies System32 or a trust store.
+modifies System32 or a trust store. These assertions execute whenever the
+existing `static_import_cases` CTest role runs.
 
 - [ ] **Step 4: Add a separate fixed early-exit mode**
 
@@ -2088,6 +2286,11 @@ companion, run harness `immediate-exit` with a five-second child timeout, and
 require a created process, no timeout, and exit 0. Forced termination is cleanup
 only and fails the case. Capture the PID, remove only its possible marker, and
 remove the validated case root.
+
+After this step, sole `--help` prints all three disjoint runner grammars (normal,
+qualification, and early-exit), returns 0, and performs no path or process work.
+Any other token combined with `--help` returns 2. Update the self-help checks at
+the start of normal mode to require all three grammars.
 
 - [ ] **Step 5: Register and exercise `early_exit_cases`**
 
@@ -2122,7 +2325,7 @@ git commit -m "test: add x3audio qualification and early-exit cases"
 
 **Files:**
 
-- Rewrite: `tools/deployment_preflight.cpp`
+- Create: `tools/deployment_preflight.cpp`
 - Create: `tools/deployment_preflight.h`
 - Create: `tests/preflight_fixture_test.cpp`
 - Modify: `tools/pe_contract_lib.h`
@@ -2165,6 +2368,11 @@ procedure requires a later runtime result. Free text is never accepted.
 Require bootstrap, companion, manifest, report parent, and the running
 preflight tool itself to be outside the target tree. Proposed hash arguments
 must match the files. Never copy an artifact.
+
+Sole `--help` prints the complete grammar above and returns 0 before resolving a
+path, opening a file/process/registry key, or creating a report. Any token
+combined with `--help` returns usage error 2 and likewise performs no evidence
+action.
 
 - [ ] **Step 2: Write the report grammar and failure ownership**
 
@@ -2313,6 +2521,11 @@ normalization. Production adapters call the Task 2/7 primitives; tests replace
 only the four listed boundaries.
 
 - [ ] **Step 5: Build an exhaustive preflight fixture matrix**
+
+Before creating a target root, the fixture invokes the absolute preflight path
+with sole `--help` and with `--help --report <sentinel>`; require exit 0/2,
+complete option/state output from the first, and no sentinel file. This help
+contract remains inside `preflight_fixture` rather than adding a CTest role.
 
 The positive CLI fixture creates an empty non-reparse target root, copies only
 the current stock executable as `VNGame-current-stock.exe`, keeps proposed
@@ -2522,6 +2735,11 @@ rs2_runtime_inventory
   --report <absolute non-existing path outside target root>
 ```
 
+Sole `--help` prints that complete grammar and returns 0 before opening a
+process, taking a snapshot, reading a file, or creating a report. Combining
+`--help` with any other token returns usage error 2 with the same no-action
+property.
+
 Require the process image to be within target root, equal the stable inventory's
 main module, and match one of the two current VNGame hashes. Across every
 module's normal and delay imports, require VNGame to be the sole X3Audio
@@ -2590,6 +2808,19 @@ that the current executable and exact System32 identity appear. It does not
 pretend the test executable is VNGame and does not write a deployment report.
 Call `rs2fix::testcases::RunRuntimeInventoryTests()` from `core`; do not add an
 eighth CTest role.
+
+Give `rs2_core_tests` the runtime tool's absolute target path and dependency:
+
+```cmake
+target_compile_definitions(rs2_core_tests PRIVATE
+  RS2_RUNTIME_INVENTORY_PATH=L\"$<TARGET_FILE:rs2_runtime_inventory>\")
+add_dependencies(rs2_core_tests rs2_runtime_inventory)
+```
+
+The runtime tests launch that exact path with sole `--help` and with
+`--help --report <absolute-nonexistent-sentinel>`; require exit 0/2, require
+complete named-option output from the first, and prove no sentinel report
+appears and no target process was opened. These checks run only inside `core`.
 
 - [ ] **Step 6: Build the tool, run core, and commit**
 
@@ -2781,8 +3012,10 @@ $bootstrap = Resolve-Path 'build-verify\Release\X3DAudio1_7.dll'
 $companion = Resolve-Path 'build-verify\Release\RS2ServerFix.dll'
 Get-FileHash -Algorithm SHA256 -LiteralPath $bootstrap
 Get-FileHash -Algorithm SHA256 -LiteralPath $companion
-& 'build-verify\Release\rs2_pe_contract.exe' bootstrap $bootstrap
-& 'build-verify\Release\rs2_pe_contract.exe' companion $companion
+& 'build-verify\Release\rs2_pe_contract.exe' `
+  --kind bootstrap --file $bootstrap
+& 'build-verify\Release\rs2_pe_contract.exe' `
+  --kind companion --file $companion
 git ls-files --eol config/qualified_x3audio_genuine.manifest
 rg -n -i "ReportFault|BootstrapContextV1|InitializeV1|rs2_faultrep_bootstrap|RS2_SYSTEM_FAULTREP" CMakeLists.txt src tests tools
 rg -n -i "faultrep\.dll" CMakeLists.txt src tests tools
@@ -2821,13 +3054,15 @@ temporary test roots.
 
 - [ ] **Step 5: Obtain one bounded cross-model implementation review**
 
-After all evidence passes, follow the repository `AGENTS.md` rule: ask Devin
-GLM-5.2 High in dangerous mode for one bounded read-only correctness, security,
-and compatibility review; use Claude Code only if that free model is
-unavailable. Give it the approved spec, this implementation plan, diff from
-`3609a30`, test/PE transcripts, known residual risks, and the no-deployment
-constraint. Forbid tracked edits, commits, deployment, server access, and a
-second reviewer.
+After all evidence passes, follow the governing cross-model workflow active for
+the implementation session. At this plan's approval checkpoint, that workflow
+uses free Devin GLM-5.2 High (`glm-5-2`) in dangerous mode for one bounded
+read-only correctness, security, and compatibility review, with Claude Code
+only if that model is unavailable. Give it the approved spec, this
+implementation plan, implementation diff, test/PE transcripts, known residual
+risks, and the no-deployment constraint. Forbid tracked edits, commits,
+deployment, server access, and a second reviewer. Do not claim that this target
+repository contains its own `AGENTS.md`.
 
 Persist streamed stdout/stderr and final exit status to a timestamped system
 temporary ledger, announce it before launch, and inspect it at least once per
