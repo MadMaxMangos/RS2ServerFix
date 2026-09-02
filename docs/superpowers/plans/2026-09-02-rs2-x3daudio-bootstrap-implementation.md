@@ -6,8 +6,8 @@
 > checkbox (`- [ ]`) syntax for tracking.
 
 Status: User-approved first-runtime console-status amendment incorporated on
-2026-09-02; awaiting focused Claude Opus 5 Max review. Implementation and
-deployment have not begun.
+2026-09-02. Focused Claude Opus 5 Max review-round-1 findings are addressed;
+focused re-review is pending. Implementation and deployment have not begun.
 
 **Goal:** Build and verify, without deployment, an AMD64
 `X3DAudio1_7.dll` bootstrap that preserves the qualified legacy X3Audio 1.7
@@ -184,7 +184,8 @@ serialization dependency is added.
   by-name import library used by the fixtures and static harness.
 - `tests/static_import_harness.cpp` — real named legacy initializer import,
   fixed initialize/calculate vector, module proof, digest, concurrent mode,
-  fail-fast modes, and immediate-exit mode.
+  bounded test-only status observation, fail-fast modes, and immediate-exit
+  mode.
 - `tests/static_import_runner.cpp` — qualified-System32 gate, nine fresh-process
   functional cases, stdout/digest comparison, and explicit qualification mode.
 - `tests/preflight_fixture_test.cpp` — complete safe/unsafe preflight matrix.
@@ -744,7 +745,6 @@ definitions:
 ```cpp
 #define RS2FIX_VERSION_QUAD 0,1,0,0
 #define RS2FIX_VERSION_ASCII "0.1.0.0"
-#define RS2FIX_VERSION_WIDE L"0.1.0.0"
 ```
 
 Declare the DLL-local seam:
@@ -949,9 +949,10 @@ rg -n "OutputDebugString|WriteConsole|UE_LOG|GLog" src/companion
 git diff --check
 ```
 
-Expected final searches: no matches. Direct `GetStdHandle` and `WriteFile`
-appear only in `console_status.cpp`; inspect those call sites for the one-call,
-no-retry contract. Commit:
+Expected final searches: no matches. Direct `GetStdHandle` appears only in
+`console_status.cpp`; direct `WriteFile` appears only in `console_status.cpp`
+and the marker/file adapter. Inspect those call sites for their respective
+one-call/no-retry and exact-write contracts. Commit:
 
 ```powershell
 git add -- CMakeLists.txt src/shared src/companion `
@@ -1914,8 +1915,9 @@ git commit -m "feat: enforce x3audio PE contracts"
 **Interfaces:**
 
 - Produces: a real normal import of the legacy initializer, one deterministic
-  functional vector/digest, exact module-set proof, concurrent/failure/exit
-  modes, and the restored `pe_harness_contract` role.
+  functional vector/digest, exact module-set proof, bounded status-line
+  observation, concurrent/failure/exit modes, and the restored
+  `pe_harness_contract` role.
 - Consumes: Task 7's explicit by-name test import library and PE contract code;
   it never links the production bootstrap target's ordinal import library.
 
@@ -2028,7 +2030,20 @@ duplicate identities, extra X3Audio basenames, or basename-only matching.
 After the vector, validate either a terminal schema-2 marker for the current PID
 or continuous absence for the bounded no-marker interval. The complete marker
 must contain both beside flags, system32 genuine, both genuine export booleans,
-initializer result 0, and terminal completion.
+initializer result 0, and terminal completion. With `--expect-marker complete`,
+do not return after observing the marker: resolve the inherited standard-output
+file with `GetStdHandle(STD_OUTPUT_HANDLE)` and
+`GetFinalPathNameByHandleW` in a 32,768-wide-character bounded buffer with
+zero/truncation rejection, then use `CreateFileW` with `GENERIC_READ`,
+`FILE_SHARE_READ | FILE_SHARE_WRITE`, and `OPEN_EXISTING` to open a separate
+reader at offset zero. Poll that reader for up to two seconds until the exact
+`host=unknown` success-line bytes including CRLF are present. Bound the
+accumulated capture to one MiB and use a bounded 10 ms test-only poll interval.
+A null/invalid/non-disk standard-output handle, path or read-open failure,
+capture overflow, or absent exact line at the deadline is a hard child failure.
+The wait only keeps this short-lived test process alive until the bootstrap
+worker finishes its write; it does not replace the runner's post-mortem
+exact-byte/count assertion and is not production synchronization.
 
 - [ ] **Step 5: Add bounded harness modes**
 
@@ -2169,10 +2184,14 @@ Any mismatch is a named test failure, not a skip or child loader error.
 - [ ] **Step 3: Capture child output and exact termination**
 
 Extend `ProcessResult` with a bounded one-MiB stdout/stderr string. For each
-child create an inheritable output file inside that case directory, redirect
-both handles, wait at most 20 seconds, terminate only to clean up a timeout, read
-the file after handle closure, and include output in failure evidence. Reject
-truncation. Preserve raw bytes so CRLF and exact success-console bytes can be
+child create-new an inheritable output file inside that case directory with
+`GENERIC_READ | GENERIC_WRITE` and
+`FILE_SHARE_READ | FILE_SHARE_WRITE`, redirect both handles, wait at most 20
+seconds, terminate only to clean up a timeout, read the file after handle
+closure, and include output in failure evidence. Reject truncation. These access
+and share modes let complete-marker harness cases resolve the inherited handle
+and open their separate read-only observation handle without moving the shared
+write pointer. Preserve raw bytes so CRLF and exact success-console bytes can be
 validated independently from the digest line.
 
 Healthy children must be created, not time out, and exit 0. Missing-genuine
@@ -3160,10 +3179,11 @@ git ls-files --eol config/qualified_x3audio_genuine.manifest
 rg -n -i "ReportFault|BootstrapContextV1|InitializeV1|rs2_faultrep_bootstrap|RS2_SYSTEM_FAULTREP" CMakeLists.txt src tests tools
 rg -n -i "faultrep\.dll" CMakeLists.txt src tests tools
 rg -n "x3daudio.h" src/bootstrap
-rg -n "RS2FIX_VERSION_(QUAD|ASCII|WIDE)" `
+rg -n "RS2FIX_VERSION_(QUAD|ASCII)" `
   src/shared/version.h src/companion/console_status.cpp `
   src/companion/companion_version.rc src/bootstrap/bootstrap_version.rc
 rg -n "OutputDebugString|WriteConsole|UE_LOG|GLog" src
+rg -n "GetStdHandle|WriteFile" src tests/static_import_harness.cpp
 git diff --check
 git status --short
 ```
@@ -3174,8 +3194,10 @@ have no matches. Every `faultrep.dll` hit from the second scan must be an
 explicit preflight rejection or negative test, never a target, import, export,
 or runtime loader path. The version scan proves both resource scripts and the
 console formatter use the shared definitions; the logging-framework scan has no
-matches. Direct `GetStdHandle`/`WriteFile` calls exist only in the reviewed
-console-status and marker/file adapters. Diff check exits 0.
+matches. In the explicit handle/write scan, direct `GetStdHandle` appears only
+in the companion console-status adapter and test-only harness output observer;
+direct `WriteFile` appears only in that console-status adapter and the companion
+marker/file adapter. Inspect each hit in context. Diff check exits 0.
 The only uncommitted paths permitted during this step are ignored
 `build-verify` outputs.
 
@@ -3255,7 +3277,7 @@ user instruction.
 | Async INIT_ONCE, immutable fallback, bounded references, no waits | Task 5; Task 10 early-exit evidence |
 | Minimal DllMain and one non-joined worker | Tasks 6, 10, 13 |
 | Companion V2, host identity, marker schema 2, privacy/fallback | Tasks 3, 6, 8, 9 |
-| Exact one-time success console line, shared version, and nonfatal failure | Tasks 3, 6, 9, 13, 14 |
+| Exact one-time success console line, shared version, and nonfatal failure | Tasks 3, 6, 8, 9, 13, 14 |
 | Resource retry, validation fail-fast, exact 0xC0000602 | Tasks 4, 5, 9 |
 | Strict qualified manifest and non-circular qualification | Tasks 1, 2, 9, 10 |
 | Normal and delay import parsing, TLS, PE contracts, VERSIONINFO | Task 7 |

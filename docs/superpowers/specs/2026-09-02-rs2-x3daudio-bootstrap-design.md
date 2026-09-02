@@ -7,10 +7,11 @@ initialization, diagnostics, and rollback proof only
 
 Status: Approved by Claude Opus 5 Max after review round 6 and by the user on
 2026-09-02. The user-approved first-runtime console-status amendment is
-incorporated and awaits focused Claude Opus 5 Max review. Earlier mechanical
-implementation-plan amendments separated ordinal DLL exports from by-name test
-imports and made Git's CRLF custody check internally consistent; architecture
-and scope are unchanged.
+incorporated; focused Claude Opus 5 Max review-round-1 findings are addressed
+and focused re-review is pending. Earlier mechanical implementation-plan
+amendments separated ordinal DLL exports from by-name test imports and made
+Git's CRLF custody check internally consistent; architecture and scope are
+unchanged.
 
 ## Goal
 
@@ -942,6 +943,12 @@ Each case runs in a fresh, bounded child process:
 Cases 01-03, 05-06, 08, and 09 must contain no success-console line. The runner
 parses that line independently from the one required `digest_sha256=` line so
 the diagnostic cannot weaken or contaminate the forwarding-fidelity check.
+For complete-marker cases, the short-lived harness uses its separately opened
+redirected-output file only to wait a bounded two seconds for the exact line
+after the marker; this prevents process exit from terminating the worker between
+marker close and console write. The runner's post-mortem raw-byte/count parse
+remains authoritative. This is test-only observation, not production
+synchronization.
 
 `early_exit_cases` is separate from the nine functional cases. It repeatedly
 starts a bootstrap-plus-companion harness whose `main` immediately calls
