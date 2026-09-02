@@ -5,7 +5,8 @@ Date: 2026-09-02
 Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
-Status: Approved by Claude Opus 5 Max after review round 6; awaiting user approval
+Status: Approved by Claude Opus 5 Max after review round 6 and by the user on
+2026-09-02
 
 ## Goal
 
