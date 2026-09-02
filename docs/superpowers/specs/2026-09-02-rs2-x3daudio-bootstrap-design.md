@@ -5,7 +5,7 @@ Date: 2026-09-02
 Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
-Status: Revised after Claude Opus 5 Max review round 2; awaiting round 3
+Status: Revised after Claude Opus 5 Max review round 3; awaiting round 4
 
 ## Goal
 
@@ -196,9 +196,11 @@ structure declarations under renamed function identifiers, but it declares
 the imported legacy initializer itself as `void` and proves compatible
 structure layout by compile-time size/offset assertions plus a System32
 control run. AMD64 calling convention, the 20-byte handle, and both named
-exports plus their observed ordinals are hard contracts. A new genuine-file
-hash is unqualified until its initializer semantics are independently checked
-and its control harness passes.
+exports plus their observed ordinals are hard contracts. Qualification state
+comes only from the reviewed, version-controlled
+`config/qualified_x3audio_genuine.json` manifest and follows the explicit
+provisional-to-qualified procedure below. A provisional entry is never accepted
+by the normal test suite or deployment preflight.
 
 ## Binary contracts
 
@@ -240,7 +242,7 @@ directories or unique system-temporary test directories.
 
 ## Genuine X3Audio resolution
 
-### One permanent successful publication
+### One normal publication plus one bounded fallback
 
 The bootstrap owns one zero-initialized `INIT_ONCE`. Resolution first produces
 a private stack result. Only after genuine validation succeeds does the caller
@@ -261,7 +263,8 @@ Both the worker and both public exports call `AcquireGenuineX3Audio`. It uses
 `InitOnceComplete(INIT_ONCE_ASYNC, dispatch)` rather than a callback or
 `InitOnceExecuteOnce`:
 
-1. an already completed call returns the immutable published record;
+1. a non-blocking `INIT_ONCE_CHECK_ONLY` first returns any normal publication;
+   otherwise a `Ready` static fallback is returned before new resolution begins;
 2. every concurrent caller receiving `pending=TRUE`, or encountering a
    begin-initialize API error, resolves into its own private stack result
    without holding an INIT_ONCE or project lock;
@@ -270,25 +273,44 @@ Both the worker and both public exports call `AcquireGenuineX3Audio`. It uses
 4. the single completion winner retains its module reference and record;
 5. a losing successful caller releases only its own extra module reference and
    private record, then obtains the winner through `INIT_ONCE_CHECK_ONLY`; and
-6. a successful private result that cannot be allocated or published remains
-   valid for the current worker/export call and its module reference is retained
-   to process exit; publication failure does not turn genuine success into a
-   process failure; and
-7. a failed attempt is abandoned without completing the INIT_ONCE, performs a
-   non-blocking check for a concurrently published success, and otherwise
-   returns its classified local failure to the caller.
+6. a successful private result whose allocation or `InitOnceComplete` fails
+   frees any unusable record storage without releasing the private module
+   reference, then falls back to one process-static `alignas(8)` dispatch plus
+   an interlocked three-state
+   `Empty/Writing/Ready` publication word. A successful caller may change
+   `Empty` to `Writing`, transfer its module reference, copy the complete
+   dispatch, and publish `Ready` with `InterlockedExchange`. No fallible API,
+   loader operation, allocation, or external call occurs between claiming
+   `Writing` and publishing `Ready`. After `Ready`, the claimant may offer the
+   aligned static pointer to `InitOnceComplete`; an API rejection does not
+   invalidate the fallback;
+7. a caller that loses the fallback claim never waits. It may use its already
+   validated private dispatch for the current worker/export operation, while
+   the fallback claimant's retained reference keeps the genuine module mapped,
+   then releases its own extra reference. A `Ready` fallback is immutable and
+   is returned by later acquisitions even if `InitOnceComplete` itself failed;
+   and
+8. a failed resolution attempt is abandoned without completing the INIT_ONCE,
+   performs non-blocking checks for both a normally published success and the
+   `Ready` fallback, and otherwise returns its classified local failure to the
+   caller.
 
-The normal path guarantees exactly one published successful dispatch, not
-exactly one resolution attempt. It permits duplicate first-race
+The normal INIT_ONCE path guarantees exactly one published successful dispatch,
+not exactly one resolution attempt. The fallback path guarantees at most one
+additional immutable static record. An exact race may leave both records and
+two retained genuine-module references, but both contain the same fully
+validated module and export addresses; no caller observes either record before
+it is complete. It permits duplicate first-race
 `LoadLibraryExW` calls but never exposes a partial table and never waits on a
 project synchronization object while acquiring loader lock. A worker makes one
 attempt and quietly stops on failure. An export receiving a resource/API
 failure checks for a concurrent publication, makes exactly one immediate
 private retry, then checks once more before failing fast. A validation failure
 is not retried. A successful private result is always usable even if INIT_ONCE
-or publication allocation fails. The remaining micro-race in which another
-thread publishes just after the final non-blocking check cannot be removed
-without waiting and is an accepted fail-fast risk.
+or publication allocation fails, and a persistent publication failure cannot
+accumulate a module reference on every later call. The remaining micro-race in
+which another thread publishes just after the final non-blocking check cannot
+be removed without waiting and is an accepted fail-fast risk.
 
 Calls from another DLL's `DllMain` remain outside the supported contract: the
 algorithm avoids private-lock/loader-lock inversion, but no proxy can safely
@@ -315,6 +337,12 @@ Each private resolution attempt:
     bootstrap;
 11. returns a complete private success only after all checks pass.
 
+Before these buffers are used, the shared `AppendPathLeaf` and
+`ExtractDirectoryAndLeaf` helpers are changed to bound `wcsnlen_s` by their
+caller's supplied capacity, never by the old global 32,768-character capacity.
+Tests pass both terminated and unterminated 512-character buffers. Zeroing the
+resolver buffers remains defense in depth, not the read-bound invariant.
+
 Failures are classified before returning. `SystemPathFailed`, path-capacity,
 `LoadFailed`, candidate-path API failure, and file-identity API failure are
 resource/API failures eligible for the export's single retry. `SelfModule`,
@@ -326,8 +354,10 @@ The caller then attempts the asynchronous one-time publication described
 above. A rejected candidate is released only when it is neither null nor the
 bootstrap module; the `SelfModule` case must never call `FreeLibrary` on the
 bootstrap. Losing allocated records and their extra module references are
-released after the winner is obtained. The publication winner, or a successful
-unpublished private path, retains its genuine module until process exit.
+released after the winner is obtained. The normal publication winner and any
+`Ready` fallback each retain exactly their own genuine-module reference until
+process exit; callers using a private record while the fallback is `Writing`
+release their extra reference after their current operation.
 Resolution does not load the companion or write diagnostics.
 
 ## Export behavior
@@ -350,7 +380,8 @@ succeeded.
 
 ### `X3DAudioCalculate`
 
-The export obtains the same permanent dispatch record. On success it calls the
+The export obtains a validated dispatch, whether normally published, from the
+immutable fallback, or private for the current call. On success it calls the
 genuine function once with the original pointers and flags and returns after
 the genuine call.
 
@@ -498,9 +529,9 @@ Milestone 1 recognizes builds but grants none permission to patch or hook.
 | Resource/API resolution failure in either export | Check publication, retry privately once, check again, then fail fast with `0xC0000602`; runtime resource failure is not excluded by preflight. |
 | Genuine-validation failure in worker | No publication, companion, or marker; a later export repeats validation. |
 | Genuine-validation failure in either export | Immediate fail-fast `0xC0000602`; the legacy void ABI has no safe fallback. |
-| INIT_ONCE/dispatch-allocation failure after private genuine success | The current call uses the private validated dispatch and retains its module; later calls may resolve again. |
-| Early initialize races worker | Each may resolve privately without waiting; exactly one successful dispatch is published and the genuine function is called only through a complete record. |
-| Early calculate races worker | Each may resolve privately without waiting; exactly one successful dispatch is published and the genuine function is called only through a complete record. |
+| INIT_ONCE/dispatch-allocation failure after private genuine success | One claimant publishes the immutable static fallback; concurrent callers use complete private records without waiting and release their extra references after their current operation. Later calls reuse the permanent fallback instead of accumulating references. |
+| Early initialize races worker | Each may resolve privately without waiting; the normal INIT_ONCE path publishes exactly one success, the fallback path publishes at most one additional immutable success, and the genuine function is called only through a complete record. |
+| Early calculate races worker | Each may resolve privately without waiting; the normal INIT_ONCE path publishes exactly one success, the fallback path publishes at most one additional immutable success, and the genuine function is called only through a complete record. |
 | Companion missing/load/identity/export failure | Genuine X3Audio remains usable; no retry. |
 | Companion initializer fails | Genuine X3Audio remains usable; validated companion remains mapped after the call. |
 | Host hash fails | Build identity is `indeterminate`; no hook/patch behavior exists. |
@@ -549,14 +580,43 @@ does not follow directory reparse points, and fails unless:
   explicit failures; and
 - security-product disposition and target-host KnownDLL state are recorded.
 
+The authoritative reviewed input is
+`config/qualified_x3audio_genuine.json`, schema 1. Each record contains state
+(`provisional` or `qualified`), SHA-256, file size, machine, COFF timestamp,
+`SizeOfImage`, file/product version, exact name/ordinal export surface,
+embedded-signature policy, and a repository-relative evidence-record path.
+The preflight and normal test runner accept only `qualified` records and never
+modify or auto-promote the manifest.
+
 The first qualified genuine hash is
 `9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446`.
 Its Microsoft signer certificate is expired in wall-clock terms but its
 embedded time-stamp makes `WinVerifyTrust` and `Get-AuthenticodeSignature`
 return valid. The preflight must not reproduce trust by comparing `NotAfter`
-itself. Catalog-only signatures are not accepted in Milestone 1; a target with
-a different or catalog-only genuine file stops for separate qualification,
-including legacy-void-ABI inspection and a System32 control-harness run.
+itself.
+
+A different embedded-signed candidate uses this non-circular qualification
+sequence:
+
+1. In an isolated evidence directory, inspect its complete exports/ordinals and
+   disassembly to confirm the legacy `void` initializer, 20-byte handle writes,
+   and calculate ABI. Record hashes and tool output in
+   `docs/evidence/x3audio/<sha256>.md`.
+2. The project maintainer adds a `provisional` manifest record pointing to that
+   evidence in a reviewed commit. This does not make any normal test or
+   preflight pass.
+3. An explicit, non-default runner mode
+   `--qualify-system32 <provisional-sha256>` accepts only the exact provisional
+   host file, runs only the fresh-process direct-System32 control vector, and
+   emits a deterministic JSON evidence record with identity, ABI-layout
+   assertions, exit status, and output digest. It never loads the proxy and
+   cannot be used as deployment evidence.
+4. After reviewing that run and appending its sanitized result to the evidence
+   record, the project maintainer changes the record to `qualified` in a second
+   reviewed commit. Only that state enables the normal suite and preflight.
+
+Catalog-only signatures are not accepted in Milestone 1 and cannot enter this
+qualification flow; supporting one requires a new reviewed design amendment.
 
 For tree compatibility, by-name imports of either public export and ordinal
 imports `@1`/`@2` are compatible and reported. Every other X3Audio name or
@@ -576,10 +636,11 @@ system-temporary directories.
 1. compile-time legacy-void initializer signature, calculate signature, and
    dispatch-record all-or-none validity;
 2. asynchronous INIT_ONCE behavior under concurrent callers: no caller waits,
-   only complete successes are offered, exactly one success is published,
-   losing module references are released, and a worker failure remains
-   retryable; publication-allocation/API failure after private success still
-   forwards through that success;
+   only complete successes are offered, exactly one normal INIT_ONCE success is
+   published, losing module references are released, and a worker failure
+   remains retryable; publication-allocation/API failure after private success
+   publishes or reuses the static fallback, forwards successfully, and does not
+   grow retained references across repeated calls;
 3. resolver validation: null, self module, wrong file identity, one/both exports
    missing, failed `VirtualQuery`, and wrong allocation base, plus classification
    and exactly one export retry for injected resource/API failures;
@@ -635,10 +696,12 @@ contains a named `X3DAudio1_7.dll!X3DAudioInitialize` import while control
 cases omit the local proxy file. It declares that imported function with the
 legacy `void` ABI. To exercise calculate, it enumerates loaded modules by full
 path, selects the intended local or System32 module handle unambiguously, and
-resolves `X3DAudioCalculate` from that exact handle. Before running any
+resolves `X3DAudioCalculate` from that exact handle. Before running any normal
 functional case, the runner requires the build host's System32 file to exist
-and match a qualified hash; absence or mismatch is a clear test failure, not a
-skip or a generic child-process loader error.
+and match a `qualified` manifest record; absence, `provisional` state, or
+mismatch is a clear test failure, not a skip or a generic child-process loader
+error. The separate provisional qualification mode is the only exception and
+cannot report the normal suite as passed.
 
 Every functional case zero-initializes the handle, listener, emitter, settings,
 matrix, delay array, and padding, then runs one fixed valid
@@ -712,10 +775,17 @@ user's explicit runtime authorization.
    root PE files without publishing sensitive configuration.
 6. Start with the normal command and verify Steam/EOS/EAC/network/map/WebAdmin
    initialization and capture the loaded System32 X3Audio path.
-7. Enumerate every loaded module, parse each readable backing PE's normal and
-   delay imports, require no unreadable/vanished entry, and require VNGame to be
-   the sole X3Audio importer. Retain the sanitized module/import report as the
-   static-call timing evidence, then stop normally.
+7. Establish a stable module set with two consecutive identical enumerations,
+   bounded to three complete attempts. For every entry, record module base,
+   image size, full path, and file identity, then parse the backing PE's normal
+   and delay imports. A vanished or changed entry restarts the complete
+   enumeration; an unreadable, pathless, malformed, or still-unstable entry is
+   recorded by sanitized identity and hard-stops Milestone 1. No entry is
+   silently skipped and there is no adjudication exception in this milestone;
+   accepting such a module requires a reviewed design amendment. Only a
+   complete parse may conclude that VNGame is the sole X3Audio importer. Retain
+   the sanitized module/import report as the static-call timing evidence, then
+   stop normally.
 
 ### Two-file pass
 
@@ -771,8 +841,10 @@ Milestone 1 is complete only when:
 - companion absence/failure cannot break valid genuine forwarding;
 - no export performs companion work, logging, hashing, or game-memory access;
 - concurrent first callers never wait on project synchronization while loading
-  the genuine module, exactly one complete success is published, and repeated
-  immediate-exit children do not hang;
+  the genuine module; the normal INIT_ONCE path publishes exactly one complete
+  success, injected publication failure yields at most one immutable static
+  fallback without repeat reference growth, and repeated immediate-exit
+  children do not hang;
 - control/companion-only/rollback load System32 directly;
 - bootstrap cases prove local bootstrap plus separately validated System32
   genuine module;
