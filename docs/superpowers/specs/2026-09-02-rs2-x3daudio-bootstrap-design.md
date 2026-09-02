@@ -6,12 +6,11 @@ Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
 Status: Approved by Claude Opus 5 Max after review round 6 and by the user on
-2026-09-02. The user-approved first-runtime console-status amendment is
-incorporated; focused Claude Opus 5 Max review-round-1 findings are addressed
-and focused re-review is pending. Earlier mechanical implementation-plan
-amendments separated ordinal DLL exports from by-name test imports and made
-Git's CRLF custody check internally consistent; architecture and scope are
-unchanged.
+2026-09-02. The first-runtime console-status amendment was approved by Claude
+Opus 5 Max after focused amendment review round 2 on the same date. Earlier
+mechanical implementation-plan amendments separated ordinal DLL exports from
+by-name test imports and made Git's CRLF custody check internally consistent;
+architecture and scope are unchanged.
 
 ## Goal
 
