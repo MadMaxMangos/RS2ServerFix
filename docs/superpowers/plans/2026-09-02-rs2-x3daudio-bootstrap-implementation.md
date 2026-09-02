@@ -5,8 +5,8 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-Status: Revised after Claude Opus 5 Max implementation-plan review round 1;
-awaiting focused review round 2
+Status: Revised after Claude Opus 5 Max implementation-plan review round 2;
+awaiting focused review round 3
 
 **Goal:** Build and verify, without deployment, an AMD64
 `X3DAudio1_7.dll` bootstrap that preserves the qualified legacy X3Audio 1.7
@@ -107,7 +107,8 @@ serialization dependency is added.
 - `docs/evidence/x3audio/9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446.md`
   — seed binary/signature/export/ABI evidence.
 - `CMakeLists.txt` — static CRT, RC support, production/test-only targets,
-  explicit manifests, generated import-library linkage, and seven CTest roles.
+  explicit manifests, test-only by-name import-library generation/linkage, and
+  seven CTest roles.
 - `src/shared/digest.h/.cpp` — uppercase SHA-256 parsing/formatting and the
   common `Sha256Digest` type.
 - `src/shared/bootstrap_abi.h` — exact 40-byte C-compatible V2 context and
@@ -1542,10 +1543,10 @@ add_custom_command(
   OUTPUT "${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${_rs2_named_import_dir}"
   COMMAND "${CMAKE_AR}" /NOLOGO
-    /DEF:${CMAKE_CURRENT_SOURCE_DIR}/tests/X3DAudio1_7_named_import.def
+    "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/tests/X3DAudio1_7_named_import.def"
     /NAME:X3DAudio1_7.dll /MACHINE:X64
-    /OUT:${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/X3DAudio1_7_named_import.def
+    "/OUT:${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/X3DAudio1_7_named_import.def"
   VERBATIM)
 add_custom_target(rs2_x3audio_named_import_library
   DEPENDS "${RS2_X3DAUDIO_NAMED_IMPORT_LIBRARY}")
@@ -2151,10 +2152,13 @@ add_test(NAME static_import_cases
     --companion $<TARGET_FILE:rs2_server_fix_companion>
     --genuine-manifest
       ${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest)
-set_tests_properties(static_import_cases PROPERTIES TIMEOUT 180)
+set_tests_properties(static_import_cases PROPERTIES TIMEOUT 300)
 ```
 
-Add dependencies on all four artifacts. Run twice in Debug:
+The 300-second role timeout covers the ten functional children, four help
+children, and Task 10's qualification submatrix while preserving each child's
+stricter 20-second bound. Add dependencies on all four artifacts. Run twice in
+Debug:
 
 ```powershell
 cmake --build build-plan --config Debug --target rs2_static_import_runner
@@ -2553,7 +2557,7 @@ malformed PE-like file
 file and directory reparse points
 faultrep.dll
 *.exe.local
-pre-existing X3Audio1_7.dll
+pre-existing X3DAudio1_7.dll
 operator alerted/blocked state
 injected KnownDLL present and query failure
 injected WinTrust failure
