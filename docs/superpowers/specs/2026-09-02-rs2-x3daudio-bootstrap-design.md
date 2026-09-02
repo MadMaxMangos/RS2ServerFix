@@ -5,7 +5,7 @@ Date: 2026-09-02
 Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
-Status: Revised after Claude Opus 5 Max review round 3; awaiting round 4
+Status: Revised after Claude Opus 5 Max review round 4; awaiting round 5
 
 ## Goal
 
@@ -198,7 +198,7 @@ structure layout by compile-time size/offset assertions plus a System32
 control run. AMD64 calling convention, the 20-byte handle, and both named
 exports plus their observed ordinals are hard contracts. Qualification state
 comes only from the reviewed, version-controlled
-`config/qualified_x3audio_genuine.json` manifest and follows the explicit
+`config/qualified_x3audio_genuine.manifest` file and follows the explicit
 provisional-to-qualified procedure below. A provisional entry is never accepted
 by the normal test suite or deployment preflight.
 
@@ -271,15 +271,21 @@ Both the worker and both public exports call `AcquireGenuineX3Audio`. It uses
 3. only a fully validated success is copied to a page-aligned record and
    offered to `InitOnceComplete`;
 4. the single completion winner retains its module reference and record;
-5. a losing successful caller releases only its own extra module reference and
-   private record, then obtains the winner through `INIT_ONCE_CHECK_ONLY`; and
-6. a successful private result whose allocation or `InitOnceComplete` fails
+5. after `InitOnceComplete` returns false, the caller performs
+   `INIT_ONCE_CHECK_ONLY`. If it obtains a winner, it releases only its own
+   extra module reference and record and returns that winner. Only a failed
+   check with no winner proceeds to step 6; and
+6. a successful private result whose allocation fails, or whose
+   `InitOnceComplete` and following check both fail,
    frees any unusable record storage without releasing the private module
    reference, then falls back to one process-static `alignas(8)` dispatch plus
    an interlocked three-state
    `Empty/Writing/Ready` publication word. A successful caller may change
    `Empty` to `Writing`, transfer its module reference, copy the complete
-   dispatch, and publish `Ready` with `InterlockedExchange`. No fallible API,
+   dispatch, and publish `Ready` with `InterlockedExchange`. Every reader uses
+   `InterlockedCompareExchange(&fallbackState, Empty, Empty)` as its acquire
+   read and must not touch the static record unless the returned state is
+   `Ready`. No fallible API,
    loader operation, allocation, or external call occurs between claiming
    `Writing` and publishing `Ready`. After `Ready`, the claimant may offer the
    aligned static pointer to `InitOnceComplete`; an API rejection does not
@@ -340,6 +346,10 @@ Each private resolution attempt:
 Before these buffers are used, the shared `AppendPathLeaf` and
 `ExtractDirectoryAndLeaf` helpers are changed to bound `wcsnlen_s` by their
 caller's supplied capacity, never by the old global 32,768-character capacity.
+`ExtractDirectoryAndLeaf` gains a `std::size_t pathCapacity` parameter
+immediately after `path`; both existing call sites and every new call pass the
+capacity of that exact input buffer. `AppendPathLeaf` uses its existing
+`capacity` argument for both input scanning and output arithmetic.
 Tests pass both terminated and unterminated 512-character buffers. Zeroing the
 resolver buffers remains defense in depth, not the read-bound invariant.
 
@@ -409,10 +419,14 @@ Other notifications perform no user work.
 The worker performs one non-retrying sequence:
 
 1. calls `AcquireGenuineX3Audio` once;
-2. continues only with a validated published or private success record;
+2. continues only with a validated normal publication, immutable fallback, or
+   private success record;
 3. constructs the absolute sibling path to `RS2ServerFix.dll`;
 4. validates, loads, and calls `RS2ServerFix_InitializeV2` once;
-5. returns without unloading a successful genuine or companion module.
+5. returns without unloading a normal/fallback-owned genuine or successful
+   companion module. If it used a private record while the fallback was
+   `Writing`, it releases only that extra genuine reference after companion
+   work, because the fallback claimant already owns the persistent reference.
 
 Worker-creation failure disables companion initialization, but it does not
 disable lazy genuine resolution by a later X3Audio export call. The bootstrap
@@ -550,6 +564,27 @@ The existing preflight parsed only the normal import directory and therefore
 missed the SHCore delay-import blocker. Milestone 1 must add bounded PE32/PE32+
 delay-import parsing before its scanner can approve any deployment.
 
+Both `rs2_deployment_preflight.exe` and `rs2_static_import_runner.exe` require an
+explicit absolute `--genuine-manifest <path>` argument; there is no compiled-in
+path, current-directory search, or basename fallback. CTest passes the absolute
+repository manifest path. Disposable validation runs the preflight on the
+target host from a user-selected, empty, non-reparse task-evidence directory
+outside the game tree and supplies the absolute path to an exact copied
+manifest. The invocation also requires absolute `--target-root`, `--bootstrap`,
+`--companion`, and `--report` paths. It records the tool and manifest SHA-256 in
+the sanitized report and writes nothing inside the stopped-server tree.
+Qualification mode additionally requires an absolute, non-existing
+`--qualification-output <path>` whose leaf is exactly
+`<provisional-sha256>.qualification.evidence`; creation uses create-new
+semantics.
+
+The preflight executable, manifest copy, and report are custody/evidence tools,
+not deployable game artifacts and are never placed beside VNGame. No build or
+test target copies them to another host. After the user preserves the sanitized
+report, rollback removes the task-local executable and manifest copies from the
+target evidence directory. The two DLLs remain the only artifacts ever placed
+in the game directory.
+
 The read-only preflight examines the exact user-selected stopped-server tree,
 does not follow directory reparse points, and fails unless:
 
@@ -581,12 +616,23 @@ does not follow directory reparse points, and fails unless:
 - security-product disposition and target-host KnownDLL state are recorded.
 
 The authoritative reviewed input is
-`config/qualified_x3audio_genuine.json`, schema 1. Each record contains state
-(`provisional` or `qualified`), SHA-256, file size, machine, COFF timestamp,
-`SizeOfImage`, file/product version, exact name/ordinal export surface,
-embedded-signature policy, and a repository-relative evidence-record path.
-The preflight and normal test runner accept only `qualified` records and never
-modify or auto-promote the manifest.
+`config/qualified_x3audio_genuine.manifest`, schema 1. It uses the project's
+existing bounded line-oriented convention: 7-bit ASCII, CRLF endings, no BOM,
+one `key=value` pair per line, and no blank lines or escaping. The fixed order
+is `schema`, `entry_count`, then, for each zero-based entry,
+`entry.N.state`, `sha256`, `file_size`, `machine`, `coff_timestamp`,
+`size_of_image`, `file_version`, `product_version`, `export_1`, `export_2`,
+`signature_policy`, and `evidence_path`. Field names after `entry.N.state` also
+carry the same `entry.N.` prefix. Values are restricted to their numeric/hex
+grammar or `[A-Za-z0-9._/-]`; export values are exact
+`X3DAudioCalculate@1` and `X3DAudioInitialize@2`.
+
+A dependency-free hand-written reader accepts at most 64 KiB, 32 entries, and
+1,024 bytes per line. It rejects BOM/NUL/non-ASCII, bare LF, duplicate, unknown,
+missing, misordered, malformed, or trailing fields and any count mismatch. No
+third-party parser or serialization dependency is permitted. The preflight and
+normal test runner accept only `qualified` records and never modify or
+auto-promote the manifest.
 
 The first qualified genuine hash is
 `9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446`.
@@ -608,9 +654,18 @@ sequence:
 3. An explicit, non-default runner mode
    `--qualify-system32 <provisional-sha256>` accepts only the exact provisional
    host file, runs only the fresh-process direct-System32 control vector, and
-   emits a deterministic JSON evidence record with identity, ABI-layout
-   assertions, exit status, and output digest. It never loads the proxy and
-   cannot be used as deployment evidence.
+   emits `<sha256>.qualification.evidence` in the same ASCII/CRLF `key=value`
+   convention. Its exact fixed key order is `schema`, `mode`,
+   `manifest_sha256`, `candidate_sha256`, `candidate_file_size`,
+   `candidate_machine`, `candidate_coff_timestamp`,
+   `candidate_size_of_image`, `candidate_file_version`,
+   `candidate_product_version`, `candidate_export_1`, `candidate_export_2`,
+   `candidate_signature_policy`, `winverifytrust_status`, `abi_layout`,
+   `child_exit_status`, and `control_digest_sha256`. All values are integer or
+   token fields; there is no floating-point serialization. The writer uses
+   bounded fixed templates, rejects partial writes, and never overwrites an
+   existing record. It never loads the proxy and cannot be used as deployment
+   evidence.
 4. After reviewing that run and appending its sanitized result to the evidence
    record, the project maintainer changes the record to `qualified` in a second
    reviewed commit. Only that state enables the normal suite and preflight.
@@ -640,7 +695,9 @@ system-temporary directories.
    published, losing module references are released, and a worker failure
    remains retryable; publication-allocation/API failure after private success
    publishes or reuses the static fallback, forwards successfully, and does not
-   grow retained references across repeated calls;
+   grow retained references across repeated calls; separate injections cover
+   `InitOnceComplete` false with a visible winner, false without a winner, and
+   acquire readers refusing `Empty` or `Writing` fallback records;
 3. resolver validation: null, self module, wrong file identity, one/both exports
    missing, failed `VirtualQuery`, and wrong allocation base, plus classification
    and exactly one export retry for injected resource/API failures;
@@ -650,11 +707,16 @@ system-temporary directories.
    fail-fast behavior;
 6. companion ABI V2 size/version, required export mask, reserved field, and
    module-handle validation;
-7. existing build identities, stock-input immutability, path identity, and
-   bounded companion-path construction;
+7. existing build identities, stock-input immutability, path identity, the new
+   `ExtractDirectoryAndLeaf` input-capacity contract, and bounded companion-path
+   construction;
 8. marker schema 2, fallback, short-write cleanup, terminal line, and forbidden
-   content scan; and
-9. proof that no known build identity permits hook/patch behavior.
+   content scan;
+9. manifest size/line/entry bounds, fixed field order, character grammar,
+   malformed/duplicate/unknown/trailing rejection, provisional/qualified gate,
+   deterministic qualification-evidence output, no-overwrite, and short-write
+   cleanup; required absolute CLI paths have no fallback search; and
+10. proof that no known build identity permits hook/patch behavior.
 
 ### Built-PE contracts
 
@@ -808,8 +870,11 @@ user's explicit runtime authorization.
 
 1. Confirm the process is stopped.
 2. Remove only the two added DLLs and task marker files.
-3. Restart once and prove the System32 X3Audio path and normal services.
-4. Retain control/pass/rollback evidence and exact tested hashes.
+3. Preserve the sanitized report outside the target-host task directory, then
+   remove only the copied preflight executable, manifest, and named temporary
+   child outputs from that directory.
+4. Restart once and prove the System32 X3Audio path and normal services.
+5. Retain control/pass/rollback evidence and exact tested hashes.
 
 Any startup failure, EAC/security intervention, unexpected module path,
 incompatible importer, genuine/companion validation failure, missing/partial
@@ -857,7 +922,8 @@ Milestone 1 is complete only when:
   changed; expected runtime logs and named marker evidence are excluded from
   that invariant and retained separately;
 - deployable artifacts are limited to two manually placed DLLs and sanitized
-  evidence; and
+  evidence; target-host custody copies of the read-only preflight and manifest
+  stay outside the game tree and are removed after the report is preserved; and
 - no production/public server, client, anti-cheat bypass, game hook, or
   performance claim is involved.
 
