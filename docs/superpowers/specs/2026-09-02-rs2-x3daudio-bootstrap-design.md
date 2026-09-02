@@ -5,7 +5,7 @@ Date: 2026-09-02
 Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
-Status: Draft for Claude Opus 5 Max and user review
+Status: Revised after Claude Opus 5 Max review round 1; awaiting round 2
 
 ## Goal
 
@@ -20,7 +20,7 @@ disposable server prove that:
    existing normal import;
 2. the bootstrap resolves and validates the genuine
    `System32\X3DAudio1_7.dll` and both public X3Audio exports;
-3. calls to both exports preserve the exact ABI, arguments, return value, and
+3. calls to both exports preserve the exact legacy 1.7 ABI, arguments, and
    output behavior;
 4. the bootstrap loads an explicitly named `RS2ServerFix.dll` companion only
    outside loader-lock context;
@@ -72,7 +72,8 @@ Evidence tied to the current RS2 server files shows:
   `C:\Windows\System32\X3DAudio1_7.dll` even on a sound-disabled dedicated
   server;
 - the captured module and examined genuine file agree on PE timestamp
-  `0x4B6B06BE`, image size 36,864, and checksum `0x00008C0D`;
+  `0x4B6B06BE`, PE `SizeOfImage` 36,864, and checksum `0x00008C0D`; the file
+  size is 24,920 bytes;
 - the examined genuine file is AMD64, Microsoft-signed, version
   `9.28 (DXSDK_FEB10.100204-0932)`, and SHA-256
   `9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446`;
@@ -94,7 +95,11 @@ Do not deploy it. The captured process loads `SHCore.dll`, whose delay-import
 table requires `faultrep.dll!ReportCoreHang`. The existing proxy exports only
 `ReportFault`, so occupying the process-wide basename can break a later
 SHCore delay resolution. The old Stage 0 implementation remains a source of
-tested path, identity, companion, marker, and harness patterns only.
+tested path, identity, companion, marker, and harness patterns only. On this
+feature branch the `faultrep.dll` target, its V1 ABI, its import-library search,
+and its faultrep-specific tests are removed from the active source/build graph.
+Their history remains recoverable from commit `a0e733d`; no build from this
+branch may emit `faultrep.dll` or export `RS2ServerFix_InitializeV1`.
 
 ### Unique `rs2boot.dll` import edit
 
@@ -136,28 +141,54 @@ neither file is a native bootstrap for this dedicated executable.
   remain held until process exit.
 - No code catches or suppresses exceptions raised inside genuine X3Audio.
 - No export records diagnostics or calls the companion.
+- Export calls from another DLL's `DllMain` are unsupported. The zero-EXE-edit
+  proxy cannot safely load the genuine DLL while its caller holds loader lock;
+  the disposable-server gate therefore has to prove the observed VNGame path
+  calls the initializer after process loader initialization.
 
-The SDK header at the selected build toolchain defines:
+The name `X3DAudio1_7.dll` is a legacy DirectX/XAudio 2.7 contract. The
+installed Windows 10 SDK header describes the newer XAudio 2.8/2.9 contract
+and declares `X3DAudioInitialize` as returning `HRESULT`; it is not the ABI
+authority for this proxy. Direct inspection of the qualified 1.7 binary shows
+that its initializer is a 97-byte leaf, writes all 20 handle bytes, and returns
+with `RAX` containing scratch arithmetic rather than an API result. The proxy
+therefore declares only the ABI actually present in the qualified binary:
 
 ```cpp
-typedef BYTE X3DAUDIO_HANDLE[20];
-
-HRESULT STDAPIVCALLTYPE X3DAudioInitialize(
+using X3DAudioInitializeFn = void (WINAPI*)(
     UINT32 speakerChannelMask,
-    FLOAT32 speedOfSound,
-    X3DAUDIO_HANDLE instance);
+    FLOAT speedOfSound,
+    BYTE* instance20Bytes);
 
-void STDAPIVCALLTYPE X3DAudioCalculate(
-    const X3DAUDIO_HANDLE instance,
-    const X3DAUDIO_LISTENER* listener,
-    const X3DAUDIO_EMITTER* emitter,
+using X3DAudioCalculateFn = void (WINAPI*)(
+    const BYTE* instance20Bytes,
+    const void* listener,
+    const void* emitter,
     UINT32 flags,
-    X3DAUDIO_DSP_SETTINGS* settings);
+    void* settings);
+
+extern "C" void WINAPI X3DAudioInitialize(
+    UINT32 speakerChannelMask,
+    FLOAT speedOfSound,
+    BYTE* instance20Bytes);
+
+extern "C" void WINAPI X3DAudioCalculate(
+    const BYTE* instance20Bytes,
+    const void* listener,
+    const void* emitter,
+    UINT32 flags,
+    void* settings);
 ```
 
-The proxy compiles against the installed Windows SDK `x3daudio.h`; it does not
-copy or hand-maintain the SDK structures. AMD64 calling convention and the two
-named exports plus their observed ordinals are hard PE contracts.
+The bootstrap never dereferences the opaque listener, emitter, or settings
+pointers and does not include `x3daudio.h`. The offline harness may use the SDK
+structure declarations under renamed function identifiers, but it declares
+the imported legacy initializer itself as `void` and proves compatible
+structure layout by compile-time size/offset assertions plus a System32
+control run. AMD64 calling convention, the 20-byte handle, and both named
+exports plus their observed ordinals are hard contracts. A new genuine-file
+hash is unqualified until its initializer semantics are independently checked
+and its control harness passes.
 
 ## Binary contracts
 
@@ -175,6 +206,8 @@ named exports plus their observed ordinals are hard PE contracts.
 - `/DYNAMICBASE`, `/NXCOMPAT`, and `/HIGHENTROPYVA`;
 - exactly two public exports:
   `X3DAudioCalculate @1` and `X3DAudioInitialize @2`, both exported by name;
+- an honest VERSIONINFO resource identifying it as the unsigned
+  `RS2ServerFix` passive X3Audio bootstrap and not as a Microsoft binary;
 - no `DisableThreadLibraryCalls`.
 
 ### Companion `RS2ServerFix.dll`
@@ -187,6 +220,8 @@ named exports plus their observed ordinals are hard PE contracts.
   Visual C++ runtime, user TLS, or dynamic global constructor;
 - `/DYNAMICBASE`, `/NXCOMPAT`, and `/HIGHENTROPYVA`;
 - exactly one public export: `RS2ServerFix_InitializeV2`;
+- an honest VERSIONINFO resource identifying it as the `RS2ServerFix`
+  companion;
 - user `DllMain` always returns `TRUE` and performs no work;
 - no worker thread of its own in Milestone 1.
 
@@ -195,10 +230,10 @@ directories or unique system-temporary test directories.
 
 ## Genuine X3Audio resolution
 
-### One permanent resolution result
+### One permanent successful publication
 
-The bootstrap owns one zero-initialized `INIT_ONCE` and one static dispatch
-record containing:
+The bootstrap owns one zero-initialized `INIT_ONCE`. A successful resolver
+allocates one page-aligned immutable dispatch record containing:
 
 ```cpp
 struct X3AudioDispatch {
@@ -210,20 +245,37 @@ struct X3AudioDispatch {
 };
 ```
 
-The init-once callback performs the only genuine resolution attempt and returns
-success to `InitOnceExecuteOnce` even when validation fails. That publishes a
-permanent success or permanent failure record and prevents retry storms or a
-partially published function table.
+Both the worker and both public exports call `AcquireGenuineX3Audio`. It uses
+`InitOnceBeginInitialize(INIT_ONCE_ASYNC)` and
+`InitOnceComplete(INIT_ONCE_ASYNC, dispatch)` rather than a callback or
+`InitOnceExecuteOnce`:
 
-Both the bootstrap worker and both public exports call the same
-`EnsureGenuineX3Audio` function. If they race, `InitOnceExecuteOnce` serializes
-them. Export calls occur after normal process import/DllMain completion in the
-supported VNGame flow; no design claim permits a caller to invoke these exports
-from its own `DllMain`.
+1. an already completed call returns the immutable published record;
+2. every concurrent caller receiving `pending=TRUE` resolves into its own
+   private record without holding an INIT_ONCE or project lock;
+3. only a fully validated success record is offered to `InitOnceComplete`;
+4. the single completion winner retains its module reference and record;
+5. a losing successful caller releases only its own extra module reference and
+   private record, then obtains the winner through `INIT_ONCE_CHECK_ONLY`; and
+6. a failed attempt is abandoned without completing the INIT_ONCE, performs a
+   non-blocking check for a concurrently published success, and otherwise
+   returns its local failure to the caller.
+
+This design guarantees exactly one published successful dispatch, not exactly
+one resolution attempt. It permits duplicate first-race `LoadLibraryExW` calls
+but never exposes a partial table and never waits on a project synchronization
+object while acquiring loader lock. A worker failure may therefore be retried
+by the first later export call; an export failure terminates the process, so it
+cannot produce a retry storm. All INIT_ONCE API-error paths are terminal in an
+export and simply disable the worker path.
+
+Calls from another DLL's `DllMain` remain outside the supported contract: the
+algorithm avoids private-lock/loader-lock inversion, but no proxy can safely
+promise a first `LoadLibraryExW` while its caller itself holds loader lock.
 
 ### Resolution and validation sequence
 
-The init-once callback:
+Each private resolution attempt:
 
 1. allocates its 32,768-character path workspace with `VirtualAlloc`;
 2. obtains the System32 directory with `GetSystemDirectoryW`;
@@ -238,24 +290,28 @@ The init-once callback:
 9. applies `VirtualQuery` to both function addresses;
 10. requires both allocation bases to equal the candidate module and not the
     bootstrap;
-11. publishes the complete dispatch record only after all checks pass; and
-12. retains the successful candidate module to process exit.
+11. returns a complete private success record only after all checks pass.
 
-Rejected non-null candidates are released after a permanent failure record is
-prepared. The temporary workspace is always released. Resolution does not load
-the companion or write diagnostics.
+The caller then attempts the asynchronous one-time publication described
+above. A rejected candidate is released only when it is neither null nor the
+bootstrap module; the `SelfModule` case must never call `FreeLibrary` on the
+bootstrap. Every temporary workspace and losing private record is released.
+The publication winner retains its genuine module and dispatch record until
+process exit. Resolution does not load the companion or write diagnostics.
 
 ## Export behavior
 
 ### `X3DAudioInitialize`
 
-The export obtains the permanent dispatch record. On success it calls the
-genuine function once with the original arguments and returns the exact
-`HRESULT` unchanged.
+The export obtains a validated dispatch, calls the genuine legacy `void`
+function exactly once with the original arguments, and returns after the
+genuine function returns. The proxy neither reads nor rewrites the 20-byte
+handle.
 
-On resolver failure it returns `HRESULT_FROM_WIN32(win32Error)` when a nonzero
-Win32 error exists, otherwise `E_FAIL`. It performs no partial initialization
-and does not fabricate a handle.
+The legacy ABI has no error channel. If no validated dispatch is available,
+the export records nothing and invokes `RaiseFailFastException`, with
+`TerminateProcess` as a defensive non-return fallback. It never returns a
+zeroed, untouched, or fabricated handle as if initialization succeeded.
 
 ### `X3DAudioCalculate`
 
@@ -263,11 +319,11 @@ The export obtains the same permanent dispatch record. On success it calls the
 genuine function once with the original pointers and flags and returns after
 the genuine call.
 
-The function has no error return. If the genuine dispatch is unavailable, the
-proxy invokes `RaiseFailFastException` rather than returning with undefined or
-partially written DSP outputs. This behavior is covered by a fresh-process
-failure test. It is not expected on an eligible system because genuine
-resolution is a deployment precondition.
+The function also has no error return. If the genuine dispatch is unavailable,
+the proxy takes the same fail-fast path rather than returning with undefined or
+partially written DSP outputs. Both failure paths are covered by separate
+fresh-process tests. They are not expected on an eligible system because an
+exact qualified genuine-file hash is a deployment precondition.
 
 Both exports are free of companion calls, file writes, logging, hashing,
 game-memory access, retries, and exception swallowing.
@@ -285,8 +341,8 @@ Other notifications perform no user work.
 
 The worker performs one non-retrying sequence:
 
-1. calls `EnsureGenuineX3Audio`;
-2. atomically observes the final resolver record;
+1. calls `AcquireGenuineX3Audio` once;
+2. continues only with a validated published or private success record;
 3. constructs the absolute sibling path to `RS2ServerFix.dll`;
 4. validates, loads, and calls `RS2ServerFix_InitializeV2` once;
 5. returns without unloading a successful genuine or companion module.
@@ -295,10 +351,23 @@ Worker-creation failure disables companion initialization, but it does not
 disable lazy genuine resolution by a later X3Audio export call. The bootstrap
 does not create another worker from an export.
 
+Creating a non-joined worker from `DllMain` is an explicit residual Windows
+loader risk accepted only for this passive startup experiment. The worker never
+waits, and both project `DllMain` process-detach paths remain empty. Its two
+`LoadLibraryExW` windows occur before host hashing. Automated acceptance adds a
+repeated child that reaches `main` and immediately calls `ExitProcess` while
+the worker may still be active; any startup/shutdown hang or abnormal exit is a
+failure. The disposable-server procedure also measures normal and immediate
+post-start shutdown. This evidence can reduce but cannot prove the absence of
+all third-party detach-lock interactions, so the risk remains named in the
+release evidence.
+
 ## Shared initialization ABI V2
 
-V1 is faultrep-specific and must not be reinterpreted. The X3Audio bootstrap
-and companion compile one new C-compatible context:
+The faultrep-specific V1 ABI is removed from this feature branch rather than
+reinterpreted or retained beside V2. The X3Audio bootstrap and companion
+compile one new C-compatible context. It deliberately carries no callable
+genuine-function pointers:
 
 ```cpp
 constexpr std::uint32_t kBootstrapAbiVersion = 2;
@@ -309,20 +378,25 @@ struct BootstrapContextV2 {
     HMODULE hostModule;
     HMODULE bootstrapModule;
     HMODULE genuineX3AudioModule;
-    FARPROC genuineX3AudioInitialize;
-    FARPROC genuineX3AudioCalculate;
-    std::uint32_t resolverStatus;
-    DWORD resolverError;
+    std::uint32_t genuineExportsMask;
+    std::uint32_t reserved;
 };
 
-static_assert(sizeof(BootstrapContextV2) == 56);
+constexpr std::uint32_t kGenuineInitializePresent = 1u << 0;
+constexpr std::uint32_t kGenuineCalculatePresent = 1u << 1;
+constexpr std::uint32_t kRequiredGenuineExports =
+    kGenuineInitializePresent | kGenuineCalculatePresent;
+
+static_assert(sizeof(BootstrapContextV2) == 40);
 
 using InitializeV2Fn = DWORD(WINAPI*)(const BootstrapContextV2*);
 ```
 
-The companion validates exact size/version, non-null host/bootstrap, resolver
-status range, and all-or-none consistency of genuine module and both function
-pointers. It verifies `hostModule == GetModuleHandleW(nullptr)` before hashing.
+The companion validates exact size/version, non-null host/bootstrap/genuine
+module, `genuineExportsMask == kRequiredGenuineExports`, and `reserved == 0`.
+It verifies `hostModule == GetModuleHandleW(nullptr)` before hashing. Because
+the worker calls the companion only after successful genuine validation, a
+resolver failure never produces a V2 call or marker.
 
 Initialization return values remain stable:
 
@@ -335,8 +409,8 @@ Initialization return values remain stable:
 ```
 
 Duplicate calls use the existing zero-initialized interlocked state and never
-wait. V1 may be removed from this feature branch; no binary may export both V1
-and V2 accidentally without a separate compatibility decision and test.
+wait. `RS2ServerFix.dll` exports V2 only; the active CMake graph and PE tests
+fail if V1 or any second companion export is present.
 
 ## Companion initialization and marker
 
@@ -352,22 +426,27 @@ The companion reuses the reviewed Stage 0 sequence:
    directory fallback; and
 7. publish terminal initialization state.
 
-The marker schema increments to version 2 and identifies:
+The primary marker leaf is exactly
+`RS2ServerFix.loader.<decimal-pid>.log` beside VNGame. The sole fallback uses
+the same leaf beneath the process temporary directory. The marker schema
+increments to version 2 and identifies:
 
 - UTC timestamp and process ID;
 - executable leaf, size, SHA-256 when valid, and build identity;
 - bootstrap leaf `X3DAudio1_7.dll` and same-directory boolean;
 - companion leaf `RS2ServerFix.dll` and same-directory boolean;
-- resolver status/error;
-- genuine module classification `system32` or `unavailable`;
-- presence/validation of both required genuine exports;
+- genuine module classification `system32`;
+- `genuine_initialize_present=true` and
+  `genuine_calculate_present=true`;
 - initializer result and primary marker error if fallback was required; and
 - terminal `completion=complete` or `completion=partial` written last.
 
 It excludes full paths, account/user identifiers, command line, environment,
 network addresses, tokens, player data, exception data, memory contents, EOS
 state, and anti-cheat state. A truncated marker lacks the terminal line and
-fails tests.
+fails tests. The exact cleanup pattern is `RS2ServerFix.loader.*.log`, but an
+operator removes only the marker paths captured for the test PIDs rather than
+blindly deleting every match.
 
 Milestone 1 recognizes builds but grants none permission to patch or hook.
 
@@ -379,18 +458,21 @@ Milestone 1 recognizes builds but grants none permission to patch or hook.
 | Companion present without bootstrap | Companion is ignored; System32 X3Audio loads as before. |
 | Invalid bootstrap/wrong bitness/dependency | Process creation may fail; preflight must prevent placement. |
 | Worker creation fails | Companion/marker absent; exported calls can still resolve and forward genuine X3Audio. |
-| System path/load/identity/export validation fails | Permanent resolver failure; initialize returns failing HRESULT and calculate fails fast if called. |
-| Early initialize races worker | Both serialize through the same init-once result; exactly one resolver attempt. |
-| Early calculate races worker | Both serialize through the same init-once result; genuine call occurs only after complete validation. |
+| System path/load/identity/export validation fails in worker | No publication, companion, or marker; a later export may make one fresh attempt. |
+| System path/load/identity/export validation fails in either export | The process fails fast; the legacy void ABI has no safe fallback. |
+| Early initialize races worker | Each may resolve privately without waiting; exactly one successful dispatch is published and the genuine function is called only through a complete record. |
+| Early calculate races worker | Each may resolve privately without waiting; exactly one successful dispatch is published and the genuine function is called only through a complete record. |
 | Companion missing/load/identity/export failure | Genuine X3Audio remains usable; no retry. |
 | Companion initializer fails | Genuine X3Audio remains usable; validated companion remains mapped after the call. |
 | Host hash fails | Build identity is `indeterminate`; no hook/patch behavior exists. |
 | Marker primary path fails | One temporary-directory write attempt. |
 | Both marker writes fail | Debug milestone only; initializer returns marker failure. |
 | Normal process termination | No explicit unload or detach cleanup; Windows tears down mappings. |
+| Immediate `ExitProcess` while worker runs | Residual risk; bounded repetition must show no hang before disposable use. |
 
-The bootstrap never returns fake successful initialization, never supplies a
-zeroed handle as success, and never silently skips a failed calculate call.
+The bootstrap never returns from a failed initializer as if a handle were
+valid, never supplies a zeroed handle as success, and never silently skips a
+failed calculate call.
 
 ## PE parsing and deployment preflight
 
@@ -408,8 +490,14 @@ does not follow directory reparse points, and fails unless:
   is present;
 - the proposed bootstrap and companion match their recorded hashes and PE
   contracts;
-- the target System32 genuine file is AMD64, has a valid Microsoft signature,
-  and exports both required names/ordinals;
+- the target System32 genuine file is AMD64, has an explicitly qualified
+  SHA-256, and matches the qualified file's recorded size, PE timestamp,
+  `SizeOfImage`, version, and both required names/ordinals;
+- that exact file passes timestamp-aware embedded Authenticode verification
+  through `WinVerifyTrust(WINTRUST_ACTION_GENERIC_VERIFY_V2)` with no UI,
+  `WTD_REVOKE_NONE`, cache-only URL retrieval, and paired VERIFY/CLOSE state
+  actions; only `ERROR_SUCCESS` is accepted, with no manual certificate-expiry
+  override;
 - all direct and delay imports of `X3DAudio1_7.dll` in the selected tree are
   reported with every required symbol;
 - no incompatible importer requires an export outside the complete two-export
@@ -417,6 +505,20 @@ does not follow directory reparse points, and fails unless:
 - malformed PE-like files, incomplete scans, and reparse-point PE files are
   explicit failures; and
 - security-product disposition and target-host KnownDLL state are recorded.
+
+The first qualified genuine hash is
+`9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446`.
+Its Microsoft signer certificate is expired in wall-clock terms but its
+embedded time-stamp makes `WinVerifyTrust` and `Get-AuthenticodeSignature`
+return valid. The preflight must not reproduce trust by comparing `NotAfter`
+itself. Catalog-only signatures are not accepted in Milestone 1; a target with
+a different or catalog-only genuine file stops for separate qualification,
+including legacy-void-ABI inspection and a System32 control-harness run.
+
+For tree compatibility, by-name imports of either public export and ordinal
+imports `@1`/`@2` are compatible and reported. Every other X3Audio name or
+ordinal is rejected. The selected VNGame contract remains stricter: it must
+normally import named `X3DAudioInitialize` exactly as profiled.
 
 The desktop loaded-module scan is contextual only. The disposable target's
 actual tree and runtime module list decide compatibility.
@@ -428,14 +530,20 @@ system-temporary directories.
 
 ### Unit tests
 
-1. both genuine function signatures and dispatch-record all-or-none validity;
-2. init-once permanent success and permanent failure under concurrent callers;
+1. compile-time legacy-void initializer signature, calculate signature, and
+   dispatch-record all-or-none validity;
+2. asynchronous INIT_ONCE behavior under concurrent callers: no caller waits,
+   only complete successes are offered, exactly one success is published,
+   losing module references are released, and a worker failure remains
+   retryable;
 3. resolver validation: null, self module, wrong file identity, one/both exports
    missing, failed `VirtualQuery`, and wrong allocation base;
-4. initialize null-dispatch HRESULT behavior and exact genuine return/argument
-   fidelity;
-5. calculate exact pointer/flag fidelity and isolated fail-fast behavior;
-6. companion ABI V2 size/version and all-or-none pointer consistency;
+4. initialize exact argument/output fidelity and isolated resolver-failure
+   fail-fast behavior;
+5. calculate exact pointer/flag/output fidelity and isolated resolver-failure
+   fail-fast behavior;
+6. companion ABI V2 size/version, required export mask, reserved field, and
+   module-handle validation;
 7. existing build identities, stock-input immutability, path identity, and
    bounded companion-path construction;
 8. marker schema 2, fallback, short-write cleanup, terminal line, and forbidden
@@ -455,31 +563,66 @@ The PE tool fails unless:
 - no artifact has a TLS directory, unexpected export, or unexpected dynamic
   runtime dependency.
 
+The old faultrep target and its contracts are absent. The active suite keeps
+the six baseline test roles under X3Audio-aware implementations and adds one
+early-exit test:
+
+1. `core` (adapted);
+2. `pe_bootstrap_contract` (two X3Audio exports, not `ReportFault`);
+3. `pe_companion_contract` (V2 only);
+4. `pe_harness_contract` (named legacy initializer import);
+5. `static_import_cases` (the matrix below);
+6. `preflight_fixture` (normal and delay imports); and
+7. `early_exit_cases` (repeated immediate `ExitProcess`).
+
+The CMake graph no longer searches for or links `FaultRep.Lib` and no active
+test expects `ReportFault`, `faultrep.dll`, or V1.
+
 ### Static-import fresh-process matrix
 
 The harness links against the proxy target's generated import library so its PE
-contains the same `X3DAudio1_7.dll` import while control cases omit the local
-proxy file.
+contains a named `X3DAudio1_7.dll!X3DAudioInitialize` import while control
+cases omit the local proxy file. It declares that imported function with the
+legacy `void` ABI. To exercise calculate, it enumerates loaded modules by full
+path, selects the intended local or System32 module handle unambiguously, and
+resolves `X3DAudioCalculate` from that exact handle.
+
+Every functional case zero-initializes the handle, listener, emitter, settings,
+matrix, and padding, then runs one fixed valid initialize/calculate vector. The
+harness emits a deterministic digest of the resulting handle and defined DSP
+outputs to captured stdout. The runner compares proxy-case digests with the
+System32 control and also requires the expected full-path module inventory; it
+does not use basename-only `GetModuleHandleW` or discard child output.
 
 Each case runs in a fresh, bounded child process:
 
-1. **System control:** harness only; System32 X3Audio loads and initialize
-   succeeds.
+1. **System control:** harness only; the qualified System32 X3Audio loads and
+   produces the reference digest.
 2. **Companion only:** harness plus companion; System32 still loads and no
    marker appears.
 3. **Bootstrap only:** local proxy loads, both genuine exports validate, an
-   initialize/calculate smoke sequence matches control, and no companion marker
-   appears.
+   initialize/calculate vector matches the control digest, two distinct
+   expected X3Audio full paths are enumerated, and no companion marker appears.
 4. **Both files:** local proxy plus companion; complete marker proves genuine,
    companion, ABI, and host identity.
 5. **Invalid companion:** genuine calls still match control; no complete marker.
-6. **Missing/invalid genuine simulation:** initialize returns failure and an
-   isolated calculate child terminates through fail-fast.
-7. **Concurrent first calls:** multiple initialize callers plus worker produce
-   one resolver attempt and consistent results.
+6. **Missing genuine simulation:** a non-deployable test-only bootstrap is
+   compiled with an absent System32 genuine leaf while retaining local output
+   name `X3DAudio1_7.dll`; separate initializer and calculate children must
+   terminate through fail-fast without modifying System32.
+7. **Concurrent first calls:** multiple initializer/calculate callers plus the
+   worker produce consistent control digests and exactly one published success;
+   attempt-count and loser-cleanup assertions live in the injected unit test,
+   not in external-process inference.
 8. **Invalid bootstrap:** process creation or loader termination fails, proving
    there is no promised fallback after local selection.
 9. **Rollback:** remove both while no child runs; System32 control succeeds.
+
+`early_exit_cases` is separate from the nine functional cases. It repeatedly
+starts a bootstrap-plus-companion harness whose `main` immediately calls
+`ExitProcess`; each child has a strict timeout and must exit normally. The
+repeat count is fixed in the implementation plan, high enough to exercise the
+worker race without turning the normal suite into an unbounded soak.
 
 The harness never unloads a module while the worker can run and disables
 critical-error UI.
@@ -519,7 +662,10 @@ user's explicit runtime authorization.
 4. Require Steam, EOS, EAC, client join/authentication, network, WebAdmin, map
    load/travel, and normal shutdown to match control.
 5. Observe a pre-agreed bounded idle/play interval.
-6. Stop normally, capture the same sanitized manifest, and prove no protected
+6. In a separate disposable repetition, request normal shutdown immediately
+   after startup readiness and require it to complete within the same bound as
+   control; do not force termination to turn a hang into a pass.
+7. Stop normally, capture the same sanitized manifest, and prove no protected
    executable, DLL, or configuration file changed. Expected runtime logs and
    explicitly named marker evidence are recorded separately.
 
@@ -535,6 +681,14 @@ incompatible importer, genuine/companion validation failure, missing/partial
 marker, service regression, shutdown hang, protected-artifact mutation, or
 rollback failure stops Milestone 1.
 
+If AV/EDR quarantines or deletes the local bootstrap, do not disable the
+control or add an exclusion. Stop the server, preserve the alert, remove the
+remaining exact companion and captured marker while stopped, and prove the
+System32 control path again. Quarantine-in-place may block process creation;
+quarantine-by-deletion may silently restore System32 loading, so the required
+local-module inventory and marker are acceptance evidence rather than optional
+diagnostics.
+
 ## Success criteria
 
 Milestone 1 is complete only when:
@@ -543,14 +697,21 @@ Milestone 1 is complete only when:
   partial-installation, concurrency, fail-fast, and preflight tests;
 - normal and delay imports are both parsed and covered by malformed-fixture
   tests;
-- both X3Audio exports preserve genuine behavior when the proxy is present;
+- the offline System32-control digest proves both X3Audio exports preserve the
+  qualified legacy ABI and defined output behavior when the proxy is present;
 - companion absence/failure cannot break valid genuine forwarding;
 - no export performs companion work, logging, hashing, or game-memory access;
+- concurrent first callers never wait on project synchronization while loading
+  the genuine module, exactly one complete success is published, and repeated
+  immediate-exit children do not hang;
 - control/companion-only/rollback load System32 directly;
 - bootstrap cases prove local bootstrap plus separately validated System32
   genuine module;
-- the exact disposable server passes control/proxy/rollback with Steam, EOS,
-  EAC, join, travel, WebAdmin, and shutdown intact;
+- the exact disposable server proves local/bootstrap and System32/genuine
+  coexistence and passes control/proxy/rollback with Steam, EOS, EAC, join,
+  travel, WebAdmin, and shutdown intact; forwarding fidelity remains an
+  offline-harness claim because VNGame imports only the initializer and the
+  exports intentionally emit no diagnostics;
 - pre/post hashes prove no protected executable, shipped DLL, or configuration
   changed; expected runtime logs and named marker evidence are excluded from
   that invariant and retained separately;
@@ -558,6 +719,12 @@ Milestone 1 is complete only when:
   evidence; and
 - no production/public server, client, anti-cheat bypass, game hook, or
   performance claim is involved.
+
+The accepted residual risk statement must accompany any Milestone 1 artifact:
+`CreateThread` from `DllMain` is a pragmatic startup trigger, is documented by
+Microsoft as risky, and cannot be proven safe against every third-party
+process-detach lock. Offline early-exit repetition plus bounded disposable
+shutdown are required evidence, not a claim that the platform risk is absent.
 
 ## Deferred milestones
 
