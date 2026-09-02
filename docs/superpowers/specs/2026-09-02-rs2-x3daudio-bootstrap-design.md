@@ -5,7 +5,7 @@ Date: 2026-09-02
 Stage: Milestone 1 - native loader, genuine API forwarding, companion
 initialization, diagnostics, and rollback proof only
 
-Status: Revised after Claude Opus 5 Max review round 4; awaiting round 5
+Status: Revised after Claude Opus 5 Max review round 5; awaiting round 6
 
 ## Goal
 
@@ -74,8 +74,9 @@ Evidence tied to the current RS2 server files shows:
 - the captured module and examined genuine file agree on PE timestamp
   `0x4B6B06BE`, PE `SizeOfImage` 36,864, and checksum `0x00008C0D`; the file
   size is 24,920 bytes;
-- the examined genuine file is AMD64, Microsoft-signed, version
-  `9.28 (DXSDK_FEB10.100204-0932)`, and SHA-256
+- the examined genuine file is AMD64 and Microsoft-signed; its
+  `VS_FIXEDFILEINFO` file and product version quads are both `9.28.1886.0`, its
+  human display `FileVersion` is `9.28 (DXSDK_FEB10.100204-0932)`, and its SHA-256 is
   `9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446`;
 - it exports only named `X3DAudioCalculate` at ordinal 1 and named
   `X3DAudioInitialize` at ordinal 2;
@@ -348,9 +349,12 @@ Before these buffers are used, the shared `AppendPathLeaf` and
 caller's supplied capacity, never by the old global 32,768-character capacity.
 `ExtractDirectoryAndLeaf` gains a `std::size_t pathCapacity` parameter
 immediately after `path`; both existing call sites and every new call pass the
-capacity of that exact input buffer. `AppendPathLeaf` uses its existing
-`capacity` argument for both input scanning and output arithmetic.
-Tests pass both terminated and unterminated 512-character buffers. Zeroing the
+capacity of that exact input buffer. `AppendPathLeaf` gains
+`directoryCapacity` immediately after `directory` and `leafCapacity`
+immediately after `leaf`; its existing `capacity` becomes `outputCapacity`.
+Every call passes the capacity of each exact input and output buffer, including
+the compile-time array extent for literal leaves. Tests pass terminated and
+unterminated directory, leaf, and 512-character path inputs. Zeroing the
 resolver buffers remains defense in depth, not the read-bound invariant.
 
 Failures are classified before returning. `SystemPathFailed`, path-capacity,
@@ -598,7 +602,8 @@ does not follow directory reparse points, and fails unless:
   contracts;
 - the target System32 genuine file is AMD64, has an explicitly qualified
   SHA-256, and matches the qualified file's recorded size, PE timestamp,
-  `SizeOfImage`, version, and both required names/ordinals;
+  `SizeOfImage`, both `VS_FIXEDFILEINFO` version quads, and both required
+  names/ordinals; display-version strings are human evidence only;
 - its absolute System32 path plus leaf fits the bootstrap's declared
   512-character resolver capacity;
 - that exact file passes timestamp-aware embedded Authenticode verification
@@ -618,21 +623,74 @@ does not follow directory reparse points, and fails unless:
 The authoritative reviewed input is
 `config/qualified_x3audio_genuine.manifest`, schema 1. It uses the project's
 existing bounded line-oriented convention: 7-bit ASCII, CRLF endings, no BOM,
-one `key=value` pair per line, and no blank lines or escaping. The fixed order
-is `schema`, `entry_count`, then, for each zero-based entry,
-`entry.N.state`, `sha256`, `file_size`, `machine`, `coff_timestamp`,
-`size_of_image`, `file_version`, `product_version`, `export_1`, `export_2`,
-`signature_policy`, and `evidence_path`. Field names after `entry.N.state` also
-carry the same `entry.N.` prefix. Values are restricted to their numeric/hex
-grammar or `[A-Za-z0-9._/-]`; export values are exact
-`X3DAudioCalculate@1` and `X3DAudioInitialize@2`.
+one `key=value` pair per line, and no blank lines or escaping. Every line,
+including the final line, must end in CRLF.
+
+The fixed key order is `schema`, `entry_count`, then these complete keys for
+each zero-based entry: `entry.N.state`, `entry.N.sha256`,
+`entry.N.file_size`, `entry.N.machine`, `entry.N.coff_timestamp`,
+`entry.N.size_of_image`, `entry.N.file_version_quad`,
+`entry.N.product_version_quad`, `entry.N.export_1`, `entry.N.export_2`,
+`entry.N.signature_policy`, and `entry.N.evidence_path`. Their value domains
+are exact:
+
+- `schema=1`; `entry_count` is unsigned decimal `1..32` with no leading zero;
+  `N` is each contiguous decimal index `0..entry_count-1`, also with no leading
+  zero except the single digit `0`;
+- `state` is `provisional` or `qualified`;
+- `sha256` is exactly 64 uppercase hexadecimal digits;
+- `file_size` is unsigned decimal `1..18446744073709551615`, with no leading
+  zero; `machine` is exactly `AMD64`;
+- `coff_timestamp` is `0x` followed by exactly eight uppercase hexadecimal
+  digits; `size_of_image` is unsigned decimal `1..4294967295`, with no leading
+  zero;
+- each version quad is four unsigned decimal components `0..65535` separated
+  by dots, with no component leading zero except the single digit `0`; these
+  are the `VS_FIXEDFILEINFO` values compared by preflight;
+- `export_1` and `export_2` are exact literals `X3DAudioCalculate@1` and
+  `X3DAudioInitialize@2`; their `@` is part of the literal, not a generic value
+  character;
+- `signature_policy` is exactly `embedded-winverifytrust-v2-cache-only`; and
+- `evidence_path` is exactly
+  `docs/evidence/x3audio/<matching-uppercase-sha256>.md`, using only
+  `[A-Za-z0-9._/-]`, with no absolute form, backslash, empty component, or
+  `.`/`..` component.
+
+Human version-resource display strings, including
+`9.28 (DXSDK_FEB10.100204-0932)`, exist only in the referenced Markdown evidence
+record and are never parsed or machine-compared.
+
+The initial committed manifest contains exactly this single record; the actual
+file uses CRLF after every shown line, including the last:
+
+```text
+schema=1
+entry_count=1
+entry.0.state=qualified
+entry.0.sha256=9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446
+entry.0.file_size=24920
+entry.0.machine=AMD64
+entry.0.coff_timestamp=0x4B6B06BE
+entry.0.size_of_image=36864
+entry.0.file_version_quad=9.28.1886.0
+entry.0.product_version_quad=9.28.1886.0
+entry.0.export_1=X3DAudioCalculate@1
+entry.0.export_2=X3DAudioInitialize@2
+entry.0.signature_policy=embedded-winverifytrust-v2-cache-only
+entry.0.evidence_path=docs/evidence/x3audio/9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446.md
+```
+
+The implementation also adds the exact `.gitattributes` rule
+`/config/*.manifest -text` so Git preserves those reviewed CRLF bytes instead
+of normalizing the deployment-gating manifest. Tests inspect the worktree file
+bytes as well as parsed fields.
 
 A dependency-free hand-written reader accepts at most 64 KiB, 32 entries, and
 1,024 bytes per line. It rejects BOM/NUL/non-ASCII, bare LF, duplicate, unknown,
-missing, misordered, malformed, or trailing fields and any count mismatch. No
-third-party parser or serialization dependency is permitted. The preflight and
-normal test runner accept only `qualified` records and never modify or
-auto-promote the manifest.
+missing, misordered, malformed, unterminated-final-line, or trailing fields and
+any count mismatch. No third-party parser or serialization dependency is
+permitted. The preflight and normal test runner accept only `qualified` records
+and never modify or auto-promote the manifest.
 
 The first qualified genuine hash is
 `9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446`.
@@ -658,13 +716,20 @@ sequence:
    convention. Its exact fixed key order is `schema`, `mode`,
    `manifest_sha256`, `candidate_sha256`, `candidate_file_size`,
    `candidate_machine`, `candidate_coff_timestamp`,
-   `candidate_size_of_image`, `candidate_file_version`,
-   `candidate_product_version`, `candidate_export_1`, `candidate_export_2`,
+   `candidate_size_of_image`, `candidate_file_version_quad`,
+   `candidate_product_version_quad`, `candidate_export_1`, `candidate_export_2`,
    `candidate_signature_policy`, `winverifytrust_status`, `abi_layout`,
-   `child_exit_status`, and `control_digest_sha256`. All values are integer or
-   token fields; there is no floating-point serialization. The writer uses
-   bounded fixed templates, rejects partial writes, and never overwrites an
-   existing record. It never loads the proxy and cannot be used as deployment
+   `child_exit_status`, and `control_digest_sha256`. `schema=1`;
+   `mode=qualify-system32`; manifest/candidate/control hashes use the same
+   uppercase SHA-256 grammar; candidate identity, quads, and exports use the
+   manifest grammars; `candidate_signature_policy` is
+   `embedded-winverifytrust-v2-cache-only`;
+   `winverifytrust_status=ERROR_SUCCESS`; `abi_layout=pass`; and
+   `child_exit_status=0x00000000`. There is no floating-point serialization.
+   The writer uses bounded fixed templates, requires a final CRLF, rejects
+   partial writes, and never overwrites an existing record. It emits a record
+   only after every listed check succeeds; failure returns nonzero and leaves
+   no evidence file. It never loads the proxy and cannot be used as deployment
    evidence.
 4. After reviewing that run and appending its sanitized result to the evidence
    record, the project maintainer changes the record to `qualified` in a second
@@ -708,14 +773,17 @@ system-temporary directories.
 6. companion ABI V2 size/version, required export mask, reserved field, and
    module-handle validation;
 7. existing build identities, stock-input immutability, path identity, the new
-   `ExtractDirectoryAndLeaf` input-capacity contract, and bounded companion-path
+   `ExtractDirectoryAndLeaf` path-capacity and `AppendPathLeaf`
+   directory/leaf/output-capacity contracts, and bounded companion-path
    construction;
 8. marker schema 2, fallback, short-write cleanup, terminal line, and forbidden
    content scan;
-9. manifest size/line/entry bounds, fixed field order, character grammar,
-   malformed/duplicate/unknown/trailing rejection, provisional/qualified gate,
-   deterministic qualification-evidence output, no-overwrite, and short-write
-   cleanup; required absolute CLI paths have no fallback search; and
+9. the shipped manifest parses to exactly the canonical qualified seed record
+   above; manifest size/line/entry bounds, fixed field order, every value domain,
+   required final CRLF, malformed/duplicate/unknown/trailing rejection,
+   provisional/qualified gate, qualification-evidence round-trip, no-overwrite,
+   and short-write cleanup are covered; required absolute CLI paths have no
+   fallback search; and
 10. proof that no known build identity permits hook/patch behavior.
 
 ### Built-PE contracts
