@@ -1,262 +1,67 @@
-#include "pe_reader.h"
-
-#include <Windows.h>
-
-#include <algorithm>
-#include <cctype>
-#include <iomanip>
+#include "pe_contract_lib.h"
+#include "tool_paths.h"
 #include <iostream>
-#include <string>
 #include <string_view>
-#include <vector>
-
 namespace {
-
-std::string LowerAscii(std::string value) {
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](const unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        });
-    return value;
+void Help() {
+    std::cout << "rs2_pe_contract --kind <bootstrap|companion|companion-passive|companion-active|harness|fixture-bootstrap|fixture-companion-passive|fixture-companion-active|missing-genuine-bootstrap|startup-fixture> --file <absolute existing plain file>\n"
+        "Sole --help prints this grammar. Options must occur exactly once.\n";
 }
-
-bool StartsWith(
-    const std::string_view value,
-    const std::string_view prefix) noexcept {
-    return value.size() >= prefix.size() &&
-           value.substr(0, prefix.size()) == prefix;
-}
-
-bool IsDynamicRuntime(const std::string& moduleName) {
-    const std::string lowered = LowerAscii(moduleName);
-    return StartsWith(lowered, "vcruntime") ||
-           StartsWith(lowered, "msvcp") ||
-           StartsWith(lowered, "concrt") ||
-           StartsWith(lowered, "api-ms-win-crt-") ||
-           lowered == "ucrtbase.dll";
-}
-
-void Require(
-    const bool condition,
-    const char* description,
-    bool* success) {
-    if (!condition) {
-        std::cerr << "FAIL\t" << description << '\n';
-        *success = false;
-    }
-}
-
-bool IsAllowedModule(
-    const std::string& moduleName,
-    const std::vector<std::string_view>& allowed) {
-    const std::string lowered = LowerAscii(moduleName);
-    return std::find(allowed.begin(), allowed.end(), lowered) !=
-           allowed.end();
-}
-
-void CheckCommon(
-    const rs2fix::pe::Image& image,
-    const bool requireDll,
-    bool* success) {
-    Require(
-        image.machine == IMAGE_FILE_MACHINE_AMD64,
-        "machine is not AMD64",
-        success);
-    Require(
-        image.optionalMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC,
-        "optional header is not PE32+",
-        success);
-    Require(
-        ((image.characteristics & IMAGE_FILE_DLL) != 0) == requireDll,
-        requireDll ? "image is not a DLL" : "image is unexpectedly a DLL",
-        success);
-    Require(
-        (image.dllCharacteristics &
-         IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0,
-        "ASLR flag is absent",
-        success);
-    Require(
-        (image.dllCharacteristics &
-         IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0,
-        "NX compatibility flag is absent",
-        success);
-    Require(
-        (image.dllCharacteristics &
-         IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
-        "high-entropy VA flag is absent",
-        success);
-
-    for (const rs2fix::pe::ImportModule& module : image.imports) {
-        const std::string lowered = LowerAscii(module.name);
-        Require(
-            !IsDynamicRuntime(module.name),
-            "dynamic Visual C++ runtime import is present",
-            success);
-        Require(
-            lowered != "dbghelp.dll",
-            "dbghelp.dll import is present",
-            success);
-    }
-}
-
-void CheckExactExport(
-    const rs2fix::pe::Image& image,
-    const char* expectedName,
-    const std::uint32_t expectedOrdinal,
-    const bool requireOrdinal,
-    bool* success) {
-    Require(
-        image.exportFunctionCount == 1,
-        "export function count is not one",
-        success);
-    Require(
-        image.exports.size() == 1,
-        "named export count is not one",
-        success);
-    if (image.exports.size() == 1) {
-        Require(
-            image.exports[0].name == expectedName,
-            "named export does not match",
-            success);
-        if (requireOrdinal) {
-            Require(
-                image.exports[0].ordinal == expectedOrdinal,
-                "export ordinal does not match",
-                success);
+void Imports(const char* kind, const std::vector<rs2fix::pe::ImportModule>& modules) {
+    for (const auto& module : modules) {
+        std::cout << kind << "_import_module=" << module.name << '\n';
+        for (const auto& symbol : module.symbols) {
+            std::cout << kind << "_import_symbol=" << module.name << '!';
+            if (symbol.byOrdinal) std::cout << '#' << symbol.ordinal;
+            else std::cout << symbol.name;
+            std::cout << " iat_rva=0x" << std::hex << symbol.iatRva << std::dec << '\n';
         }
     }
 }
-
-void PrintEvidence(const rs2fix::pe::Image& image) {
-    std::cout << "machine=0x" << std::hex << std::uppercase
-              << image.machine << std::dec << '\n';
-    std::cout << "characteristics=0x" << std::hex << std::uppercase
-              << image.characteristics << std::dec << '\n';
-    std::cout << "dll_characteristics=0x" << std::hex
-              << std::uppercase << image.dllCharacteristics
-              << std::dec << '\n';
-    for (const rs2fix::pe::ImportModule& module : image.imports) {
-        std::cout << "import_module=" << module.name << '\n';
-        for (const rs2fix::pe::ImportSymbol& symbol : module.symbols) {
-            if (symbol.byOrdinal) {
-                std::cout << "import_symbol=" << module.name
-                          << "!#" << symbol.ordinal << '\n';
-            } else {
-                std::cout << "import_symbol=" << module.name
-                          << '!' << symbol.name << '\n';
-            }
-        }
-    }
-    for (const rs2fix::pe::ExportSymbol& symbol : image.exports) {
-        std::cout << "export_symbol=" << symbol.name
-                  << " ordinal=" << symbol.ordinal << '\n';
-    }
 }
-
-void CheckBootstrap(
-    const rs2fix::pe::Image& image,
-    bool* success) {
-    CheckCommon(image, true, success);
-    CheckExactExport(image, "ReportFault", 13, true, success);
-    const std::vector<std::string_view> allowed{"kernel32.dll"};
-    for (const rs2fix::pe::ImportModule& module : image.imports) {
-        Require(
-            IsAllowedModule(module.name, allowed),
-            "bootstrap has a disallowed direct import module",
-            success);
-        Require(
-            LowerAscii(module.name) != "rs2serverfix.dll",
-            "bootstrap statically imports the companion",
-            success);
+int wmain(int count, wchar_t** arguments) {
+    using namespace rs2fix::tooling;
+    if (arguments && count == 2 && std::wstring_view(arguments[1]) == L"--help") { Help(); return 0; }
+    if (!arguments || count != 5) { Help(); return 2; }
+    std::wstring_view kindText;
+    const wchar_t* file = nullptr;
+    for (int index = 1; index < count; index += 2) {
+        const std::wstring_view option(arguments[index]);
+        if (option == L"--kind" && kindText.empty()) kindText = arguments[index + 1];
+        else if (option == L"--file" && !file) file = arguments[index + 1];
+        else { Help(); return 2; }
     }
-}
-
-void CheckCompanion(
-    const rs2fix::pe::Image& image,
-    bool* success) {
-    CheckCommon(image, true, success);
-    CheckExactExport(
-        image,
-        "RS2ServerFix_InitializeV1",
-        0,
-        false,
-        success);
-    const std::vector<std::string_view> allowed{
-        "kernel32.dll", "bcrypt.dll"};
-    for (const rs2fix::pe::ImportModule& module : image.imports) {
-        Require(
-            IsAllowedModule(module.name, allowed),
-            "companion has a disallowed direct import module",
-            success);
-    }
-}
-
-void CheckHarness(
-    const rs2fix::pe::Image& image,
-    bool* success) {
-    CheckCommon(image, false, success);
-    bool foundFaultrep = false;
-    for (const rs2fix::pe::ImportModule& module : image.imports) {
-        if (LowerAscii(module.name) != "faultrep.dll") {
-            continue;
-        }
-        foundFaultrep = true;
-        Require(
-            module.symbols.size() == 1,
-            "harness faultrep import count is not one",
-            success);
-        if (module.symbols.size() == 1) {
-            Require(
-                !module.symbols[0].byOrdinal,
-                "harness imports ReportFault by ordinal",
-                success);
-            Require(
-                module.symbols[0].name == "ReportFault",
-                "harness faultrep import name does not match",
-                success);
-        }
-    }
-    Require(
-        foundFaultrep,
-        "harness has no faultrep.dll import",
-        success);
-}
-
-} // namespace
-
-int wmain(const int argumentCount, wchar_t** arguments) {
-    if (argumentCount != 3 || arguments == nullptr) {
-        std::cerr << "usage: rs2_pe_contract <bootstrap|companion|harness> <path>\n";
-        return 2;
-    }
-
-    rs2fix::pe::Image image{};
-    std::string parseError;
-    if (!rs2fix::pe::ReadPeImage(arguments[2], &image, &parseError)) {
-        std::cerr << "FAIL\tparse\t" << parseError << '\n';
-        return 1;
-    }
-    PrintEvidence(image);
-
-    bool success = true;
-    const std::wstring_view mode(arguments[1]);
-    if (mode == L"bootstrap") {
-        CheckBootstrap(image, &success);
-    } else if (mode == L"companion") {
-        CheckCompanion(image, &success);
-    } else if (mode == L"harness") {
-        CheckHarness(image, &success);
-    } else {
-        std::cerr << "FAIL\tunknown mode\n";
-        return 2;
-    }
-
-    if (!success) {
-        return 1;
-    }
-    std::cout << "contract=pass\n";
-    return 0;
+    ArtifactKind kind{};
+    if (!ParseArtifactKind(kindText, &kind) || !IsAbsoluteToolPath(file)) { Help(); return 2; }
+    std::wstring normalized;
+    std::string pathError;
+    if (!RequireAbsolutePlainFile(file, &normalized, &pathError)) { std::cerr << "usage_error=" << pathError << '\n'; return 2; }
+    ContractReport report;
+    CheckArtifactContract(normalized.c_str(), kind, &report);
+    const auto& image = report.image;
+    std::cout << std::hex << std::uppercase << "machine=0x" << image.machine << "\noptional_magic=0x" << image.optionalMagic
+        << "\ncharacteristics=0x" << image.characteristics << "\ndll_characteristics=0x" << image.dllCharacteristics
+        << "\ncoff_timestamp=0x" << image.coffTimestamp << "\nchecksum=0x" << image.checksum
+        << "\ntls_rva=0x" << image.tlsDirectoryRva << std::dec << "\ntls_size=" << image.tlsDirectorySize
+        << "\nsize_of_image=" << image.sizeOfImage << '\n';
+    Imports("normal", image.normalImports); Imports("delay", image.delayImports);
+    for (const auto& symbol : image.exports)
+        std::cout << "export_symbol=" << symbol.name << " ordinal=" << symbol.ordinal << " rva=0x" << std::hex << symbol.rva
+            << std::dec << " forwarder=" << symbol.forwarder << '\n';
+    const auto narrow = [](const std::wstring& value) {
+        if (value.empty()) return std::string{};
+        const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+        if (required <= 0) return std::string("<invalid-utf16>");
+        std::string bytes(static_cast<std::size_t>(required), '\0');
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+            bytes.data(), required, nullptr, nullptr) != required) return std::string("<invalid-utf16>");
+        return bytes;
+    };
+    std::cout << "version_company=" << narrow(report.version.companyName) << "\nversion_product=" << narrow(report.version.productName)
+        << "\nversion_description=" << narrow(report.version.fileDescription) << "\nversion_original_filename=" << narrow(report.version.originalFilename)
+        << "\nversion_file=" << narrow(report.version.fileVersionText) << "\nversion_product_version=" << narrow(report.version.productVersionText) << '\n';
+    for (const auto& finding : report.findings) std::cout << "finding=" << finding << '\n';
+    std::cout << "contract=" << (report.passed ? "pass" : "fail") << '\n';
+    return report.passed ? 0 : 1;
 }

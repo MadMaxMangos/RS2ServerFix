@@ -1,248 +1,215 @@
 #include "shared/path_identity.h"
-
+#include "companion/sha256.h"
 #include <Windows.h>
-#include <ErrorRep.h>
-
-#include <cstdint>
+#include <TlHelp32.h>
+#define X3DAudioInitialize X3DAudioInitialize_SdkDeclarationOnly
+#define X3DAudioCalculate X3DAudioCalculate_SdkDeclarationOnly
+#include <x3daudio.h>
+#undef X3DAudioCalculate
+#undef X3DAudioInitialize
+#include <array>
+#include <cstddef>
+#include <cstring>
+#include <cwchar>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <vector>
 
-volatile auto g_reportFaultImportAnchor = &ReportFault;
+extern "C" __declspec(dllimport) void WINAPI X3DAudioInitialize(UINT32, FLOAT, BYTE*);
+volatile auto g_x3audioInitializeImportAnchor = &X3DAudioInitialize;
+static_assert(X3DAUDIO_HANDLE_BYTESIZE == 20);
+static_assert(sizeof(X3DAUDIO_LISTENER) == 56 && offsetof(X3DAUDIO_LISTENER, pCone) == 48);
+static_assert(sizeof(X3DAUDIO_EMITTER) == 128 && offsetof(X3DAUDIO_EMITTER, ChannelCount) == 64);
+static_assert(offsetof(X3DAUDIO_EMITTER, pVolumeCurve) == 80);
+static_assert(sizeof(X3DAUDIO_DSP_SETTINGS) == 56 && offsetof(X3DAUDIO_DSP_SETTINGS, SrcChannelCount) == 16);
+static_assert(offsetof(X3DAUDIO_DSP_SETTINGS, EmitterToListenerDistance) == 44);
 
 namespace {
-
-bool Fail(const char* message) {
-    std::cerr << "FAIL\t" << message << '\n';
-    return false;
+using CalculateFn = void(WINAPI*)(const BYTE*, const void*, const void*, UINT32, void*);
+constexpr wchar_t kAudioLeaf[] = L"X3DAudio1_7.dll";
+constexpr wchar_t kCompanionLeaf[] = L"RS2ServerFix.dll";
+struct Options { std::wstring_view mode, modules, marker; };
+void Usage() {
+    std::cout << "rs2_static_import_harness --mode <vector|concurrent|fail-initialize|fail-calculate|immediate-exit>\n"
+        "  [--expect-modules <system-only|proxy-and-system> --expect-marker absent]\n"
+        "Sole --help performs no mode action. vector/concurrent require expectations; other modes forbid them.\n";
 }
-
-bool OwnDirectory(wchar_t* directory) {
-    wchar_t path[rs2fix::kPathCapacity]{};
-    wchar_t leaf[260]{};
-    DWORD error = ERROR_SUCCESS;
-    return rs2fix::GetBoundedModulePath(
-               nullptr,
-               path,
-               rs2fix::kPathCapacity,
-               &error) &&
-           rs2fix::ExtractDirectoryAndLeaf(
-               path,
-               directory,
-               rs2fix::kPathCapacity,
-               leaf,
-               260,
-               &error);
+bool Parse(int argc, wchar_t** argv, Options* options) {
+    if ((argc - 1) % 2 != 0) return false;
+    for (int i = 1; i < argc; i += 2) {
+        const std::wstring_view key(argv[i]), value(argv[i + 1]);
+        if (value.empty() || value.find(L'"') != value.npos) return false;
+        std::wstring_view* target = key == L"--mode" ? &options->mode :
+            key == L"--expect-modules" ? &options->modules : key == L"--expect-marker" ? &options->marker : nullptr;
+        if (target == nullptr || !target->empty()) return false;
+        *target = value;
+    }
+    if (options->mode == L"vector" || options->mode == L"concurrent")
+        return (options->modules == L"system-only" || options->modules == L"proxy-and-system") && options->marker == L"absent";
+    return (options->mode == L"fail-initialize" || options->mode == L"fail-calculate" || options->mode == L"immediate-exit") &&
+        options->modules.empty() && options->marker.empty();
 }
-
-bool BuildMarkerPath(wchar_t* markerPath) {
-    wchar_t directory[rs2fix::kPathCapacity]{};
-    if (!OwnDirectory(directory)) {
-        return false;
-    }
-    wchar_t leaf[64]{};
-    if (swprintf_s(
-            leaf,
-            L"RS2ServerFix.loader.%lu.log",
-            static_cast<unsigned long>(GetCurrentProcessId())) <= 0) {
-        return false;
-    }
-    DWORD error = ERROR_SUCCESS;
-    return rs2fix::AppendPathLeaf(
-        directory,
-        leaf,
-        markerPath,
-        rs2fix::kPathCapacity,
-        &error);
+bool OwnDirectory(std::wstring* directory) {
+    std::array<wchar_t, rs2fix::kPathCapacity> path{}, result{}, leaf{};
+    DWORD error = 0;
+    if (!rs2fix::GetBoundedModulePath(nullptr, path.data(), path.size(), &error) ||
+        !rs2fix::ExtractDirectoryAndLeaf(path.data(), path.size(), result.data(), result.size(),
+            leaf.data(), leaf.size(), &error)) return false;
+    *directory = result.data(); return true;
 }
-
-bool ReadMarker(const wchar_t* path, std::string* text) {
-    const HANDLE file = CreateFileW(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file, &size) ||
-        size.QuadPart <= 0 || size.QuadPart >= 8192) {
-        CloseHandle(file);
-        return false;
-    }
-    char buffer[8192]{};
-    DWORD read = 0;
-    const bool readSucceeded = ReadFile(
-        file,
-        buffer,
-        static_cast<DWORD>(size.QuadPart),
-        &read,
-        nullptr) != FALSE &&
-        read == static_cast<DWORD>(size.QuadPart);
-    const bool closeSucceeded = CloseHandle(file) != FALSE;
-    if (!readSucceeded || !closeSucceeded) {
-        return false;
-    }
-    text->assign(buffer, read);
-    return true;
+bool SameFile(const wchar_t* left, const wchar_t* right) {
+    rs2fix::FileIdentity a{}, b{}; DWORD error = 0;
+    return rs2fix::QueryFileIdentity(left, &a, &error) && rs2fix::QueryFileIdentity(right, &b, &error) &&
+        rs2fix::SameFileIdentity(a, b);
 }
-
-bool ContainsLine(
-    const std::string& text,
-    const std::string_view line) {
-    return text.find(line) != std::string::npos;
-}
-
-bool ValidateCompleteMarker(const wchar_t* markerPath) {
-    const ULONGLONG deadline = GetTickCount64() + 15000;
-    std::string marker;
-    const std::string terminal = "completion=complete\r\n";
-    while (GetTickCount64() < deadline) {
-        marker.clear();
-        if (ReadMarker(markerPath, &marker) &&
-            marker.size() >= terminal.size() &&
-            marker.compare(
-                marker.size() - terminal.size(),
-                terminal.size(),
-                terminal) == 0) {
-            break;
+struct Modules { HMODULE selected{}; bool valid{}; };
+Modules InspectModules(bool proxy, bool requireCompleteSet) {
+    Modules result{};
+    std::wstring directory;
+    std::array<wchar_t, 512> system{}; DWORD error = 0;
+    if (!OwnDirectory(&directory) || !rs2fix::BuildSystemX3AudioPath(system.data(), system.size(), &error)) return result;
+    const std::wstring local = directory + L"\\" + kAudioLeaf;
+    HANDLE snapshot = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0; attempt < 3 && snapshot == INVALID_HANDLE_VALUE; ++attempt) {
+        snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+        if (snapshot == INVALID_HANDLE_VALUE && GetLastError() != ERROR_BAD_LENGTH) return result;
+    }
+    if (snapshot == INVALID_HANDLE_VALUE) return result;
+    MODULEENTRY32W entry{}; entry.dwSize = sizeof(entry);
+    bool ok = Module32FirstW(snapshot, &entry) != FALSE;
+    unsigned audioCount = 0, localCount = 0, systemCount = 0, companionCount = 0;
+    std::vector<rs2fix::FileIdentity> seen;
+    while (ok) {
+        if (_wcsicmp(entry.szModule, kCompanionLeaf) == 0) ++companionCount;
+        if (_wcsicmp(entry.szModule, kAudioLeaf) == 0) {
+            ++audioCount;
+            std::array<wchar_t, rs2fix::kPathCapacity> loaded{};
+            rs2fix::FileIdentity identity{};
+            if (!rs2fix::GetBoundedModulePath(entry.hModule, loaded.data(), loaded.size(), &error) ||
+                !rs2fix::QueryFileIdentity(loaded.data(), &identity, &error)) { ok = false; break; }
+            for (const auto& old : seen) if (rs2fix::SameFileIdentity(old, identity)) ok = false;
+            if (!ok) break;
+            seen.push_back(identity);
+            const bool isSystem = _wcsicmp(loaded.data(), system.data()) == 0 && SameFile(loaded.data(), system.data());
+            const bool isLocal = _wcsicmp(loaded.data(), local.c_str()) == 0 && SameFile(loaded.data(), local.c_str());
+            if (isSystem) ++systemCount;
+            if (isLocal) ++localCount;
+            if (proxy ? isLocal : isSystem) result.selected = entry.hModule;
+            if (!isSystem && !isLocal) { ok = false; break; }
         }
-        Sleep(10);
+        SetLastError(ERROR_SUCCESS);
+        if (!Module32NextW(snapshot, &entry)) {
+            ok = GetLastError() == ERROR_NO_MORE_FILES; break;
+        }
     }
-
-    const std::string pid = "pid=" +
-        std::to_string(GetCurrentProcessId()) + "\r\n";
-    return (!marker.empty() || Fail("complete marker was not written")) &&
-           (ContainsLine(marker, "schema=1\r\n") ||
-            Fail("marker schema mismatch")) &&
-           (ContainsLine(marker, pid) || Fail("marker PID mismatch")) &&
-           (ContainsLine(
-                marker,
-                "bootstrap_beside_executable=true\r\n") ||
-            Fail("bootstrap location evidence mismatch")) &&
-           (ContainsLine(
-                marker,
-                "companion_beside_executable=true\r\n") ||
-            Fail("companion location evidence mismatch")) &&
-           (ContainsLine(marker, "resolver_status=ok\r\n") ||
-            Fail("genuine resolver did not succeed")) &&
-           (ContainsLine(marker, "genuine_module=system32\r\n") ||
-            Fail("genuine module evidence mismatch")) &&
-           (ContainsLine(marker, "initialize_result=0\r\n") ||
-            Fail("companion initialization failed")) &&
-           (marker.size() >= terminal.size() &&
-            marker.compare(
-                marker.size() - terminal.size(),
-                terminal.size(),
-                terminal) == 0 ||
-            Fail("marker completion is not terminal"));
+    if (!CloseHandle(snapshot)) ok = false;
+    const bool expectedSet = proxy ? audioCount == 2 && localCount == 1 && systemCount == 1
+                                  : audioCount == 1 && localCount == 0 && systemCount == 1;
+    result.valid = ok && result.selected != nullptr && companionCount == 0 && (!requireCompleteSet || expectedSet);
+    return result;
 }
-
-bool ValidateNoMarker(const wchar_t* markerPath) {
+bool Vector(bool proxy, rs2fix::Sha256Digest* digest) {
+    BYTE instance[X3DAUDIO_HANDLE_BYTESIZE]{};
+    X3DAUDIO_LISTENER listener{}; X3DAUDIO_EMITTER emitter{}; X3DAUDIO_DSP_SETTINGS settings{};
+    FLOAT matrix[2]{}, delays[2]{};
+    listener.OrientFront = {0, 0, 1}; listener.OrientTop = {0, 1, 0};
+    emitter.OrientFront = {0, 0, 1}; emitter.OrientTop = {0, 1, 0}; emitter.Position = {0, 0, 1};
+    emitter.ChannelCount = 1; emitter.CurveDistanceScaler = 1; emitter.DopplerScaler = 1;
+    settings.pMatrixCoefficients = matrix; settings.pDelayTimes = delays;
+    settings.SrcChannelCount = 1; settings.DstChannelCount = 2;
+    constexpr UINT32 flags = X3DAUDIO_CALCULATE_MATRIX | X3DAUDIO_CALCULATE_DELAY |
+        X3DAUDIO_CALCULATE_LPF_DIRECT | X3DAUDIO_CALCULATE_LPF_REVERB | X3DAUDIO_CALCULATE_REVERB |
+        X3DAUDIO_CALCULATE_DOPPLER | X3DAUDIO_CALCULATE_EMITTER_ANGLE;
+    X3DAudioInitialize(SPEAKER_STEREO, X3DAUDIO_SPEED_OF_SOUND, instance);
+    const auto modules = InspectModules(proxy, true);
+    if (!modules.valid) return false;
+    const auto calculate = reinterpret_cast<CalculateFn>(GetProcAddress(modules.selected, "X3DAudioCalculate"));
+    if (calculate == nullptr) return false;
+    calculate(instance, &listener, &emitter, flags, &settings);
+    std::array<BYTE, 68> canonical{};
+    std::memcpy(canonical.data(), instance, sizeof(instance));
+    const FLOAT values[] = {settings.LPFDirectCoefficient, settings.LPFReverbCoefficient,
+        settings.ReverbLevel, settings.DopplerFactor, settings.EmitterToListenerAngle,
+        settings.EmitterToListenerDistance, settings.EmitterVelocityComponent,
+        settings.ListenerVelocityComponent, matrix[0], matrix[1], delays[0], delays[1]};
+    static_assert(sizeof(values) + sizeof(instance) == 68);
+    for (std::size_t i = 0; i < std::size(values); ++i)
+        std::memcpy(canonical.data() + sizeof(instance) + i * sizeof(FLOAT), &values[i], sizeof(FLOAT));
+    return rs2fix::HashBytesSha256(canonical.data(), canonical.size(), digest);
+}
+struct ThreadData { HANDLE start{}; bool proxy{}, success{}; rs2fix::Sha256Digest digest{}; };
+DWORD WINAPI VectorThread(void* argument) {
+    auto& data = *static_cast<ThreadData*>(argument);
+    if (WaitForSingleObject(data.start, 20000) == WAIT_OBJECT_0) data.success = Vector(data.proxy, &data.digest);
+    return data.success ? 0 : 1;
+}
+bool Concurrent(bool proxy, rs2fix::Sha256Digest* digest) {
+    HANDLE start = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (start == nullptr) return false;
+    std::array<ThreadData, 16> data{}; std::array<HANDLE, 16> threads{};
+    DWORD count = 0;
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i].start = start; data[i].proxy = proxy;
+        threads[i] = CreateThread(nullptr, 0, VectorThread, &data[i], 0, nullptr);
+        if (threads[i] == nullptr) break;
+        ++count;
+    }
+    SetEvent(start);
+    if (count != 0 && WaitForMultipleObjects(count, threads.data(), TRUE, 20000) != WAIT_OBJECT_0)
+        ExitProcess(ERROR_TIMEOUT);
+    bool success = count == data.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        success = data[i].success && data[i].digest == data[0].digest && success;
+        if (!CloseHandle(threads[i])) success = false;
+    }
+    if (!CloseHandle(start)) success = false;
+    if (success) *digest = data[0].digest;
+    return success;
+}
+bool Absent(const std::wstring& path) {
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+bool NoMarkerOrCompanion(bool proxy) {
+    std::wstring directory;
+    std::array<wchar_t, rs2fix::kPathCapacity> temp{};
+    const DWORD count = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
+    if (!OwnDirectory(&directory) || count == 0 || count >= temp.size()) return false;
+    const std::wstring leaf = L"RS2ServerFix.loader." + std::to_wstring(GetCurrentProcessId()) + L".log";
     const ULONGLONG deadline = GetTickCount64() + 2000;
-    while (GetTickCount64() < deadline) {
-        if (GetFileAttributesW(markerPath) != INVALID_FILE_ATTRIBUTES) {
-            return Fail("marker unexpectedly exists");
-        }
+    do {
+        if (!Absent(directory + L"\\" + leaf) || !Absent(std::wstring(temp.data()) + leaf) ||
+            GetModuleHandleW(kCompanionLeaf) != nullptr) return false;
         Sleep(10);
-    }
-    return GetFileAttributesW(markerPath) == INVALID_FILE_ATTRIBUTES ||
-           Fail("marker unexpectedly exists");
+    } while (GetTickCount64() < deadline);
+    return InspectModules(proxy, true).valid;
 }
-
-bool ValidateFaultrepIdentity(const bool expectSystem) {
-    const HMODULE loaded = GetModuleHandleW(L"faultrep.dll");
-    if (loaded == nullptr) {
-        return Fail("faultrep.dll is not loaded");
-    }
-
-    wchar_t loadedPath[rs2fix::kPathCapacity]{};
-    wchar_t expectedPath[rs2fix::kPathCapacity]{};
-    DWORD error = ERROR_SUCCESS;
-    if (!rs2fix::GetBoundedModulePath(
-            loaded,
-            loadedPath,
-            rs2fix::kPathCapacity,
-            &error)) {
-        return Fail("loaded faultrep path is unavailable");
-    }
-    if (expectSystem) {
-        if (!rs2fix::BuildSystemFaultrepPath(
-                expectedPath,
-                rs2fix::kPathCapacity,
-                &error)) {
-            return Fail("System32 faultrep path is unavailable");
-        }
-    } else {
-        wchar_t directory[rs2fix::kPathCapacity]{};
-        if (!OwnDirectory(directory) ||
-            !rs2fix::AppendPathLeaf(
-                directory,
-                L"faultrep.dll",
-                expectedPath,
-                rs2fix::kPathCapacity,
-                &error)) {
-            return Fail("local faultrep path is unavailable");
-        }
-    }
-
-    rs2fix::FileIdentity loadedIdentity{};
-    rs2fix::FileIdentity expectedIdentity{};
-    if (!rs2fix::QueryFileIdentity(
-            loadedPath, &loadedIdentity, &error) ||
-        !rs2fix::QueryFileIdentity(
-            expectedPath, &expectedIdentity, &error)) {
-        return Fail("faultrep file identity is unavailable");
-    }
-    return rs2fix::SameFileIdentity(
-               loadedIdentity, expectedIdentity) ||
-           Fail("wrong faultrep module was selected");
-}
-
 } // namespace
 
-int wmain(const int argumentCount, wchar_t** arguments) {
-    if (argumentCount != 3 || arguments == nullptr) {
-        std::cerr << "usage: harness <--expect-system|--expect-bootstrap> "
-                     "<--expect-marker|--forbid-marker>\n";
-        return 2;
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--help") { Usage(); return 0; }
+    Options options{};
+    if (!Parse(argc, argv, &options)) { Usage(); return 2; }
+    if (options.mode == L"immediate-exit") ExitProcess(0);
+    if (g_x3audioInitializeImportAnchor == nullptr) return 1;
+    if (options.mode == L"fail-initialize") {
+        BYTE instance[20]{}; X3DAudioInitialize(SPEAKER_STEREO, X3DAUDIO_SPEED_OF_SOUND, instance); return 1;
     }
-    if (g_reportFaultImportAnchor == nullptr) {
-        std::cerr << "FAIL\tReportFault import anchor is null\n";
-        return 1;
+    if (options.mode == L"fail-calculate") {
+        auto modules = InspectModules(true, false);
+        if (!modules.valid) return 1;
+        auto calculate = reinterpret_cast<CalculateFn>(GetProcAddress(modules.selected, "X3DAudioCalculate"));
+        if (calculate == nullptr) return 1;
+        BYTE instance[20]{}, listener[56]{}, emitter[128]{}, settings[56]{};
+        calculate(instance, listener, emitter, 0, settings); return 1;
     }
-
-    const std::wstring_view moduleExpectation(arguments[1]);
-    const std::wstring_view markerExpectation(arguments[2]);
-    const bool expectSystem = moduleExpectation == L"--expect-system";
-    const bool expectBootstrap =
-        moduleExpectation == L"--expect-bootstrap";
-    const bool expectMarker = markerExpectation == L"--expect-marker";
-    const bool forbidMarker = markerExpectation == L"--forbid-marker";
-    if ((!expectSystem && !expectBootstrap) ||
-        (!expectMarker && !forbidMarker)) {
-        std::cerr << "FAIL\tinvalid expectation\n";
-        return 2;
-    }
-
-    wchar_t markerPath[rs2fix::kPathCapacity]{};
-    if (!BuildMarkerPath(markerPath)) {
-        std::cerr << "FAIL\tmarker path is unavailable\n";
-        return 1;
-    }
-
-    const bool moduleValid = ValidateFaultrepIdentity(expectSystem);
-    const bool markerValid = expectMarker
-        ? ValidateCompleteMarker(markerPath)
-        : ValidateNoMarker(markerPath);
-    if (!moduleValid || !markerValid) {
-        return 1;
-    }
-    std::cout << "harness=pass\n";
+    rs2fix::Sha256Digest digest{};
+    const bool proxy = options.modules == L"proxy-and-system";
+    if (!(options.mode == L"concurrent" ? Concurrent(proxy, &digest) : Vector(proxy, &digest)) ||
+        !NoMarkerOrCompanion(proxy)) { std::cerr << "functional_or_module_or_absence_check_failed\n"; return 1; }
+    const auto hex = rs2fix::FormatSha256Upper(digest);
+    std::cout << "digest_sha256=" << hex.data() << '\n';
     return 0;
 }

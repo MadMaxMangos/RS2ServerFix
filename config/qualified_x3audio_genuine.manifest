@@ -1,0 +1,14 @@
+schema=1
+entry_count=1
+entry.0.state=qualified
+entry.0.sha256=9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446
+entry.0.file_size=24920
+entry.0.machine=AMD64
+entry.0.coff_timestamp=0x4B6B06BE
+entry.0.size_of_image=36864
+entry.0.file_version_quad=9.28.1886.0
+entry.0.product_version_quad=9.28.1886.0
+entry.0.export_1=X3DAudioCalculate@1
+entry.0.export_2=X3DAudioInitialize@2
+entry.0.signature_policy=embedded-winverifytrust-v2-cache-only
+entry.0.evidence_path=docs/evidence/x3audio/9460709339701AD471A5CABE6365355F4D586DC4FCB86507C1331839DC555446.md

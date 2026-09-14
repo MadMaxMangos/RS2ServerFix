@@ -1,12 +1,8 @@
 #pragma once
-
-#include "bootstrap/bootstrap_types.h"
+#include "bootstrap/genuine_resolver.h"
 
 namespace rs2fix {
-
-EFaultRepRetVal ForwardOrFail(
-    ReportFaultFn function,
-    LPEXCEPTION_POINTERS exceptionPointers,
-    DWORD options) noexcept;
-
+bool TryForwardCalculate(GenuineResolverState*, HMODULE,
+    const GenuineResolverOps&, const BYTE*, const void*, const void*, UINT32, void*);
+[[noreturn]] void FailFastX3Audio() noexcept;
 } // namespace rs2fix

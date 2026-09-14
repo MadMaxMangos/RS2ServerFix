@@ -1,0 +1,12 @@
+EXPORTS
+    FixtureState DATA
+    FixtureInitializerSlot DATA
+    FixtureInitializerThunk
+    FixtureInitialize
+    FixtureReturn
+    FixtureInitializeEnd
+    FixtureRecon
+    FixtureReconLoad
+    FixtureReconEnd
+    FixtureBadConstant DATA
+    FixtureGoodConstant DATA

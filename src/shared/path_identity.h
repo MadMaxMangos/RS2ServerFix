@@ -1,53 +1,25 @@
 #pragma once
-
 #include <Windows.h>
-
 #include <cstddef>
 
 namespace rs2fix {
-
 inline constexpr std::size_t kPathCapacity = 32768;
-
+inline constexpr std::size_t kBootstrapPathCapacity = 512;
 struct FileIdentity {
     DWORD volumeSerial{};
     DWORD fileIndexHigh{};
     DWORD fileIndexLow{};
     bool valid{};
 };
-
-bool BuildSystemFaultrepPath(
-    wchar_t* output,
-    std::size_t capacity,
-    DWORD* error) noexcept;
-
-bool GetBoundedModulePath(
-    HMODULE module,
-    wchar_t* output,
-    std::size_t capacity,
-    DWORD* error) noexcept;
-
-bool ExtractDirectoryAndLeaf(
-    const wchar_t* path,
-    wchar_t* directory,
-    std::size_t directoryCapacity,
-    wchar_t* leaf,
-    std::size_t leafCapacity,
-    DWORD* error) noexcept;
-
-bool AppendPathLeaf(
-    const wchar_t* directory,
-    const wchar_t* leaf,
-    wchar_t* output,
-    std::size_t capacity,
-    DWORD* error) noexcept;
-
-bool QueryFileIdentity(
-    const wchar_t* path,
-    FileIdentity* identity,
-    DWORD* error) noexcept;
-
-bool SameFileIdentity(
-    const FileIdentity& left,
-    const FileIdentity& right) noexcept;
-
+bool BuildSystemX3AudioPath(wchar_t*, std::size_t, DWORD*) noexcept;
+bool GetBoundedModulePath(HMODULE, wchar_t*, std::size_t, DWORD*) noexcept;
+bool ExtractDirectoryAndLeaf(const wchar_t* path, std::size_t pathCapacity,
+    wchar_t* directory, std::size_t directoryCapacity,
+    wchar_t* leaf, std::size_t leafCapacity, DWORD* error) noexcept;
+// output may equal directory; leaf must not overlap output.
+bool AppendPathLeaf(const wchar_t* directory, std::size_t directoryCapacity,
+    const wchar_t* leaf, std::size_t leafCapacity,
+    wchar_t* output, std::size_t outputCapacity, DWORD* error) noexcept;
+bool QueryFileIdentity(const wchar_t*, FileIdentity*, DWORD*) noexcept;
+bool SameFileIdentity(const FileIdentity&, const FileIdentity&) noexcept;
 } // namespace rs2fix

@@ -1,0 +1,30 @@
+#include <winver.h>
+#include "shared/version.h"
+
+1 VERSIONINFO
+FILEVERSION RS2FIX_VERSION_QUAD
+PRODUCTVERSION RS2FIX_VERSION_QUAD
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE @RS2_RESOURCE_FILETYPE@
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "RS2ServerFix Project\0"
+            VALUE "FileDescription", "@RS2_RESOURCE_DESCRIPTION@\0"
+            VALUE "FileVersion", RS2FIX_VERSION_ASCII "\0"
+            VALUE "InternalName", "@RS2_RESOURCE_NAME@\0"
+            VALUE "OriginalFilename", "@RS2_RESOURCE_FILENAME@\0"
+            VALUE "ProductName", "RS2ServerFix\0"
+            VALUE "ProductVersion", RS2FIX_VERSION_ASCII "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

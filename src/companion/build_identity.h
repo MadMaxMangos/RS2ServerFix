@@ -1,11 +1,9 @@
 #pragma once
 
-#include <array>
+#include "shared/digest.h"
 #include <cstdint>
 
 namespace rs2fix {
-
-using Sha256Digest = std::array<std::uint8_t, 32>;
 
 enum class BuildIdentity : std::uint32_t {
     Pr1CrashFullDump,

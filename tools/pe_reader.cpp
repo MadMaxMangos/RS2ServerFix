@@ -1,4 +1,5 @@
 #include "pe_reader.h"
+#include "tool_paths.h"
 
 #include <Windows.h>
 
@@ -46,28 +47,36 @@ bool MultiplySize(
 
 class FileBytes {
 public:
+    explicit FileBytes(const std::vector<std::uint8_t>& bytes) : bytes_(bytes) {}
+    FileBytes() = default;
+    const std::vector<std::uint8_t>& bytes() const noexcept { return bytes_; }
     bool Load(const wchar_t* path, std::string* error) {
-        if (path == nullptr || path[0] == L'\0') {
-            return SetError(error, "empty path");
-        }
+        std::wstring normalized;
+        if (!tooling::RequireAbsolutePlainFile(path, &normalized, error)) return false;
 
         const HANDLE file = CreateFileW(
-            path,
+            normalized.c_str(),
             GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ,
             nullptr,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT,
             nullptr);
         if (file == INVALID_HANDLE_VALUE) {
             return SetError(error, "open failed");
+        }
+        BY_HANDLE_FILE_INFORMATION identity{};
+        if (!GetFileInformationByHandle(file, &identity) ||
+            (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+            CloseHandle(file);
+            return SetError(error, "not a plain file");
         }
 
         LARGE_INTEGER size{};
         if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
             static_cast<unsigned long long>(size.QuadPart) >
                 static_cast<unsigned long long>(
-                    (std::numeric_limits<std::size_t>::max)())) {
+                    512ULL * 1024 * 1024)) {
             CloseHandle(file);
             return SetError(error, "invalid file size");
         }
@@ -141,6 +150,9 @@ struct ParsedHeaders {
     std::uint32_t numberOfRvaAndSizes{};
     IMAGE_DATA_DIRECTORY exportDirectory{};
     IMAGE_DATA_DIRECTORY importDirectory{};
+    IMAGE_DATA_DIRECTORY delayDirectory{};
+    IMAGE_DATA_DIRECTORY tlsDirectory{};
+    std::uint64_t imageBase{};
     std::vector<IMAGE_SECTION_HEADER> sections;
 };
 
@@ -168,7 +180,7 @@ bool ReadHeaders(
     }
     IMAGE_FILE_HEADER fileHeader{};
     if (!file.Read(fileHeaderOffset, &fileHeader) ||
-        fileHeader.NumberOfSections == 0) {
+        fileHeader.NumberOfSections == 0 || fileHeader.NumberOfSections > 96) {
         return SetError(error, "invalid file header");
     }
 
@@ -202,6 +214,17 @@ bool ReadHeaders(
         headers->numberOfRvaAndSizes = optional.NumberOfRvaAndSizes;
         image->optionalMagic = optional.Magic;
         image->dllCharacteristics = optional.DllCharacteristics;
+        image->sizeOfImage = optional.SizeOfImage;
+        image->checksum = optional.CheckSum;
+        image->imageBase = optional.ImageBase;
+        image->entryPointRva = optional.AddressOfEntryPoint;
+        headers->imageBase = optional.ImageBase;
+        if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)
+            headers->delayDirectory = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
+            headers->tlsDirectory = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        for (std::size_t i = 0; i < std::min<std::size_t>(optional.NumberOfRvaAndSizes, IMAGE_NUMBEROF_DIRECTORY_ENTRIES); ++i)
+            image->dataDirectories[i] = {optional.DataDirectory[i].VirtualAddress, optional.DataDirectory[i].Size};
         if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
             exportDirectory =
                 optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -224,6 +247,17 @@ bool ReadHeaders(
         headers->numberOfRvaAndSizes = optional.NumberOfRvaAndSizes;
         image->optionalMagic = optional.Magic;
         image->dllCharacteristics = optional.DllCharacteristics;
+        image->sizeOfImage = optional.SizeOfImage;
+        image->checksum = optional.CheckSum;
+        image->imageBase = optional.ImageBase;
+        image->entryPointRva = optional.AddressOfEntryPoint;
+        headers->imageBase = optional.ImageBase;
+        if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)
+            headers->delayDirectory = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
+            headers->tlsDirectory = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        for (std::size_t i = 0; i < std::min<std::size_t>(optional.NumberOfRvaAndSizes, IMAGE_NUMBEROF_DIRECTORY_ENTRIES); ++i)
+            image->dataDirectories[i] = {optional.DataDirectory[i].VirtualAddress, optional.DataDirectory[i].Size};
         if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
             exportDirectory =
                 optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -240,10 +274,27 @@ bool ReadHeaders(
         IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
         return SetError(error, "too many data directories");
     }
+    for (std::size_t i = 0; i < image->dataDirectories.size(); ++i) {
+        const auto& directory = image->dataDirectories[i];
+        if ((directory.virtualAddress == 0) != (directory.size == 0))
+            return SetError(error, "partial data-directory entry");
+        if (!directory.virtualAddress) continue;
+        if (i == IMAGE_DIRECTORY_ENTRY_SECURITY) {
+            if (!file.Contains(directory.virtualAddress, directory.size)) return SetError(error, "invalid certificate file range");
+        } else if (static_cast<std::uint64_t>(directory.virtualAddress) + directory.size > image->sizeOfImage)
+            return SetError(error, "directory exceeds image");
+    }
     headers->exportDirectory = exportDirectory;
     headers->importDirectory = importDirectory;
     image->machine = fileHeader.Machine;
     image->characteristics = fileHeader.Characteristics;
+    image->coffTimestamp = fileHeader.TimeDateStamp;
+    image->tlsDirectoryRva = headers->tlsDirectory.VirtualAddress;
+    image->tlsDirectorySize = headers->tlsDirectory.Size;
+    image->sizeOfHeaders = headers->sizeOfHeaders;
+    if (image->sizeOfImage == 0 || image->sizeOfImage < image->sizeOfHeaders ||
+        image->entryPointRva >= image->sizeOfImage)
+        return SetError(error, "invalid image size or entry point");
 
     std::size_t sectionOffset = 0;
     std::size_t sectionBytes = 0;
@@ -276,9 +327,9 @@ bool ReadHeaders(
             return SetError(error, "invalid section header");
         }
         if (section.SizeOfRawData != 0 &&
-            !file.Contains(
+            (section.PointerToRawData < headers->sizeOfHeaders || !file.Contains(
                 section.PointerToRawData,
-                section.SizeOfRawData)) {
+                section.SizeOfRawData))) {
             return SetError(error, "invalid section raw range");
         }
         const std::uint64_t virtualSpan = std::max<std::uint32_t>(
@@ -286,11 +337,30 @@ bool ReadHeaders(
             section.SizeOfRawData);
         if (static_cast<std::uint64_t>(section.VirtualAddress) +
                 virtualSpan >
-            static_cast<std::uint64_t>(
-                (std::numeric_limits<std::uint32_t>::max)()) + 1ULL) {
+            image->sizeOfImage || (virtualSpan != 0 && section.VirtualAddress < headers->sizeOfHeaders)) {
             return SetError(error, "section RVA overflow");
         }
+        for (const auto& previous : headers->sections) {
+            const std::uint64_t previousSpan = std::max(previous.Misc.VirtualSize, previous.SizeOfRawData);
+            if (virtualSpan != 0 && previousSpan != 0 &&
+                section.VirtualAddress < static_cast<std::uint64_t>(previous.VirtualAddress) + previousSpan &&
+                previous.VirtualAddress < static_cast<std::uint64_t>(section.VirtualAddress) + virtualSpan)
+                return SetError(error, "overlapping virtual sections");
+            if (section.SizeOfRawData != 0 && previous.SizeOfRawData != 0 &&
+                section.PointerToRawData < static_cast<std::uint64_t>(previous.PointerToRawData) + previous.SizeOfRawData &&
+                previous.PointerToRawData < static_cast<std::uint64_t>(section.PointerToRawData) + section.SizeOfRawData)
+                return SetError(error, "overlapping raw sections");
+        }
         headers->sections.push_back(section);
+        Section exposed{};
+        exposed.name.assign(reinterpret_cast<const char*>(section.Name),
+            strnlen_s(reinterpret_cast<const char*>(section.Name), IMAGE_SIZEOF_SHORT_NAME));
+        exposed.virtualAddress = section.VirtualAddress;
+        exposed.virtualSize = section.Misc.VirtualSize;
+        exposed.rawOffset = section.PointerToRawData;
+        exposed.rawSize = section.SizeOfRawData;
+        exposed.characteristics = section.Characteristics;
+        image->sections.push_back(std::move(exposed));
     }
     return true;
 }
@@ -299,6 +369,19 @@ class RvaReader {
 public:
     RvaReader(const FileBytes& file, const ParsedHeaders& headers) noexcept
         : file_(file), headers_(headers) {}
+
+    // Some legitimate PE data (exported globals and delay-load HMODULE slots)
+    // lives in a section's loader-zeroed tail and has no physical file bytes.
+    // Code, descriptors, lookup thunks and strings must still use raw Map/Read.
+    bool Mapped(const std::uint32_t rva, const std::size_t needed) const noexcept {
+        if (rva < headers_.sizeOfHeaders) return needed <= headers_.sizeOfHeaders - rva;
+        for (const auto& section : headers_.sections) {
+            const std::uint64_t span = std::max(section.Misc.VirtualSize, section.SizeOfRawData);
+            if (rva >= section.VirtualAddress && static_cast<std::uint64_t>(rva) - section.VirtualAddress < span &&
+                needed <= span - (rva - section.VirtualAddress)) return true;
+        }
+        return false;
+    }
 
     bool Map(
         const std::uint32_t rva,
@@ -410,9 +493,10 @@ bool ParseImportSymbols(
     const RvaReader& reader,
     const bool pe32Plus,
     const std::uint32_t thunkRva,
+    const std::uint32_t iatRva,
     std::vector<ImportSymbol>* symbols,
     std::string* error) {
-    if (symbols == nullptr || thunkRva == 0) {
+    if (symbols == nullptr || thunkRva == 0 || iatRva == 0) {
         return SetError(error, "missing import thunk");
     }
     const std::size_t entrySize = pe32Plus
@@ -433,6 +517,10 @@ bool ParseImportSymbols(
         }
 
         std::uint64_t value = 0;
+        const std::uint64_t currentIat = static_cast<std::uint64_t>(iatRva) + index * entrySize;
+        std::size_t iatOffset = 0;
+        if (currentIat > UINT32_MAX || !reader.Map(static_cast<DWORD>(currentIat), entrySize, &iatOffset))
+            return SetError(error, "invalid import IAT range");
         if (pe32Plus) {
             ULONGLONG raw = 0;
             if (!reader.Read(static_cast<DWORD>(entryRva64), &raw)) {
@@ -454,6 +542,7 @@ bool ParseImportSymbols(
             ? IMAGE_ORDINAL_FLAG64
             : IMAGE_ORDINAL_FLAG32;
         ImportSymbol symbol{};
+        symbol.iatRva = static_cast<DWORD>(currentIat);
         if ((value & ordinalFlag) != 0) {
             if ((value & ~(ordinalFlag | 0xffffULL)) != 0) {
                 return SetError(error, "invalid ordinal import");
@@ -498,6 +587,9 @@ bool ParseImports(
     if (directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
         return SetError(error, "short import directory");
     }
+    std::size_t directoryOffset = 0;
+    if (!reader.Map(directory.VirtualAddress, directory.Size, &directoryOffset))
+        return SetError(error, "invalid import directory range");
 
     const std::size_t maximumDescriptors =
         directory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -541,13 +633,71 @@ bool ParseImports(
                 reader,
                 headers.pe32Plus,
                 thunk,
+                descriptor.FirstThunk,
                 &module.symbols,
                 error)) {
             return false;
         }
-        image->imports.push_back(std::move(module));
+        image->normalImports.push_back(std::move(module));
     }
     return SetError(error, "unterminated import directory");
+}
+
+struct DelayDescriptor {
+    DWORD attributes, name, moduleHandle, iat, lookup, bound, unload, timestamp;
+};
+static_assert(sizeof(DelayDescriptor) == 32);
+bool ParseDelayImports(const RvaReader& reader, const ParsedHeaders& headers,
+                       Image* image, std::string* error) {
+    const auto& directory = headers.delayDirectory;
+    if (!DirectoryPresent(directory, error)) return false;
+    if (!directory.VirtualAddress) return true;
+    std::size_t offset = 0;
+    if (directory.Size < sizeof(DelayDescriptor) ||
+        !reader.Map(directory.VirtualAddress, directory.Size, &offset))
+        return SetError(error, "invalid delay directory range");
+    const auto count = directory.Size / sizeof(DelayDescriptor);
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::uint64_t rva = static_cast<std::uint64_t>(directory.VirtualAddress) + index * sizeof(DelayDescriptor);
+        DelayDescriptor descriptor{};
+        if (rva > UINT32_MAX || !reader.Read(static_cast<DWORD>(rva), &descriptor))
+            return SetError(error, "invalid delay descriptor");
+        const DelayDescriptor zero{};
+        if (std::memcmp(&descriptor, &zero, sizeof(zero)) == 0) return true;
+        if ((descriptor.attributes & ~1UL) != 0) return SetError(error, "unsupported delay attributes");
+        DWORD* fields[]{&descriptor.name, &descriptor.moduleHandle, &descriptor.iat,
+                       &descriptor.lookup, &descriptor.bound, &descriptor.unload};
+        if ((descriptor.attributes & 1) == 0) {
+            for (DWORD* field : fields) {
+                if (*field == 0) continue;
+                if (*field < headers.imageBase || static_cast<std::uint64_t>(*field) - headers.imageBase > UINT32_MAX)
+                    return SetError(error, "invalid VA delay field");
+                *field = static_cast<DWORD>(*field - headers.imageBase);
+            }
+        }
+        const std::size_t pointerSize = headers.pe32Plus ? 8 : 4;
+        if (!descriptor.name || !descriptor.moduleHandle || !descriptor.iat || !descriptor.lookup ||
+            !reader.Mapped(descriptor.moduleHandle, pointerSize))
+            return SetError(error, "missing or invalid delay required field");
+        ImportModule module{};
+        if (!reader.CString(descriptor.name, &module.name)) return SetError(error, "invalid delay module name");
+        if (!ParseImportSymbols(reader, headers.pe32Plus, descriptor.lookup, descriptor.iat, &module.symbols, error)) return false;
+        const std::size_t tableSize = (module.symbols.size() + 1) * pointerSize;
+        if ((descriptor.bound && !reader.Map(descriptor.bound, tableSize, &offset)) ||
+            (descriptor.unload && !reader.Map(descriptor.unload, tableSize, &offset)))
+            return SetError(error, "invalid delay optional table");
+        image->delayImports.push_back(std::move(module));
+    }
+    return SetError(error, "unterminated delay directory");
+}
+
+bool ParseTls(const RvaReader& reader, const ParsedHeaders& headers, std::string* error) {
+    if (!DirectoryPresent(headers.tlsDirectory, error)) return false;
+    if (!headers.tlsDirectory.VirtualAddress) return true;
+    const std::size_t required = headers.pe32Plus ? sizeof(IMAGE_TLS_DIRECTORY64) : sizeof(IMAGE_TLS_DIRECTORY32);
+    std::size_t offset = 0;
+    return (headers.tlsDirectory.Size >= required && reader.Map(headers.tlsDirectory.VirtualAddress, headers.tlsDirectory.Size, &offset))
+        || SetError(error, "invalid TLS directory range");
 }
 
 bool ParseExports(
@@ -566,6 +716,9 @@ bool ParseExports(
     if (directory.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) {
         return SetError(error, "short export directory");
     }
+    std::size_t directoryOffset = 0;
+    if (!reader.Map(directory.VirtualAddress, directory.Size, &directoryOffset))
+        return SetError(error, "invalid export directory range");
 
     IMAGE_EXPORT_DIRECTORY exports{};
     if (!reader.Read(directory.VirtualAddress, &exports)) {
@@ -649,6 +802,20 @@ bool ParseExports(
             return SetError(error, "invalid export name");
         }
         symbol.ordinal = static_cast<std::uint32_t>(ordinal);
+        DWORD functionRva = 0;
+        if (!file.Read(functionOffset + static_cast<std::size_t>(functionIndex) * sizeof(DWORD), &functionRva) || !functionRva)
+            return SetError(error, "null named export address");
+        symbol.rva = functionRva;
+        if (functionRva >= directory.VirtualAddress &&
+            static_cast<std::uint64_t>(functionRva) < static_cast<std::uint64_t>(directory.VirtualAddress) + directory.Size) {
+            if (!reader.CString(functionRva, &symbol.forwarder) ||
+                symbol.forwarder.size() + 1 > static_cast<std::uint64_t>(directory.VirtualAddress) + directory.Size - functionRva)
+                return SetError(error, "invalid export forwarder");
+        } else {
+            if (!reader.Mapped(functionRva, 1)) return SetError(error, "invalid export address");
+        }
+        for (const auto& previous : image->exports)
+            if (previous.name == symbol.name) return SetError(error, "duplicate export name");
         image->exports.push_back(std::move(symbol));
     }
     return true;
@@ -673,17 +840,68 @@ bool ReadPeImage(
         if (!file.Load(path, error)) {
             return false;
         }
-        ParsedHeaders headers{};
-        if (!ReadHeaders(file, &headers, image, error)) {
-            return false;
-        }
-        const RvaReader reader(file, headers);
-        return ParseImports(reader, headers, image, error) &&
-               ParseExports(file, reader, headers, image, error);
+        return ReadPeBytes(file.bytes(), image, error);
     } catch (...) {
         *image = {};
         return SetError(error, "PE parsing allocation failure");
     }
+}
+
+bool ReadPeBytes(const std::vector<std::uint8_t>& bytes, Image* image, std::string* error) {
+    if (!image) return SetError(error, "null output image");
+    *image = {};
+    if (error) error->clear();
+    if (bytes.empty() || bytes.size() > 512ULL * 1024 * 1024) return SetError(error, "invalid file size");
+    try {
+        FileBytes file(bytes);
+        Image parsed{};
+        ParsedHeaders headers{};
+        if (!ReadHeaders(file, &headers, &parsed, error)) return false;
+        const RvaReader reader(file, headers);
+        if (!ParseImports(reader, headers, &parsed, error) ||
+            !ParseDelayImports(reader, headers, &parsed, error) ||
+            !ParseTls(reader, headers, error) ||
+            !ParseExports(file, reader, headers, &parsed, error)) return false;
+        parsed.rawBytes = bytes;
+        *image = std::move(parsed);
+        return true;
+    } catch (...) {
+        return SetError(error, "PE parsing allocation failure");
+    }
+}
+
+const Section* FindSection(const Image& image, std::uint32_t rva, std::size_t size) noexcept {
+    for (const auto& section : image.sections) {
+        const std::uint64_t span = std::max(section.virtualSize, section.rawSize);
+        if (rva >= section.virtualAddress && static_cast<std::uint64_t>(rva) - section.virtualAddress < span &&
+            size <= span - (rva - section.virtualAddress)) return &section;
+    }
+    return nullptr;
+}
+bool MapImageRva(const Image& image, std::uint32_t rva, std::size_t size, std::size_t* rawOffset) noexcept {
+    if (!rawOffset || rva >= image.sizeOfImage || size > static_cast<std::uint64_t>(image.sizeOfImage) - rva) return false;
+    std::size_t raw = 0;
+    if (rva < image.sizeOfHeaders) {
+        if (size > image.sizeOfHeaders - rva) return false;
+        raw = rva;
+    } else {
+        const auto* section = FindSection(image, rva, size);
+        if (!section || rva - section->virtualAddress > section->rawSize ||
+            size > section->rawSize - (rva - section->virtualAddress)) return false;
+        raw = static_cast<std::size_t>(section->rawOffset) + rva - section->virtualAddress;
+    }
+    if (raw > image.rawBytes.size() || size > image.rawBytes.size() - raw) return false;
+    *rawOffset = raw;
+    return true;
+}
+bool ReadImageRva(const Image& image, std::uint32_t rva, std::size_t size,
+                  std::vector<std::uint8_t>* bytes, std::string* error) {
+    if (!bytes) return SetError(error, "null RVA output");
+    bytes->clear();
+    std::size_t raw = 0;
+    if (!MapImageRva(image, rva, size, &raw)) return SetError(error, "invalid RVA raw range");
+    bytes->assign(image.rawBytes.begin() + raw, image.rawBytes.begin() + raw + size);
+    return true;
 }
 
 } // namespace rs2fix::pe

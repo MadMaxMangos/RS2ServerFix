@@ -1,73 +1,67 @@
 #include "bootstrap/companion_loader.h"
 #include "bootstrap/forwarder.h"
-#include "bootstrap/genuine_resolver.h"
-#include "shared/bootstrap_abi.h"
+#include "shared/selected_profile.h"
 
-#include <Windows.h>
+#include <intrin.h>
 
 namespace {
-
-PVOID volatile g_reportFault{};
+rs2fix::GenuineResolverState g_genuine{};
 HMODULE g_bootstrap{};
+HMODULE g_host{};
+DWORD g_startupThread{};
+DWORD g_staticLoad{};
+volatile LONG g_optionalAttempted{};
 
-DWORD WINAPI BootstrapWorker(void* parameter) noexcept {
-    const HMODULE bootstrap = static_cast<HMODULE>(parameter);
-    const rs2fix::GenuineResolverResult genuine =
-        rs2fix::ResolveGenuineReportFault(bootstrap);
-
-    if (genuine.status == rs2fix::GenuineResolverStatus::Ok &&
-        genuine.function != nullptr) {
-        InterlockedCompareExchangePointer(
-            &g_reportFault,
-            reinterpret_cast<PVOID>(genuine.function),
-            nullptr);
+struct LeaseOwner {
+    rs2fix::GenuineDispatchLease lease;
+    ~LeaseOwner() noexcept {
+        rs2fix::ReleaseGenuineX3AudioLease(&lease, rs2fix::ProductionGenuineResolverOps());
     }
-
-    rs2fix::BootstrapContextV1 context{};
-    context.size = sizeof(context);
-    context.abiVersion = rs2fix::kBootstrapAbiVersion;
-    context.hostModule = GetModuleHandleW(nullptr);
-    context.bootstrapModule = bootstrap;
-    context.genuineFaultrepModule = genuine.module;
-    context.genuineReportFault =
-        reinterpret_cast<FARPROC>(genuine.function);
-    context.resolverStatus =
-        static_cast<std::uint32_t>(genuine.status);
-    context.resolverError = genuine.win32Error;
-
-    rs2fix::LoadAndInitializeCompanion(bootstrap, context);
-    return 0;
-}
-
+};
 } // namespace
 
-extern "C" EFaultRepRetVal APIENTRY ReportFault(
-    _In_ LPEXCEPTION_POINTERS pointers,
-    _In_ const DWORD options) {
-    const auto function = reinterpret_cast<rs2fix::ReportFaultFn>(
-        InterlockedCompareExchangePointer(
-            &g_reportFault, nullptr, nullptr));
-    return rs2fix::ForwardOrFail(function, pointers, options);
+extern "C" __declspec(noinline) void WINAPI X3DAudioInitialize(
+    UINT32 mask, FLOAT speed, BYTE* handle) {
+    // Capture here, not in a helper: this is the actual imported API return PC.
+    const auto returnAddress = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    LeaseOwner owner{rs2fix::AcquireGenuineX3Audio(&g_genuine, g_bootstrap,
+        rs2fix::ProductionGenuineResolverOps())};
+    if (!owner.lease.valid) rs2fix::FailFastX3Audio();
+    owner.lease.dispatch.initialize(mask, speed, handle);
+
+    rs2fix::BootstrapContextV3 context{};
+    context.size = sizeof(context);
+    context.abiVersion = rs2fix::kBootstrapAbiVersion;
+    context.hostModule = g_host;
+    context.bootstrapModule = g_bootstrap;
+    context.genuineX3AudioModule = owner.lease.dispatch.module;
+    context.genuineExportsMask = rs2fix::kRequiredGenuineExports;
+    context.triggerReturnAddress = returnAddress;
+    context.startupThreadId = g_startupThread;
+    context.currentThreadId = GetCurrentThreadId();
+    context.staticLoad = g_staticLoad;
+    context.triggerKind = rs2fix::kTriggerExeCrtInitialize;
+    if (rs2fix::CheckStartupOpportunity(context, rs2fix::kSelectedStartupProfile,
+            rs2fix::ProductionMemoryOps()) == rs2fix::StartupGateResult::Ready &&
+        InterlockedCompareExchange(&g_optionalAttempted, 1, 0) == 0) {
+        // Synchronous, one attempt, and still holding the same genuine lease.
+        (void)rs2fix::LoadAndInitializeCompanion(g_bootstrap, context);
+    }
 }
 
-BOOL WINAPI DllMain(
-    HINSTANCE instance,
-    const DWORD reason,
-    LPVOID) noexcept {
-    if (reason != DLL_PROCESS_ATTACH) {
-        return TRUE;
-    }
+extern "C" void WINAPI X3DAudioCalculate(const BYTE* handle, const void* listener,
+    const void* emitter, UINT32 flags, void* settings) {
+    if (!rs2fix::TryForwardCalculate(&g_genuine, g_bootstrap,
+            rs2fix::ProductionGenuineResolverOps(), handle, listener, emitter, flags, settings))
+        rs2fix::FailFastX3Audio();
+}
 
-    g_bootstrap = instance;
-    const HANDLE worker = CreateThread(
-        nullptr,
-        0,
-        BootstrapWorker,
-        g_bootstrap,
-        0,
-        nullptr);
-    if (worker != nullptr) {
-        CloseHandle(worker);
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) noexcept {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_bootstrap = instance;
+        g_host = GetModuleHandleW(nullptr);
+        g_startupThread = GetCurrentThreadId();
+        g_staticLoad = reserved != nullptr ? 1u : 0u;
     }
     return TRUE;
 }

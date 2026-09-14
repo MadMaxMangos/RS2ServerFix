@@ -1,4 +1,8 @@
 #include "companion/marker.h"
+#include "shared/version.h"
+#if defined(RS2_STARTUP_TEST_PROFILE)
+#include "fixture_profile.h"
+#endif
 
 #include <Windows.h>
 
@@ -6,7 +10,9 @@
 #include <charconv>
 #include <cstdio>
 #include <cwchar>
+#include <cstring>
 #include <limits>
+#include <new>
 #include <string_view>
 
 namespace rs2fix {
@@ -78,33 +84,6 @@ const char* BooleanName(const bool value) noexcept {
     return value ? "true" : "false";
 }
 
-const char* ResolverStatusName(
-    const GenuineResolverStatus status) noexcept {
-    switch (status) {
-    case GenuineResolverStatus::Ok:
-        return "ok";
-    case GenuineResolverStatus::SystemPathFailed:
-        return "system-path-failed";
-    case GenuineResolverStatus::LoadFailed:
-        return "load-failed";
-    case GenuineResolverStatus::SelfModule:
-        return "self-module";
-    case GenuineResolverStatus::CandidatePathFailed:
-        return "candidate-path-failed";
-    case GenuineResolverStatus::FileIdentityFailed:
-        return "file-identity-failed";
-    case GenuineResolverStatus::WrongFile:
-        return "wrong-file";
-    case GenuineResolverStatus::ExportMissing:
-        return "export-missing";
-    case GenuineResolverStatus::QueryAddressFailed:
-        return "query-address-failed";
-    case GenuineResolverStatus::SelfAddress:
-        return "self-address";
-    }
-    return "unknown";
-}
-
 bool AppendField(
     BufferWriter& writer,
     const std::string_view name,
@@ -152,6 +131,11 @@ bool ConvertLeafName(
     const std::size_t length = wcsnlen_s(input, 260);
     if (length == 0 || length >= 260) {
         return false;
+    }
+    if (std::wcscmp(input, L".") == 0 || std::wcscmp(input, L"..") == 0) return false;
+    for (std::size_t i = 0; i < length; ++i) {
+        if (input[i] < 32 || input[i] == 127 || input[i] == L'\\' ||
+            input[i] == L'/' || input[i] == L':' || input[i] == L'=') return false;
     }
     const int converted = WideCharToMultiByte(
         CP_UTF8,
@@ -210,11 +194,43 @@ bool BuildMarkerPath(
     return true;
 }
 
+HANDLE CreateMarker(void*, const wchar_t* path, DWORD* error) noexcept {
+    const HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    *error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    return file;
+}
+bool WriteMarker(void*, HANDLE file, const void* bytes, DWORD size,
+                 DWORD* written, DWORD* error) noexcept {
+    const bool ok = WriteFile(file, bytes, size, written, nullptr) != FALSE;
+    *error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok;
+}
+bool FlushMarker(void*, HANDLE file, DWORD* error) noexcept {
+    const bool ok = FlushFileBuffers(file) != FALSE;
+    *error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok;
+}
+bool CloseMarker(void*, HANDLE file, DWORD* error) noexcept {
+    const bool ok = CloseHandle(file) != FALSE;
+    *error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok;
+}
+bool RemoveMarker(void*, const wchar_t* path, DWORD* error) noexcept {
+    const bool ok = DeleteFileW(path) != FALSE;
+    *error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok;
+}
+constexpr MarkerFileOps kMarkerOps{
+    nullptr, CreateMarker, WriteMarker, FlushMarker, CloseMarker, RemoveMarker};
+
 bool WriteMarkerFile(
     const wchar_t* path,
     const char* data,
     const std::size_t size,
-    DWORD* error) noexcept {
+    DWORD* error,
+    DWORD* cleanupError,
+    const MarkerFileOps& ops) noexcept {
     if (error != nullptr) {
         *error = ERROR_INVALID_PARAMETER;
     }
@@ -223,49 +239,29 @@ bool WriteMarkerFile(
         return false;
     }
 
-    HANDLE file = CreateFileW(
-        path,
-        GENERIC_WRITE,
-        FILE_SHARE_READ,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        if (error != nullptr) {
-            *error = GetLastError();
-        }
+    DWORD localError = ERROR_SUCCESS;
+    HANDLE file = ops.createAlways(ops.context, path, &localError);
+    if (!file || file == INVALID_HANDLE_VALUE) {
+        *error = localError == ERROR_SUCCESS ? ERROR_OPEN_FAILED : localError;
         return false;
     }
-
-    bool success = true;
-    DWORD remaining = static_cast<DWORD>(size);
-    const char* cursor = data;
-    DWORD localError = ERROR_SUCCESS;
-    while (remaining != 0) {
-        DWORD written = 0;
-        if (!WriteFile(file, cursor, remaining, &written, nullptr) ||
-            written == 0) {
-            success = false;
-            localError = GetLastError();
-            if (localError == ERROR_SUCCESS) {
-                localError = ERROR_WRITE_FAULT;
-            }
-            break;
-        }
-        cursor += written;
-        remaining -= written;
-    }
-    if (success && !FlushFileBuffers(file)) {
+    DWORD written = 0;
+    bool success = ops.write(ops.context, file, data, static_cast<DWORD>(size), &written, &localError);
+    if (written != size) success = false;
+    if (!success && localError == ERROR_SUCCESS) localError = ERROR_WRITE_FAULT;
+    if (success && !ops.flush(ops.context, file, &localError)) {
         success = false;
-        localError = GetLastError();
+        if (localError == ERROR_SUCCESS) localError = ERROR_WRITE_FAULT;
     }
-    if (!CloseHandle(file) && success) {
+    DWORD closeError = ERROR_SUCCESS;
+    if (!ops.close(ops.context, file, &closeError) && success) {
         success = false;
-        localError = GetLastError();
+        localError = closeError == ERROR_SUCCESS ? ERROR_INVALID_HANDLE : closeError;
     }
     if (!success) {
-        DeleteFileW(path);
+        DWORD removeError = ERROR_SUCCESS;
+        if (!ops.remove(ops.context, path, &removeError))
+            *cleanupError = removeError == ERROR_SUCCESS ? ERROR_WRITE_FAULT : removeError;
     }
     if (error != nullptr) {
         *error = success ? ERROR_SUCCESS : localError;
@@ -290,6 +286,28 @@ void CopyPath(
 
 } // namespace
 
+const MarkerFileOps& ProductionMarkerFileOps() noexcept { return kMarkerOps; }
+
+bool MarkerStateAccepted(const MarkerData& data) noexcept {
+    const bool supportedHost =
+#if defined(RS2_STARTUP_TEST_PROFILE)
+        data.digest == kFixtureReconProfile.hostDigest;
+#else
+        data.buildIdentity == BuildIdentity::CurrentFullDump &&
+        ClassifyBuild(data.digest, data.digestValid) == BuildIdentity::CurrentFullDump;
+#endif
+    const bool outcomeMatches =
+        (data.mode == ReconMode::Passive && data.recon.outcome == ReconOutcome::Passive) ||
+        (data.mode == ReconMode::Active && data.recon.outcome == ReconOutcome::Active);
+    return data.complete && data.digestValid &&
+        supportedHost &&
+        data.bootstrapBesideExecutable && data.companionBesideExecutable &&
+        data.genuineSystem32 && data.genuineExportsMask == kRequiredGenuineExports &&
+        data.triggerKind == kTriggerExeCrtInitialize && data.recon.qualified &&
+        outcomeMatches && data.recon.reason == FixReason::None &&
+        data.recon.error == ERROR_SUCCESS && data.initializeResult == kInitOk;
+}
+
 bool FormatMarkerUtf8(
     const MarkerData& data,
     char* output,
@@ -298,6 +316,7 @@ bool FormatMarkerUtf8(
     if (bytesUsed != nullptr) {
         *bytesUsed = 0;
     }
+    if (output && capacity) output[0] = '\0';
     if (output == nullptr || bytesUsed == nullptr || capacity == 0) {
         return false;
     }
@@ -309,8 +328,15 @@ bool FormatMarkerUtf8(
         return false;
     }
 
-    SYSTEMTIME utc{};
-    GetSystemTime(&utc);
+    const SYSTEMTIME& utc = data.utc;
+    FILETIME validatedUtc{};
+    if (utc.wYear > 9999 || !SystemTimeToFileTime(&utc, &validatedUtc) ||
+        static_cast<unsigned>(data.buildIdentity) > static_cast<unsigned>(BuildIdentity::Indeterminate) ||
+        static_cast<unsigned>(data.mode) > static_cast<unsigned>(ReconMode::Active) ||
+        static_cast<unsigned>(data.recon.outcome) > static_cast<unsigned>(ReconOutcome::Fatal) ||
+        static_cast<unsigned>(data.recon.reason) > static_cast<unsigned>(FixReason::RollbackFailed) ||
+        (data.genuineExportsMask & ~kRequiredGenuineExports) != 0 ||
+        data.triggerKind > kTriggerExeCrtInitialize) return false;
     char timestamp[64]{};
     const int timestampLength = std::snprintf(
         timestamp,
@@ -330,7 +356,8 @@ bool FormatMarkerUtf8(
     }
 
     BufferWriter writer(output, capacity);
-    AppendField(writer, "schema", "1");
+    AppendField(writer, "schema", "3");
+    AppendField(writer, "version", RS2FIX_VERSION_ASCII);
     AppendField(writer, "utc", timestamp);
     AppendIntegerField(writer, "pid", data.processId);
     AppendField(writer, "executable", leafName);
@@ -340,7 +367,7 @@ bool FormatMarkerUtf8(
         writer,
         "build_identity",
         BuildIdentityName(data.buildIdentity));
-    AppendField(writer, "bootstrap", "faultrep.dll");
+    AppendField(writer, "bootstrap", "X3DAudio1_7.dll");
     AppendField(
         writer,
         "bootstrap_beside_executable",
@@ -352,15 +379,21 @@ bool FormatMarkerUtf8(
         BooleanName(data.companionBesideExecutable));
     AppendField(
         writer,
-        "resolver_status",
-        ResolverStatusName(data.resolverStatus));
-    AppendIntegerField(writer, "resolver_error", data.resolverError);
-    AppendField(
-        writer,
         "genuine_module",
-        data.resolverStatus == GenuineResolverStatus::Ok
+        data.genuineSystem32
             ? "system32"
             : "unavailable");
+    AppendField(writer, "genuine_initialize_present",
+        BooleanName((data.genuineExportsMask & kGenuineInitializePresent) != 0));
+    AppendField(writer, "genuine_calculate_present",
+        BooleanName((data.genuineExportsMask & kGenuineCalculatePresent) != 0));
+    AppendField(writer, "trigger", data.triggerKind == kTriggerExeCrtInitialize
+        ? "exe-crt-initialize" : "unavailable");
+    AppendField(writer, "mode", ReconModeName(data.mode));
+    AppendField(writer, "fix", kReconFixId);
+    AppendField(writer, "qualification", data.recon.qualified ? "ready" : "rejected");
+    AppendField(writer, "recon", ReconOutcomeName(data.recon.outcome));
+    AppendField(writer, "reason", FixReasonName(data.recon.reason));
     AppendIntegerField(writer, "initialize_result", data.initializeResult);
     AppendIntegerField(
         writer, "primary_write_error", data.primaryWriteError);
@@ -381,7 +414,8 @@ bool WriteMarkerWithFallback(
     const wchar_t* primaryDirectory,
     const wchar_t* fallbackDirectory,
     const MarkerData& data,
-    MarkerWriteResult* result) noexcept {
+    MarkerWriteResult* result,
+    const MarkerFileOps& ops) noexcept {
     if (result == nullptr) {
         return false;
     }
@@ -389,12 +423,18 @@ bool WriteMarkerWithFallback(
     result->usedFallback = false;
     result->primaryError = ERROR_SUCCESS;
     result->finalError = ERROR_SUCCESS;
+    result->cleanupError = ERROR_SUCCESS;
     result->writtenPath[0] = L'\0';
-    auto* workspace = static_cast<MarkerWorkspace*>(VirtualAlloc(
+    if (!ops.createAlways || !ops.write || !ops.flush || !ops.close || !ops.remove) {
+        result->primaryError = result->finalError = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    void* storage = VirtualAlloc(
         nullptr,
         sizeof(MarkerWorkspace),
         MEM_RESERVE | MEM_COMMIT,
-        PAGE_READWRITE));
+        PAGE_READWRITE);
+    auto* workspace = storage ? ::new (storage) MarkerWorkspace{} : nullptr;
     if (workspace == nullptr) {
         result->primaryError = ERROR_NOT_ENOUGH_MEMORY;
         result->finalError = ERROR_NOT_ENOUGH_MEMORY;
@@ -417,7 +457,7 @@ bool WriteMarkerWithFallback(
             workspace->primaryPath,
             workspace->formatted.data(),
             formattedSize,
-            &result->primaryError)) {
+            &result->primaryError, &result->cleanupError, ops)) {
         result->written = true;
         CopyPath(
             workspace->primaryPath,
@@ -432,6 +472,8 @@ bool WriteMarkerWithFallback(
 
     workspace->fallbackData = data;
     workspace->fallbackData.primaryWriteError = result->primaryError;
+    if (result->cleanupError != ERROR_SUCCESS)
+        workspace->fallbackData.initializeResult = kInitMarkerWriteFailed;
     workspace->formatted.fill('\0');
     formattedSize = 0;
     if (!BuildMarkerPath(
@@ -439,6 +481,7 @@ bool WriteMarkerWithFallback(
             data.processId,
             workspace->fallbackPath,
             kMarkerPathCapacity) ||
+        _wcsicmp(workspace->primaryPath, workspace->fallbackPath) == 0 ||
         !FormatMarkerUtf8(
             workspace->fallbackData,
             workspace->formatted.data(),
@@ -448,7 +491,7 @@ bool WriteMarkerWithFallback(
             workspace->fallbackPath,
             workspace->formatted.data(),
             formattedSize,
-            &result->finalError)) {
+            &result->finalError, &result->cleanupError, ops)) {
         if (result->finalError == ERROR_SUCCESS) {
             result->finalError = ERROR_INVALID_NAME;
         }
