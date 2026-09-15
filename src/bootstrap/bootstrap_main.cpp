@@ -58,6 +58,8 @@ extern "C" void WINAPI X3DAudioCalculate(const BYTE* handle, const void* listene
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) noexcept {
     if (reason == DLL_PROCESS_ATTACH) {
+        // Record attach evidence only under the loader lock; resolution and the
+        // optional companion attempt are deferred to the imported API call.
         g_bootstrap = instance;
         g_host = GetModuleHandleW(nullptr);
         g_startupThread = GetCurrentThreadId();

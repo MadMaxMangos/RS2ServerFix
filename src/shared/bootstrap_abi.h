@@ -13,6 +13,8 @@ inline constexpr std::uint32_t kGenuineCalculatePresent = 2u;
 inline constexpr std::uint32_t kRequiredGenuineExports = 3u;
 inline constexpr std::uint32_t kTriggerExeCrtInitialize = 1u;
 
+// Call-scoped snapshot for synchronous initialization; all module handles are
+// borrowed. Both DLLs validate this exact x64 layout and version before use.
 struct BootstrapContextV3 {
     std::uint32_t size;
     std::uint32_t abiVersion;

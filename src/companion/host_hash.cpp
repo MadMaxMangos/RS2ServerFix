@@ -6,6 +6,8 @@ namespace rs2fix {
 namespace {
 ULONGLONG Ticks(void*) noexcept { return GetTickCount64(); }
 HANDLE Open(void*, const wchar_t* path, DWORD* error) noexcept {
+    // Hold read-only sharing through correction so ordinary file opens cannot
+    // write or replace the file whose bytes supplied the host digest.
     const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     *error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;

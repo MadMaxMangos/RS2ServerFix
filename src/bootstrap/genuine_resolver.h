@@ -38,6 +38,8 @@ inline constexpr std::uintptr_t kDispatchAlignment =
 static_assert(alignof(GenuineResolverState) >= kDispatchAlignment);
 static_assert(offsetof(GenuineResolverState, fallback) % kDispatchAlignment == 0);
 static_assert(std::is_trivially_copyable_v<GenuineResolverState>);
+// Published dispatches retain their module for process lifetime. A private
+// dispatch instead transfers one load reference to releaseModuleOnClose.
 struct GenuineDispatchLease {
     X3AudioDispatch dispatch{};
     bool valid{};

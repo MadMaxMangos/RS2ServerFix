@@ -133,6 +133,8 @@ ReporterStartResult TryStartReporter(ReporterStorage* storage,
         result.error = ERROR_ALREADY_EXISTS;
         return result;
     }
+    // The worker receives an owned value copy. Keep this storage claimed for
+    // its lifetime; startup returns without joining the report-only thread.
     storage->report = report;
     storage->ops = ops;
     MemoryBarrier();

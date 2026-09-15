@@ -227,6 +227,8 @@ void ScanDirectory(const std::wstring& directory, const std::wstring& relative, 
     if (!guard.Unchanged()) scan.Event("UNSAFE", relative, 0, "directory-changed-during-scan", true);
 }
 void CheckStopped(Scan& scan) {
+    // This scan reports current process evidence; it cannot reserve the tree
+    // against a server starting after the snapshot.
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) { scan.Event("UNSAFE", L".", 0, "stopped-query-failed", true); return; }
     PROCESSENTRY32W process{}; process.dwSize = sizeof(process);

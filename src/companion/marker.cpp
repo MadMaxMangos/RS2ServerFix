@@ -259,6 +259,8 @@ bool WriteMarkerFile(
         localError = closeError == ERROR_SUCCESS ? ERROR_INVALID_HANDLE : closeError;
     }
     if (!success) {
+        // A short write or failed flush/close can leave a misleading marker.
+        // Preserve cleanup failure separately even if a fallback can be written.
         DWORD removeError = ERROR_SUCCESS;
         if (!ops.remove(ops.context, path, &removeError))
             *cleanupError = removeError == ERROR_SUCCESS ? ERROR_WRITE_FAULT : removeError;
@@ -472,6 +474,7 @@ bool WriteMarkerWithFallback(
 
     workspace->fallbackData = data;
     workspace->fallbackData.primaryWriteError = result->primaryError;
+    // An undeleted primary marker prevents acceptance of the fallback report.
     if (result->cleanupError != ERROR_SUCCESS)
         workspace->fallbackData.initializeResult = kInitMarkerWriteFailed;
     workspace->formatted.fill('\0');

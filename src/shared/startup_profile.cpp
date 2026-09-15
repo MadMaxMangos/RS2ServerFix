@@ -148,6 +148,8 @@ bool ImageSectionMatches(std::uintptr_t base, std::size_t imageSize,
     return matching == 1;
 }
 
+// Eligibility depends on the profiled caller, initializer slot and live CRT
+// stage together; matching an executable's headers alone is insufficient.
 StartupGateResult CheckStartupOpportunity(const BootstrapContextV3& context,
     const StartupProfile& profile, const MemoryOps& ops) noexcept {
     if (context.size != sizeof(context) || context.abiVersion != kBootstrapAbiVersion ||

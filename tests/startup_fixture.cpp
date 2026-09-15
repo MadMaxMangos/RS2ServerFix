@@ -92,6 +92,8 @@ void DynamicCall() noexcept {
     DWORD originalProtection = 0;
     if (!VirtualProtect(&__imp_X3DAudioInitialize, sizeof(__imp_X3DAudioInitialize), PAGE_READWRITE, &originalProtection)) ExitProcess(86);
     const auto original = __imp_X3DAudioInitialize;
+    // Keep the profiled call site while routing through the dynamically loaded
+    // proxy, so this case tests static-load eligibility with a matching caller.
     InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&__imp_X3DAudioInitialize), reinterpret_cast<PVOID>(initialize));
     DWORD old = 0;
     if (!VirtualProtect(&__imp_X3DAudioInitialize, sizeof(__imp_X3DAudioInitialize), originalProtection, &old)) ExitProcess(87);

@@ -130,6 +130,8 @@ bool CaptureStableRuntimeInventory(DWORD pid, const RuntimeInventoryOps& ops, Ru
     RuntimeProcessIdentity identity;
     if (!ops.queryProcess(ops.context, lease->handle, &identity, &code) || identity.processId != pid || identity.creationTime == 0 || !IsAbsoluteToolPath(identity.imagePath.c_str())) return Fail(error, "process-identity-unavailable");
     inventory->process = lease; inventory->processId = pid; inventory->creationTime = identity.creationTime; inventory->processImagePath = identity.imagePath;
+    // Require two consecutive complete module sets for this process instance.
+    // This is an observation window, not a lock against later module changes.
     std::vector<RuntimeModule> previous;
     for (std::size_t attempt = 1; attempt <= 3; ++attempt) {
         inventory->attempts = attempt;
@@ -205,6 +207,8 @@ bool ObserveReconState(const RuntimeInventory& inventory, std::uintptr_t base, s
         return Fail(error, "recon-range-invalid");
     if (!ProcessUnchanged(inventory)) return Fail(error, "process-exited-or-identity-changed");
     std::array<std::uint8_t, 641> code{}; std::array<std::uint8_t, 16> constant{};
+    // The retained process handle and creation-time checks bind these reads to
+    // the captured process instance rather than a later process reusing its PID.
     const auto& lease = *inventory.process; std::size_t actual{}; DWORD readError{};
     if (!lease.ops.readMemory(lease.ops.context, lease.handle, base + profile.functionRva, code.data(), profile.functionSize, &actual, &readError) || actual != profile.functionSize)
         return Fail(error, "recon-read-rejected-or-partial-compatibility-failure-no-bypass");

@@ -61,6 +61,8 @@ function Resolve-PlainPath([string]$Path, [ValidateSet('File', 'Directory')][str
 
 function Open-LockedFile([string]$Path, [Collections.Generic.List[IO.FileStream]]$Locks) {
     $plain = Resolve-PlainPath $Path File
+    # Retain every input handle until the outer check finishes, preventing normal
+    # writes or replacement between package verification and evidence collection.
     $stream = [IO.File]::Open($plain, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $Locks.Add($stream)
     return $stream

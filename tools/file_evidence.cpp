@@ -111,6 +111,8 @@ bool ReadFileEvidence(const wchar_t* absolutePath, ULONGLONG hashDeadline,
     }
     FileEvidence parsed{};
     parsed.fileSize = size;
+    // Hash and parse the same captured bytes. Version resources are read by path,
+    // whose identity is checked against the retained original handle below.
     if (!HashBytesSha256(bytes.data(), bytes.size(), &parsed.sha256)) return Fail(error, "evidence_hash_failed");
     if (GetTickCount64() > hashDeadline) return Fail(error, "evidence_hash_timeout");
     if (!pe::ReadPeBytes(bytes, &parsed.image, error)) return false;
@@ -149,6 +151,7 @@ EmbeddedSignatureResult VerifyEmbeddedSignatureCacheOnly(const wchar_t* absolute
     GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     const HWND window = reinterpret_cast<HWND>(INVALID_HANDLE_VALUE);
     result.verifyStatus = ops.invoke(ops.context, window, &action, &data);
+    // Release provider state even after rejected trust; keep both results.
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     result.closeAttempted = true;
     result.closeStatus = ops.invoke(ops.context, window, &action, &data);

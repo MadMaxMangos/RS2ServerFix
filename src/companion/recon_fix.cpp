@@ -199,6 +199,8 @@ ReconResult RunReconFix(const BootstrapContextV3& context,
         result.reason = FixReason::ReadbackFailed;
         return result;
     }
+    // Passive mode reaches the same qualification boundary as active mode;
+    // qualified records readiness, not proof that a correction was installed.
     result.qualified = true;
     if (mode == ReconMode::Passive) {
         result.outcome = ReconOutcome::Passive;

@@ -125,6 +125,7 @@ struct SyntheticImage {
         return valid;
     }
     static bool Fails(std::uint32_t mask, unsigned call) {
+        // Bit zero selects the first call, including calls made during rollback.
         return call > 0 && call <= 32 && (mask & (1u << (call - 1))) != 0;
     }
     bool Original() const {
@@ -214,6 +215,8 @@ struct SyntheticImage {
             return false;
         }
         const bool fail = Fails(state.writeFailures, state.writes);
+        // Exercise the conservative transaction rule: a reported write failure
+        // can still require rollback because bytes may already have changed.
         if (!fail || state.mutateBeforeWriteFailure) std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
         if (state.mutateConstantOnWrite && state.writes == 1) state.bytes[kConstantRva] ^= 1;
         if (state.mutateNeighborOnWrite && state.writes == 1) state.bytes[kFunctionRva] ^= 1;

@@ -171,6 +171,8 @@ Child Run(const std::wstring& directory, const std::wstring& temporary, const st
     if (result.created) {
         result.pid = process.dwProcessId;
         if (obstructMarker) {
+            // Suspension lets us occupy both PID-specific marker paths before
+            // the fixture's CRT initializer can attempt its first marker write.
             const auto leaf = L"RS2ServerFix.loader." + std::to_wstring(result.pid) + L".log";
             if (!NewDirectory(Join(directory, leaf)) || !NewDirectory(Join(temporary, leaf)) ||
                 ResumeThread(process.hThread) == MAXDWORD) {

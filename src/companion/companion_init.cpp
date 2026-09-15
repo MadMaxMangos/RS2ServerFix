@@ -31,6 +31,7 @@ constexpr ReconMode kCompiledMode =
 #endif
 
 DWORD Finish(LONG volatile* state, DWORD result) noexcept {
+    // Failed qualification or reporting still consumes the single attempt.
     InterlockedExchange(state, 2);
     return result;
 }

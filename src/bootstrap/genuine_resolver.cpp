@@ -222,6 +222,8 @@ GenuineDispatchLease PublishPrivateSuccess(GenuineResolverState* state,
     if (InterlockedCompareExchange(&state->fallbackState,
             static_cast<LONG>(FallbackState::Writing), static_cast<LONG>(FallbackState::Empty)) ==
         static_cast<LONG>(FallbackState::Empty)) {
+        // This embedded record needs no allocation; Ready publishes the complete
+        // immutable payload and its retained module reference to other callers.
         state->fallback = privateResult.dispatch;
         InterlockedExchange(&state->fallbackState, static_cast<LONG>(FallbackState::Ready));
         privateResult.ownsModule = false;
@@ -236,6 +238,8 @@ GenuineDispatchLease PublishPrivateSuccess(GenuineResolverState* state,
         privateResult.ownsModule = false;
         return Persistent(winner);
     }
+    // If fallback publication is not observable yet, forward using this caller's
+    // private module reference and release it when the exported call finishes.
     privateResult.ownsModule = false;
     return {privateResult.dispatch, true, true};
 }
@@ -265,6 +269,8 @@ GenuineDispatchLease AcquireGenuineX3Audio(GenuineResolverState* state, HMODULE 
             return PublishPrivateSuccess(state, static_cast<GenuineResolverResult&&>(result), begun, pending, ops);
         failed.dispatch = result.dispatch;
         if (Published(state, ops, &published)) return Persistent(published);
+        // Only resource/API failures get one retry; a wrong-file or export
+        // validation failure is terminal for this acquisition.
         if (result.failureClass != GenuineFailureClass::ResourceApi) break;
     }
     return failed;

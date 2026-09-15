@@ -28,6 +28,7 @@ HMODULE LoadLibraryWithThreadErrorMode(const wchar_t* absolutePath, DWORD flags,
     if (error != nullptr) *error = failure;
     if (absolutePath == nullptr || ops.getMode == nullptr || ops.setMode == nullptr ||
         ops.loadLibrary == nullptr || ops.fatalRestoreFailure == nullptr) return nullptr;
+    // Suppress loader dialogs on this thread without changing process-wide policy.
     const DWORD savedMode = ops.getMode(ops.context);
     if (!ops.setMode(ops.context, savedMode | SEM_FAILCRITICALERRORS, &failure)) {
         if (error != nullptr) *error = failure;
@@ -36,6 +37,7 @@ HMODULE LoadLibraryWithThreadErrorMode(const wchar_t* absolutePath, DWORD flags,
     HMODULE module = ops.loadLibrary(ops.context, absolutePath, flags, &failure);
     DWORD restoreError = ERROR_SUCCESS;
     if (!ops.setMode(ops.context, savedMode, &restoreError)) {
+        // Continuing would leak our temporary error mode into the host caller.
         if (error != nullptr) *error = restoreError;
         ops.fatalRestoreFailure(ops.context, restoreError);
         return nullptr;
