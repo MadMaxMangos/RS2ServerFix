@@ -1,0 +1,3 @@
+LIBRARY rs2_test_steam_client.dll
+EXPORTS
+    FixtureSteamClientSignature DATA

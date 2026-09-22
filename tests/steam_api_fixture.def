@@ -1,0 +1,8 @@
+LIBRARY rs2_test_steam_api.dll
+EXPORTS
+    SteamInternal_FindOrCreateGameServerInterface=?FixtureSteamFactory@@YAPEAXHPEBD@Z
+    SteamInternal_GameServer_Init=?FixtureSteamInit@@YA_NIGGGHPEBD@Z
+    SteamGameServer_Shutdown=?FixtureSteamShutdown@@YAXXZ
+    FixtureSteamReadSnapshot=?FixtureSteamReadSnapshot@@YA?AUFixtureSteamSnapshot@@XZ
+    FixtureSteamFactoryAlias=?FixtureSteamFactoryAlias@@YAPEAXHPEBD@Z
+    FixtureSteamSignature DATA

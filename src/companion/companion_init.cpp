@@ -6,6 +6,12 @@
 #include "shared/path_identity.h"
 #include "shared/selected_profile.h"
 #include "shared/selected_recon_profile.h"
+#if defined(RS2_STEAM_OBSERVER)
+#include "companion/steam_observer.h"
+#endif
+#if defined(RS2_STEAM_REPORTING)
+#include "companion/steam_reporting.h"
+#endif
 
 #include <cwchar>
 #include <new>
@@ -211,6 +217,34 @@ DWORD RunCompanionInitialization(const BootstrapContextV3& context,
     const DWORD result = written && work->markerWrite.written &&
         work->markerWrite.cleanupError == ERROR_SUCCESS && work->markerWrite.finalError == ERROR_SUCCESS
         ? marker.initializeResult : kInitMarkerWriteFailed;
+#if defined(RS2_STEAM_OBSERVER)
+    // The core diagnostic is already attempted, and its acceptance/result is
+    // frozen. Observer failures cannot rewrite recon's marker or return value.
+#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_STARTUP_TEST_PROFILE)
+    const auto& reportingObserverProfile=observer::kFixtureObserverProfile;
+#else
+    const auto& reportingObserverProfile=observer::ProductionObserverProfile();
+#endif
+    reporting::StartReporting(context,kSelectedStartupProfile,reportingObserverProfile,
+        marker.digest,lease,work->hostDirectory,
+        marker.recon.outcome==ReconOutcome::Active && marker.recon.reason==FixReason::None && result==kInitOk);
+#else
+    if (marker.recon.outcome != ReconOutcome::Active || marker.recon.reason != FixReason::None) {
+        observer::ObserverUnavailable(observer::Reason::ReconIneligible);
+    } else if (result != kInitOk) {
+        observer::ObserverUnavailable(observer::Reason::CoreMarkerFailed);
+    } else {
+#if defined(RS2_STARTUP_TEST_PROFILE)
+        const auto& observerProfile = observer::kFixtureObserverProfile;
+#else
+        const auto& observerProfile = observer::ProductionObserverProfile();
+#endif
+        observer::StartObserver(context, kSelectedStartupProfile, observerProfile,
+            marker.digest, lease, work->hostDirectory);
+    }
+#endif
+#endif
     VirtualFree(work, 0, MEM_RELEASE);
     return Finish(state, result);
 }

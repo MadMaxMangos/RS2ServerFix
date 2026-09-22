@@ -5,6 +5,13 @@
 #include <cwchar>
 #include <cstring>
 #include <iterator>
+#if defined(RS2_OBSERVER_FIXTURE)
+#include "steam_api_fixture.h"
+#include "companion/steam_observer_dispatch.h"
+#endif
+#if defined(RS2_REPORTING_FIXTURE)
+bool ExerciseReportingFixture();
+#endif
 
 extern "C" {
 volatile DWORD FixtureState = 1;
@@ -14,6 +21,17 @@ int FixtureRecon(int draw, int count);
 extern const BYTE FixtureReconLoad[];
 __declspec(dllimport) void WINAPI X3DAudioInitialize(UINT32, FLOAT, BYTE*);
 extern FARPROC __imp_X3DAudioInitialize;
+#if defined(RS2_OBSERVER_FIXTURE)
+void* FixtureSteamAccessor();
+bool FixtureSteamPublisher(void*);
+bool FixtureSteamAdvertise(void*);
+extern std::uintptr_t FixtureSteamContext[3];
+extern void* FixtureSteamPrivate;
+extern void* FixtureSteamPublication;
+extern FARPROC __imp_SteamInternal_GameServer_Init;
+extern FARPROC __imp_SteamGameServer_Shutdown;
+extern FARPROC __imp_SteamInternal_FindOrCreateGameServerInterface;
+#endif
 }
 
 namespace {
@@ -73,6 +91,117 @@ bool WaitForReporter() noexcept {
     } while (GetTickCount64() < deadline);
     return CloseHandle(reader) && found;
 }
+#if defined(RS2_OBSERVER_FIXTURE)
+bool g_steamPrehookInstalled{};
+FARPROC g_steamPrehookAlias{};
+DWORD g_steamPrehookProtection{};
+void PreHookSteamFactory() noexcept {
+    // This mutation is confined to the disposable own-code EXE. The alias lives
+    // inside the already imported fake DLL: module ownership and hash still
+    // qualify, so the named-export/actual-IAT equality check must reject it.
+    const auto module = GetModuleHandleW(L"rs2_test_steam_api.dll");
+    const auto original = module ? GetProcAddress(module, "SteamInternal_FindOrCreateGameServerInterface") : nullptr;
+    const auto alias = module ? GetProcAddress(module, "FixtureSteamFactoryAlias") : nullptr;
+    MEMORY_BASIC_INFORMATION target{}, cell{};
+    if (!original || !alias || original == alias || __imp_SteamInternal_FindOrCreateGameServerInterface != original ||
+        FixtureState != 1 || g_initializeReturned || GetModuleHandleW(L"RS2ServerFix.dll") ||
+        VirtualQuery(reinterpret_cast<const void*>(alias), &target, sizeof(target)) != sizeof(target) ||
+        target.AllocationBase != module ||
+        VirtualQuery(&__imp_SteamInternal_FindOrCreateGameServerInterface, &cell, sizeof(cell)) != sizeof(cell)) ExitProcess(94);
+    DWORD protection{};
+    if (!VirtualProtect(&__imp_SteamInternal_FindOrCreateGameServerInterface, sizeof(void*), PAGE_READWRITE, &protection)) ExitProcess(95);
+    const auto replaced = InterlockedCompareExchangePointer(
+        reinterpret_cast<PVOID volatile*>(&__imp_SteamInternal_FindOrCreateGameServerInterface),
+        reinterpret_cast<PVOID>(alias), reinterpret_cast<PVOID>(original));
+    DWORD ignored{};
+    if (!VirtualProtect(&__imp_SteamInternal_FindOrCreateGameServerInterface, sizeof(void*), protection, &ignored) ||
+        replaced != reinterpret_cast<PVOID>(original) || protection != cell.Protect ||
+        VirtualQuery(&__imp_SteamInternal_FindOrCreateGameServerInterface, &cell, sizeof(cell)) != sizeof(cell) ||
+        cell.Protect != protection || __imp_SteamInternal_FindOrCreateGameServerInterface != alias) ExitProcess(96);
+    g_steamPrehookAlias = alias;
+    g_steamPrehookProtection = protection;
+    g_steamPrehookInstalled = true;
+}
+#if !defined(RS2_REPORTING_FIXTURE)
+bool ExerciseSteamFixture() {
+    namespace api = rs2fix::observer;
+    // The imports are already mapped; never load another API or call real Steam.
+    const auto module = GetModuleHandleW(L"rs2_test_steam_api.dll");
+    const auto snapshot = reinterpret_cast<FixtureSteamSnapshotFn>(
+        module ? GetProcAddress(module, "FixtureSteamReadSnapshot") : nullptr);
+    if (!snapshot) return false;
+    const auto before = snapshot();
+    if (before.factory || before.init || before.shutdown || before.factoryAlias) return false;
+    bool ok = true;
+    SetLastError(0x4321);
+    const auto init = reinterpret_cast<api::InitFn>(__imp_SteamInternal_GameServer_Init);
+    const bool initialized = init(0x10203040, 8766, 7777, 27015, 3,
+        reinterpret_cast<const char*>(kFixtureUnreadablePointer));
+    ok = !initialized && GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321);
+    void* object = FixtureSteamAccessor();
+    ok = object && GetLastError() == 0x5678 && ok;
+    if (!object) return false;
+    SetLastError(0x4321);
+    void* repeated = FixtureSteamAccessor();
+    ok = repeated == object && GetLastError() == 0x5678 && ok;
+    // Publication happens only after the CRT audio opportunity and observer
+    // installation. This is fixture state, not a model of game ownership.
+    FixtureSteamContext[1] = 1;
+    FixtureSteamContext[2] = reinterpret_cast<std::uintptr_t>(object);
+    FixtureSteamPrivate = object;
+    FixtureSteamPublication = object;
+    const auto table = *static_cast<const void* const**>(object);
+    SetLastError(0x4321); reinterpret_cast<api::VoidMethod>(table[6])(object);
+    ok = GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); const bool logged = FixtureSteamPublisher(object);
+    ok = logged && GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); const bool advertised = FixtureSteamAdvertise(object);
+    ok = advertised && GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); reinterpret_cast<api::IntMethod>(table[12])(object, 64);
+    ok = GetLastError() == 0x5678 && ok;
+    const auto secret = reinterpret_cast<const char*>(kFixtureUnreadablePointer);
+    SetLastError(0x4321); reinterpret_cast<api::KeyValueMethod>(table[20])(object, secret, secret);
+    ok = GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); const bool updated = reinterpret_cast<api::UpdateMethod>(table[27])(object, kFixtureSteamId, secret, 123);
+    ok = !updated && GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); const auto begun = reinterpret_cast<api::BeginMethod>(table[29])(object, secret, 17, kFixtureSteamId);
+    ok = begun == 7 && GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); reinterpret_cast<api::EndMethod>(table[30])(object, kFixtureSteamId);
+    ok = GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); reinterpret_cast<api::BoolArgumentMethod>(table[39])(object, true);
+    ok = GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); reinterpret_cast<api::IntMethod>(table[40])(object, -1);
+    ok = GetLastError() == 0x5678 && ok;
+    SetLastError(0x4321); reinterpret_cast<api::ShutdownFn>(__imp_SteamGameServer_Shutdown)();
+    ok = GetLastError() == 0x5678 && ok;
+    const auto after = snapshot();
+    constexpr unsigned observed[]{6, 8, 12, 20, 27, 29, 30, 39, 40};
+    for (unsigned i = 0; i < 44; ++i) {
+        unsigned expected = 0;
+        for (const auto slot : observed) if (slot == i) expected = i == 8 ? 2 : 1;
+        ok = after.methods[i] == expected && ok;
+    }
+    const bool prehookRequested = Option(L"--prehook-steam-factory");
+    if (prehookRequested) {
+        MEMORY_BASIC_INFORMATION cell{};
+        const bool preserved = g_steamPrehookInstalled && __imp_SteamInternal_FindOrCreateGameServerInterface == g_steamPrehookAlias &&
+            VirtualQuery(&__imp_SteamInternal_FindOrCreateGameServerInterface, &cell, sizeof(cell)) == sizeof(cell) &&
+            cell.Protect == g_steamPrehookProtection;
+        std::printf("steam_prehook=installed-before-audio preserved=%s\n", preserved ? "true" : "false");
+        ok = preserved && ok;
+    }
+    ok = after.factory == 2 && after.init == 1 && after.shutdown == 1 && after.badArguments == 0 &&
+        after.factoryAlias == (prehookRequested ? 2u : 0u) && ok;
+    std::printf("steam_fixture=%s factory=%u init=%u shutdown=%u bad_arguments=%u factory_alias=%u\n",
+        ok ? "pass" : "fail", after.factory, after.init, after.shutdown, after.badArguments, after.factoryAlias);
+    // Only the own-code fixture waits; the injected observer never blocks the
+    // game on its logger. The runner inspects the actual emitted records.
+    Sleep(1200);
+    return ok;
+}
+#endif
+#endif
 __declspec(noinline) void WrongReturn() noexcept {
     X3DAudioInitialize(3, 343.5f, FixtureHandle);
     ++g_initializeReturned;
@@ -112,7 +241,18 @@ void DynamicCall() noexcept {
 }
 }
 
+#if defined(RS2_REPORTING_FIXTURE)
+extern "C" bool FixtureReportingPrehookPreserved() noexcept {
+    MEMORY_BASIC_INFORMATION cell{};
+    return g_steamPrehookInstalled && __imp_SteamInternal_FindOrCreateGameServerInterface==g_steamPrehookAlias &&
+        VirtualQuery(&__imp_SteamInternal_FindOrCreateGameServerInterface,&cell,sizeof(cell))==sizeof(cell) &&
+        cell.Protect==g_steamPrehookProtection;
+}
+#endif
 extern "C" void FixtureInitializerThunk() noexcept {
+#if defined(RS2_OBSERVER_FIXTURE)
+    if (Option(L"--prehook-steam-factory")) PreHookSteamFactory();
+#endif
     if (Option(L"--prior-unrelated")) WrongReturn();
     if (Option(L"--wrong-stage")) FixtureState = 2;
     if (Option(L"--dynamic-load")) {
@@ -166,5 +306,12 @@ int wmain(int argc, wchar_t** argv) {
     // Ordinary tests observe completion through their own redirected output;
     // immediate-exit cases deliberately do not wait for this report-only thread.
     if (companion && !WaitForReporter()) return 92;
+#if defined(RS2_OBSERVER_FIXTURE)
+#if defined(RS2_REPORTING_FIXTURE)
+    if (!ExerciseReportingFixture()) return 93;
+#else
+    if (!ExerciseSteamFixture()) return 93;
+#endif
+#endif
     return valid ? 0 : 82;
 }

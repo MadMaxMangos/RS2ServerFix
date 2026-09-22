@@ -1,0 +1,77 @@
+EXPORTS
+    FixtureState DATA
+    FixtureInitializerSlot DATA
+    FixtureInitializerThunk
+    FixtureInitialize
+    FixtureReturn
+    FixtureInitializeEnd
+    FixtureRecon
+    FixtureReconLoad
+    FixtureReconEnd
+    FixtureBadConstant DATA
+    FixtureGoodConstant DATA
+    FixtureSteamAccessor
+    FixtureSteamAccessorReturn
+    FixtureSteamAccessorEnd
+    FixtureSteamLiteral DATA
+    FixtureSteamContext DATA
+    FixtureSteamPrivate DATA
+    FixtureSteamPublication DATA
+    FixtureSteamPublisherReturn
+    FixtureSteamAdvertiseReturn
+    FixtureReportWorld DATA
+    FixtureReportWorldInfoClass DATA
+    FixtureReportTickableObject DATA
+    FixtureReportTaskPool DATA
+    FixtureReportSelectedId DATA
+    FixtureReportInvalidId DATA
+    FixtureReportCounter DATA
+    FixtureReportRegistry DATA
+    FixtureReportService DATA
+    FixtureReportRegistration DATA
+    FixtureReportGameMode DATA
+    FixtureReportMaximum DATA
+    FixtureReportMembers DATA
+    FixtureReportPublicIp DATA
+    FixtureReportFullDirty DATA
+    FixtureReportSkipBuilder DATA
+    FixtureReportPumpBefore DATA
+    FixtureReportPumpAfter DATA
+    FixtureReportBuilderBefore DATA
+    FixtureReportBuilderAfter DATA
+    FixtureReportTimingClockErrors DATA
+    FixtureReportObjectVtable DATA
+    FixtureReportMetadataVtable DATA
+    FixtureReportSecondaryVtable=??_7FixtureReportTickable@@6BFixtureReportSecondary@@@ DATA
+    FixtureReportSecondaryTick=?Tick@FixtureReportTickable@@UEAAXXZ
+    FixtureReportObjectNoop
+    FixtureReportObjectNoopEnd
+    FixtureReportBuilder
+    FixtureReportBuilderEnd
+    FixtureReportAdapter
+    FixtureReportAdapterReturn
+    FixtureReportAdapterEnd
+    FixtureReportDispatch
+    FixtureReportDispatchReturn
+    FixtureReportDispatchEnd
+    FixtureReportTaskPump
+    FixtureReportTaskPumpReturn
+    FixtureReportTaskPumpEnd
+    FixtureReportUpdate
+    FixtureReportUpdateReturn
+    FixtureReportUpdateEnd
+    FixtureReportLeechTick
+    FixtureReportTickReturn
+    FixtureReportLeechTickEnd
+    FixtureReportSubsystem
+    FixtureReportSubsystemReturn
+    FixtureReportSubsystemEnd
+    FixtureReportCallbackPump
+    FixtureReportCallbackReturn
+    FixtureReportCallbackPumpEnd
+    FixtureReportWorldTick
+    FixtureReportWorldReturn
+    FixtureReportWorldTickEnd
+    FixtureReportEngine
+    FixtureReportEngineReturn
+    FixtureReportEngineEnd

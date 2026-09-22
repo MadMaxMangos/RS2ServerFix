@@ -256,6 +256,10 @@ void CheckArtifact(const std::wstring& path, const Sha256Digest& expected, Artif
     const bool first = scan.ops.queryFileIdentity(scan.ops.context, path.c_str(), &before, &code);
     const auto hash = HashFileSha256(path.c_str(), GetTickCount64() + 10000);
     const bool valid = CheckArtifactContract(path.c_str(), kind, &contract);
+    if (!valid && !scan.inputs.observerCompanion && contract.version.fileDescription == L"RS2ServerFix Active Recon Steam Observer Companion")
+        scan.Event("UNSAFE", leaf, 0, "observer-artifact-requires-explicit---companion-kind-companion-observer", true);
+    if (!valid && !scan.inputs.reportingCompanion && contract.version.fileDescription == L"RS2ServerFix Active Recon Steam Reporting Companion")
+        scan.Event("UNSAFE", leaf, 0, "reporting-artifact-requires-explicit---companion-kind-companion-reporting", true);
     const bool last = scan.ops.queryFileIdentity(scan.ops.context, path.c_str(), &after, &code);
     if (!EqualEvidencePath(EvidenceLeaf(path), leaf) || !first || !last || !SameFileIdentity(before, after) || !hash.digestValid || hash.digest != expected || !valid) scan.Event("UNSAFE", leaf, 0, "artifact-contract-hash-or-identity-failed", true);
 }
@@ -269,6 +273,8 @@ int RunDeploymentPreflight(const PreflightInputs& inputs, const PreflightOps& op
     std::wstring root, bootstrap, companion, manifestPath, report, self; std::string error;
     wchar_t tool[kPathCapacity]{}; DWORD code{};
     if ((inputs.mode != DeploymentMode::Passive && inputs.mode != DeploymentMode::Active) ||
+        ((inputs.observerCompanion || inputs.reportingCompanion) && inputs.mode != DeploymentMode::Active) ||
+        (inputs.observerCompanion && inputs.reportingCompanion) ||
         !ops.queryFileIdentity || !ops.verifySignature || !ops.queryKnownDllState ||
         !RequireAbsolutePlainDirectory(inputs.targetRoot.c_str(), &root, &error) ||
         !RequireAbsolutePlainFile(inputs.bootstrapPath.c_str(), &bootstrap, &error) ||
@@ -283,7 +289,11 @@ int RunDeploymentPreflight(const PreflightInputs& inputs, const PreflightOps& op
     GenuineManifest manifest; Sha256Digest manifestHash{};
     if (!ReadGenuineManifest(manifestPath.c_str(), &manifest, &manifestHash, &error)) scan.Event("UNSAFE", L".", 0, "manifest-invalid", true);
     CheckArtifact(bootstrap, inputs.bootstrapSha256, ArtifactKind::Bootstrap, scan, L"X3DAudio1_7.dll");
-    CheckArtifact(companion, inputs.companionSha256, inputs.mode == DeploymentMode::Passive ? ArtifactKind::CompanionPassive : ArtifactKind::CompanionActive, scan, L"RS2ServerFix.dll");
+    ArtifactKind companionKind=ArtifactKind::CompanionPassive;
+    if (inputs.reportingCompanion) companionKind=ArtifactKind::CompanionReporting;
+    else if (inputs.observerCompanion) companionKind=ArtifactKind::CompanionObserver;
+    else if (inputs.mode==DeploymentMode::Active) companionKind=ArtifactKind::CompanionActive;
+    CheckArtifact(companion, inputs.companionSha256, companionKind, scan, L"RS2ServerFix.dll");
     wchar_t genuinePath[512]{}; FileEvidence genuine; FileIdentity before{}, after{};
     bool genuineOk = BuildSystemX3AudioPath(genuinePath, std::size(genuinePath), &code) && ops.queryFileIdentity(ops.context, genuinePath, &before, &code) && ReadFileEvidence(genuinePath, GetTickCount64() + 10000, &genuine, &error);
     if (genuineOk) {
@@ -310,6 +320,8 @@ int RunDeploymentPreflight(const PreflightInputs& inputs, const PreflightOps& op
         << "\r\noperator_recorded_applocker=" << SecurityName(inputs.appLocker) << "\r\noperator_recorded_eac=" << SecurityName(inputs.eac)
         << "\r\nknown_dll_x3audio=" << (known == KnownDllState::Absent ? "absent" : known == KnownDllState::Present ? "present" : "query-failed")
         << "\r\ndeployment_mode=" << DeploymentModeName(inputs.mode) << "\r\nevent_count=" << scan.events.size() + (scan.incomplete ? 1 : 0) << "\r\n";
+    if (inputs.observerCompanion) out << "companion_kind=companion-observer\r\n";
+    if (inputs.reportingCompanion) out << "companion_kind=companion-reporting\r\n";
     for (std::size_t i = 0; i < scan.events.size(); ++i) out << "event." << i << '=' << scan.events[i] << "\r\n";
     if (scan.incomplete) out << "event." << scan.events.size() << "=UNSAFE|.|0|scan-incomplete\r\n";
     out << "pe_file_count=" << scan.peFiles << "\r\nx3audio_importer_count=" << scan.importers << "\r\nunsafe_count=" << scan.unsafe << "\r\nresult=" << (scan.unsafe ? "unsafe" : "pass") << "\r\n";
@@ -321,10 +333,10 @@ int RunDeploymentPreflight(const PreflightInputs& inputs, const PreflightOps& op
 #ifndef RS2_PREFLIGHT_NO_MAIN
 int wmain(int argc, wchar_t** argv) {
     using namespace rs2fix; using namespace rs2fix::tooling;
-    constexpr const wchar_t* help = L"rs2_deployment_preflight --target-root <absolute plain directory> --bootstrap <absolute plain file> --bootstrap-sha256 <64 uppercase hex> --companion <absolute plain file> --companion-sha256 <64 uppercase hex> --genuine-manifest <absolute plain file> --report <absolute new file outside target root> --mode <passive|active> --av-edr-disposition <state> --wdac-disposition <state> --applocker-disposition <state> --eac-disposition <state>\nstate: not-observed-yet|not-installed|not-enforced|allowed|alerted|blocked\n";
+    constexpr const wchar_t* help = L"rs2_deployment_preflight --target-root <absolute plain directory> --bootstrap <absolute plain file> --bootstrap-sha256 <64 uppercase hex> --companion <absolute plain file> --companion-sha256 <64 uppercase hex> --genuine-manifest <absolute plain file> --report <absolute new file outside target root> --mode <passive|active> --av-edr-disposition <state> --wdac-disposition <state> --applocker-disposition <state> --eac-disposition <state> [--companion-kind <companion-observer|companion-reporting>]\nObserver/reporting selection requires active; default selects the ordinary recon companion.\nstate: not-observed-yet|not-installed|not-enforced|allowed|alerted|blocked\n";
     if (argc == 2 && std::wstring_view(argv[1]) == L"--help") { std::wcout << help; return 0; }
     for (int i = 1; i < argc; ++i) if (std::wstring_view(argv[i]) == L"--help") { std::wcerr << help; return 2; }
-    if (argc != 25) { std::wcerr << help; return 2; }
+    if (argc != 25 && argc != 27) { std::wcerr << help; return 2; }
     std::map<std::wstring, std::wstring> values;
     for (int i = 1; i < argc; i += 2) if (!values.emplace(argv[i], argv[i + 1]).second) return 2;
     constexpr const wchar_t* names[] = { L"--target-root", L"--bootstrap", L"--bootstrap-sha256", L"--companion", L"--companion-sha256", L"--genuine-manifest", L"--report", L"--mode", L"--av-edr-disposition", L"--wdac-disposition", L"--applocker-disposition", L"--eac-disposition" };
@@ -335,6 +347,13 @@ int wmain(int argc, wchar_t** argv) {
         return v.size() == 64 && ParseSha256Upper(ascii, result);
     };
     PreflightInputs in;
+    if (argc == 27) {
+        const auto selection = values.find(L"--companion-kind");
+        if (selection == values.end()) return 2;
+        if (selection->second == L"companion-observer") in.observerCompanion = true;
+        else if (selection->second == L"companion-reporting") in.reportingCompanion = true;
+        else return 2;
+    }
     in.targetRoot = values[L"--target-root"]; in.bootstrapPath = values[L"--bootstrap"]; in.companionPath = values[L"--companion"];
     in.genuineManifestPath = values[L"--genuine-manifest"]; in.reportPath = values[L"--report"];
     if (!digest(L"--bootstrap-sha256", &in.bootstrapSha256) || !digest(L"--companion-sha256", &in.companionSha256) || !ParseDeploymentMode(values[L"--mode"], &in.mode) || !ParseSecurity(values[L"--av-edr-disposition"], &in.avEdr) || !ParseSecurity(values[L"--wdac-disposition"], &in.wdac) || !ParseSecurity(values[L"--applocker-disposition"], &in.appLocker) || !ParseSecurity(values[L"--eac-disposition"], &in.eac)) return 2;

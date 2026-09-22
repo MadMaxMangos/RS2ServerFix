@@ -1,0 +1,4 @@
+LIBRARY RS2ServerFix
+EXPORTS
+    RS2ServerFix_InitializeV3 @1
+    RS2SteamReport_StatusV2 @2 DATA

@@ -15,11 +15,29 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#if defined(RS2_OBSERVER_RUNNER)
+#include "steam_api_fixture.h"
+#include <filesystem>
+#endif
+#if defined(RS2_REPORTING_RUNNER)
+#include "shared/steam_reporting_status.h"
+#include "companion/steam_reporting_types.h"
+#endif
 
 namespace {
 namespace tool = rs2fix::tooling;
 struct Input { std::wstring path; rs2fix::Sha256Digest digest{}; };
-struct Inputs { Input host, bootstrap, passive, active, production; std::wstring manifest; };
+struct Inputs {
+    Input host, bootstrap, passive, active, production; std::wstring manifest;
+#if defined(RS2_OBSERVER_RUNNER)
+    Input sdk;
+    std::string expectedVersion;
+#endif
+#if defined(RS2_REPORTING_RUNNER)
+    Input client;
+    bool calibrationOnly{};
+#endif
+};
 struct Child {
     bool created{}, ended{}, timedOut{}, captured{}, preparationFailed{};
     DWORD error{}, status{STILL_ACTIVE}, pid{};
@@ -30,13 +48,72 @@ struct Scenario {
     const wchar_t* options;
     bool active{}, companion{}, markerFailure{}, missing{}, invalid{}, late{}, dynamic{}, production{}, immediate{};
     unsigned calls{1};
+#if defined(RS2_OBSERVER_RUNNER)
+    // 0=enabled, 1=disabled, 2=missing, 3=invalid, 4=wrong SDK disk hash,
+    // 5=blocked output path, 6=pre-existing same-SDK factory IAT hook.
+    unsigned observerMode{};
+#endif
+#if defined(RS2_REPORTING_RUNNER)
+    unsigned reportMode{};
+#endif
 };
 void Usage() {
+#if defined(RS2_REPORTING_RUNNER)
+    std::cout << "rs2_reporting_startup_runner --host <absolute-file> --bootstrap <absolute-file>\n"
+        "  --companion <absolute-file> --sdk <absolute-inert-fixture-dll> --client <absolute-inert-client-dll>\n"
+        "  --expected-companion-version 0.4.1.0 --genuine-manifest <absolute-file> [--calibration-only]\n"
+        "Sole --help performs no process or file work.\n";
+#elif defined(RS2_OBSERVER_RUNNER)
+    std::cout << "rs2_observer_startup_runner --host <absolute-file> --bootstrap <absolute-file>\n"
+        "  --companion <absolute-file> --sdk <absolute-inert-fixture-dll>\n"
+        "  --expected-companion-version 0.3.0.0 --genuine-manifest <absolute-file>\n"
+        "Sole --help performs no process or file work.\n";
+#else
     std::cout << "rs2_startup_runner --host <absolute-file> --bootstrap <absolute-file>\n"
         "  --passive <absolute-file> --active <absolute-file> --genuine-manifest <absolute-file>\n"
         "  [--production-bootstrap <absolute-file>]\nSole --help performs no process or file work.\n";
+#endif
 }
 bool Parse(int argc, wchar_t** argv, Inputs* inputs) {
+#if defined(RS2_OBSERVER_RUNNER)
+#if defined(RS2_REPORTING_RUNNER)
+    if (argc!=15 && argc!=16) return false;
+    if (argc==16) {
+        if (std::wstring_view(argv[15])!=L"--calibration-only") return false;
+        inputs->calibrationOnly=true;
+    }
+    const int arguments=15;
+#else
+    if (argc != 13) return false;
+    const int arguments=argc;
+#endif
+    for (int i = 1; i < arguments; i += 2) {
+        const std::wstring_view key(argv[i]);
+        if (key == L"--expected-companion-version") {
+#if defined(RS2_REPORTING_RUNNER)
+            if (!inputs->expectedVersion.empty() || std::wcscmp(argv[i + 1], L"0.4.1.0")) return false;
+            inputs->expectedVersion = "0.4.1.0";
+#else
+            if (!inputs->expectedVersion.empty() || std::wcscmp(argv[i + 1], L"0.3.0.0")) return false;
+            inputs->expectedVersion = "0.3.0.0";
+#endif
+            continue;
+        }
+        std::wstring* target = key == L"--host" ? &inputs->host.path : key == L"--bootstrap" ? &inputs->bootstrap.path :
+            key == L"--companion" ? &inputs->active.path : key == L"--sdk" ? &inputs->sdk.path :
+#if defined(RS2_REPORTING_RUNNER)
+            key == L"--client" ? &inputs->client.path :
+#endif
+            key == L"--genuine-manifest" ? &inputs->manifest : nullptr;
+        if (!target || !target->empty() || !tool::IsAbsoluteToolPath(argv[i + 1])) return false;
+        *target = argv[i + 1];
+    }
+    return !inputs->host.path.empty() && !inputs->bootstrap.path.empty() && !inputs->active.path.empty() &&
+#if defined(RS2_REPORTING_RUNNER)
+        !inputs->client.path.empty() &&
+#endif
+        !inputs->sdk.path.empty() && !inputs->expectedVersion.empty() && !inputs->manifest.empty();
+#else
     if (argc != 11 && argc != 13) return false;
     for (int i = 1; i < argc; i += 2) {
         const std::wstring_view key(argv[i]);
@@ -48,6 +125,15 @@ bool Parse(int argc, wchar_t** argv, Inputs* inputs) {
     }
     return !inputs->host.path.empty() && !inputs->bootstrap.path.empty() && !inputs->passive.path.empty() &&
         !inputs->active.path.empty() && !inputs->manifest.empty();
+#endif
+}
+std::string ExpectedVersion(const Inputs& inputs) {
+#if defined(RS2_OBSERVER_RUNNER)
+    return inputs.expectedVersion;
+#else
+    (void)inputs;
+    return RS2FIX_VERSION_ASCII;
+#endif
 }
 bool Hash(const std::wstring& path, rs2fix::Sha256Digest* digest) {
     const auto result = rs2fix::HashFileSha256(path.c_str(), GetTickCount64() + 10000);
@@ -65,6 +151,24 @@ bool Artifact(Input* input, tool::ArtifactKind kind) {
     input->path = normalized;
     return Hash(input->path, &input->digest);
 }
+#if defined(RS2_REPORTING_RUNNER)
+bool OwnClient(Input& input) {
+    rs2fix::pe::Image image; std::wstring normalized; std::string error;
+    if (!tool::RequireAbsolutePlainFile(input.path.c_str(),&normalized,&error) ||
+        !rs2fix::pe::ReadPeImage(normalized.c_str(),&image,&error) || image.machine!=IMAGE_FILE_MACHINE_AMD64 ||
+        !(image.characteristics&IMAGE_FILE_DLL) || !image.delayImports.empty() || image.exports.size()!=1) return false;
+    const auto& symbol=image.exports[0];
+    if (symbol.name!="FixtureSteamClientSignature" || !symbol.forwarder.empty()) return false;
+    const auto* section=rs2fix::pe::FindSection(image,symbol.rva,sizeof(kFixtureSteamClientSignature));
+    std::vector<std::uint8_t> signature;
+    if (!section || !(section->characteristics&IMAGE_SCN_MEM_READ) ||
+        (section->characteristics&(IMAGE_SCN_MEM_WRITE|IMAGE_SCN_MEM_EXECUTE|IMAGE_SCN_MEM_DISCARDABLE)) ||
+        !rs2fix::pe::ReadImageRva(image,symbol.rva,sizeof(kFixtureSteamClientSignature),&signature,&error) ||
+        std::memcmp(signature.data(),kFixtureSteamClientSignature,sizeof(kFixtureSteamClientSignature))) return false;
+    input.path=normalized;
+    return Hash(normalized,&input.digest); // File-only qualification; never LoadLibrary in this runner.
+}
+#endif
 bool Qualify(Inputs* inputs) {
     tool::GenuineManifest manifest{}; rs2fix::Sha256Digest manifestDigest{}; std::string error;
     wchar_t system[512]{}; DWORD code = 0; tool::FileEvidence evidence{};
@@ -79,11 +183,41 @@ bool Qualify(Inputs* inputs) {
     }
     const auto trust = tool::VerifyEmbeddedSignatureCacheOnly(system, tool::ProductionWinTrustOps());
     if (trust.verifyStatus != 0 || !trust.closeAttempted || trust.closeStatus != 0) return false;
+#if defined(RS2_OBSERVER_RUNNER)
+    rs2fix::pe::Image sdk; std::wstring normalized;
+    if (!tool::RequireAbsolutePlainFile(inputs->sdk.path.c_str(), &normalized, &error) ||
+        !rs2fix::pe::ReadPeImage(normalized.c_str(), &sdk, &error) || sdk.machine != IMAGE_FILE_MACHINE_AMD64 ||
+        !(sdk.characteristics & IMAGE_FILE_DLL) || !sdk.delayImports.empty()) return false;
+    bool ownFixture = false;
+    for (const auto& symbol : sdk.exports) if (symbol.name == "FixtureSteamSignature" && symbol.forwarder.empty()) {
+        std::vector<std::uint8_t> signature;
+        ownFixture = rs2fix::pe::ReadImageRva(sdk, symbol.rva, sizeof(kFixtureSteamSignature), &signature, &error) &&
+            !std::memcmp(signature.data(), kFixtureSteamSignature, sizeof(kFixtureSteamSignature));
+    }
+    inputs->sdk.path = normalized;
+#if defined(RS2_REPORTING_RUNNER)
+    bool namedPump=false;
+    for (const auto& symbol:sdk.exports) if (symbol.name=="SteamGameServer_RunCallbacks" && symbol.forwarder.empty()) {
+        const auto* section=rs2fix::pe::FindSection(sdk,symbol.rva,1);
+        namedPump=section && (section->characteristics&IMAGE_SCN_MEM_EXECUTE) && !(section->characteristics&IMAGE_SCN_MEM_WRITE);
+    }
+    return ownFixture && namedPump && Hash(normalized,&inputs->sdk.digest) && OwnClient(inputs->client) &&
+        Artifact(&inputs->host,tool::ArtifactKind::ReportingStartupFixture) &&
+        Artifact(&inputs->bootstrap,tool::ArtifactKind::FixtureBootstrap) &&
+        Artifact(&inputs->active,tool::ArtifactKind::FixtureCompanionReporting);
+#else
+    return ownFixture && Hash(normalized, &inputs->sdk.digest) &&
+        Artifact(&inputs->host, tool::ArtifactKind::ObserverStartupFixture) &&
+        Artifact(&inputs->bootstrap, tool::ArtifactKind::FixtureBootstrap) &&
+        Artifact(&inputs->active, tool::ArtifactKind::FixtureCompanionObserver);
+#endif
+#else
     return Artifact(&inputs->host, tool::ArtifactKind::StartupFixture) &&
         Artifact(&inputs->bootstrap, tool::ArtifactKind::FixtureBootstrap) &&
         Artifact(&inputs->passive, tool::ArtifactKind::FixtureCompanionPassive) &&
         Artifact(&inputs->active, tool::ArtifactKind::FixtureCompanionActive) &&
         (inputs->production.path.empty() || Artifact(&inputs->production, tool::ArtifactKind::Bootstrap));
+#endif
 }
 std::wstring Join(const std::wstring& directory, std::wstring_view leaf) {
     if (leaf.empty() || leaf.find_first_of(L"/\\\"") != leaf.npos) return {};
@@ -130,7 +264,11 @@ std::vector<wchar_t> Environment(const std::wstring& temporary) {
     for (const auto& value : values) { result.insert(result.end(), value.begin(), value.end()); result.push_back(0); }
     result.push_back(0); return result;
 }
-Child Run(const std::wstring& directory, const std::wstring& temporary, const std::wstring& arguments, bool obstructMarker) {
+Child Run(const std::wstring& directory, const std::wstring& temporary, const std::wstring& arguments, bool obstructMarker
+#if defined(RS2_REPORTING_RUNNER)
+    , DWORD childDeadline=20000, std::size_t maximumOutput=1024 * 1024
+#endif
+    ) {
     Child result{};
     auto environment = Environment(temporary);
     if (environment.empty()) return result;
@@ -181,7 +319,13 @@ Child Run(const std::wstring& directory, const std::wstring& temporary, const st
             }
         }
         CloseHandle(process.hThread);
-        DWORD waited = WaitForSingleObject(process.hProcess, 20000);
+        DWORD waited = WaitForSingleObject(process.hProcess,
+#if defined(RS2_REPORTING_RUNNER)
+            childDeadline
+#else
+            20000
+#endif
+            );
         if (waited != WAIT_OBJECT_0) {
             result.timedOut = waited == WAIT_TIMEOUT;
             if (waited == WAIT_FAILED) result.error = GetLastError();
@@ -193,7 +337,13 @@ Child Run(const std::wstring& directory, const std::wstring& temporary, const st
         CloseHandle(process.hProcess);
     }
     const bool closed = CloseHandle(output) != FALSE;
-    result.captured = closed && Read(outputPath, &result.output, 1024 * 1024);
+    result.captured = closed && Read(outputPath, &result.output,
+#if defined(RS2_REPORTING_RUNNER)
+        maximumOutput
+#else
+        1024 * 1024
+#endif
+        );
     return result;
 }
 bool Absent(const std::wstring& path) {
@@ -212,7 +362,7 @@ bool Marker(const Child& child, const std::wstring& directory, const Inputs& inp
             !fields.emplace(bytes.substr(begin, equals - begin), bytes.substr(equals + 1, end - equals - 1)).second) return false;
         begin = end + 2;
     }
-    return fields["schema"] == "3" && fields["version"] == RS2FIX_VERSION_ASCII && fields["pid"] == std::to_string(child.pid) &&
+    return fields["schema"] == "3" && fields["version"] == ExpectedVersion(inputs) && fields["pid"] == std::to_string(child.pid) &&
         fields["sha256"] == rs2fix::FormatSha256Upper(inputs.host.digest).data() && fields["executable"] == "fixture.exe" &&
         fields["build_identity"] == "unknown" && fields["bootstrap_beside_executable"] == "true" &&
         fields["companion_beside_executable"] == "true" && fields["genuine_module"] == "system32" &&
@@ -221,7 +371,7 @@ bool Marker(const Child& child, const std::wstring& directory, const Inputs& inp
         fields["fix"] == "recon-exclusive-scale-v1" && fields["qualification"] == "ready" &&
         fields["recon"] == (active ? "active" : "passive") && fields["reason"] == "none" && fields["initialize_result"] == "0";
 }
-bool StatusLine(const std::string& output, bool active, bool markerFailure, bool allowAbsent) {
+bool StatusLine(const Inputs& inputs, const std::string& output, bool active, bool markerFailure, bool allowAbsent) {
     const std::string prefix = "[RS2ServerFix]";
     const auto at = output.find(prefix);
     if (at == output.npos) return allowAbsent;
@@ -229,11 +379,135 @@ bool StatusLine(const std::string& output, bool active, bool markerFailure, bool
     const auto end = output.find("\r\n", at);
     if (end == output.npos) return false;
     const std::string mode = active ? "active" : "passive";
-    const std::string expected = "[RS2ServerFix] v" RS2FIX_VERSION_ASCII " loaded; host=unknown; mode=" + mode +
+    const std::string expected = "[RS2ServerFix] v" + ExpectedVersion(inputs) + " loaded; host=unknown; mode=" + mode +
         "; qualification=ready; recon=" + mode + "; fix=recon-exclusive-scale-v1; reason=none; marker=" +
         (markerFailure ? "failed; acceptance=failed" : "complete; acceptance=passed");
     return output.substr(at, end - at) == expected;
 }
+#if defined(RS2_OBSERVER_RUNNER)
+bool CreateText(const std::wstring& path, std::string_view text) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written{};
+    const bool ok = text.size() <= MAXDWORD && WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) &&
+        written == text.size() && FlushFileBuffers(file);
+    return CloseHandle(file) && ok;
+}
+#if !defined(RS2_REPORTING_RUNNER)
+bool StageObserver(const Inputs& inputs, const Scenario& scenario, const std::wstring& directory) {
+    if (!Copy(inputs.sdk, directory, L"rs2_test_steam_api.dll")) return false;
+    if (scenario.observerMode != 2) {
+        const auto config = scenario.observerMode == 1 ? "enabled=0\r\n" : scenario.observerMode == 3 ?
+            "enabled=1\nenabled=1\n" : "enabled=1\r\nmax_log_mib=16\r\n";
+        if (!CreateText(Join(directory, L"RS2SteamObserve.ini"), config)) return false;
+    }
+    if (scenario.observerMode == 4) {
+        // Change only a disposable OWN DLL's overlay. Its code/imports/exports
+        // still run, but the qualified SDK disk hash must reject observation.
+        HANDLE file = CreateFileW(Join(directory, L"rs2_test_steam_api.dll").c_str(), FILE_APPEND_DATA, 0,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        constexpr char changed[] = "own-fixture-unsupported-sdk-hash"; DWORD count{};
+        const bool ok = WriteFile(file, changed, sizeof(changed), &count, nullptr) && count == sizeof(changed) && FlushFileBuffers(file);
+        if (!CloseHandle(file) || !ok) return false;
+    }
+    if (scenario.observerMode == 5 && !CreateText(Join(directory, L"RS2SteamObserve"), "owned-obstruction")) return false;
+    return true;
+}
+#endif
+bool JsonUnsigned(const std::string& line, const char* name, std::uint64_t* value) {
+    const std::string prefix = std::string("\"") + name + "\":";
+    auto at = line.find(prefix);
+    if (at == line.npos || line.find(prefix, at + prefix.size()) != line.npos) return false;
+    at += prefix.size();
+    if (at == line.size() || line[at] < '0' || line[at] > '9') return false;
+    *value = 0;
+    while (at < line.size() && line[at] >= '0' && line[at] <= '9') {
+        const unsigned digit = line[at++] - '0';
+        if (*value > (UINT64_MAX - digit) / 10) return false;
+        *value = *value * 10 + digit;
+    }
+    return at < line.size() && (line[at] == ',' || line[at] == '}');
+}
+#if !defined(RS2_REPORTING_RUNNER)
+bool ObserverEvidence(const Inputs& inputs, const Scenario& scenario, const Child& child, const std::wstring& directory) {
+    if (child.output.find("steam_fixture=pass factory=2 init=1 shutdown=1 bad_arguments=0") == child.output.npos) return false;
+    const bool enabled = scenario.observerMode == 0 && !scenario.markerFailure;
+    const auto results = Join(directory, L"RS2SteamObserve"), keys = Join(directory, L"RS2SteamObserveKeys");
+    const std::string prefix = "[RS2SteamObserve] v" + inputs.expectedVersion + "; status=";
+    if (!enabled) {
+        if (child.output.find(prefix + "disabled; reason=") == child.output.npos) return false;
+        const char* reason = scenario.markerFailure ? "core_marker_failed" : scenario.observerMode == 1 ? "config_disabled" :
+            scenario.observerMode == 2 ? "config_missing" : scenario.observerMode == 3 ? "config_invalid" :
+            scenario.observerMode == 4 ? "sdk_identity_mismatch" :
+            scenario.observerMode == 6 ? "sdk_binding_mismatch" : nullptr;
+        if (reason && child.output.find(prefix + "disabled; reason=" + reason + "\r\n") == child.output.npos) return false;
+        if (scenario.observerMode == 6 &&
+            (child.output.find("steam_prehook=installed-before-audio preserved=true") == child.output.npos ||
+             child.output.find("bad_arguments=0 factory_alias=2") == child.output.npos)) return false;
+        return (scenario.observerMode == 5 || Absent(results)) && Absent(keys);
+    }
+    if (child.output.find(prefix + "armed;") == child.output.npos || child.output.find(prefix + "bound;") == child.output.npos ||
+        child.output.find(prefix + "calls-observed;") == child.output.npos) return false;
+    std::error_code error;
+    std::filesystem::directory_iterator runs(results, error);
+    if (error) return false;
+    std::wstring runDirectory;
+    for (const auto& run : runs) {
+        if (!runDirectory.empty() || !run.is_directory(error) || error ||
+            (GetFileAttributesW(run.path().c_str()) & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+        runDirectory = run.path().wstring();
+    }
+    if (runDirectory.empty()) return false;
+    std::string bytes;
+    if (!Read(Join(runDirectory, L"events.jsonl"), &bytes, 1024 * 1024) || bytes.empty() || bytes.back() != '\n') return false;
+    // Never use a summary notice alone as evidence of actual intercepted calls.
+    if (bytes.find("1234605616436508552") != bytes.npos || bytes.find("1122334455667788") != bytes.npos) return false;
+    unsigned completed[47]{};
+    bool startup = false, countersComplete = false;
+    std::size_t start = 0;
+    while (start < bytes.size()) {
+        const auto end = bytes.find('\n', start);
+        if (end == bytes.npos) return false;
+        const auto line = bytes.substr(start, end - start);
+        start = end + 1;
+        if (line.find("\"type\":\"startup\"") != line.npos) {
+            std::uint64_t pid{}, schema{};
+            startup = JsonUnsigned(line, "pid", &pid) && pid == child.pid && JsonUnsigned(line, "schema", &schema) && schema == 1 &&
+                line.find("\"version\":\"" + inputs.expectedVersion + "\"") != line.npos && line.find("\"armed\":true") != line.npos;
+        } else if (line.find("\"type\":\"event\"") != line.npos) {
+            std::uint64_t method{}, phase{}, result{};
+            if (!JsonUnsigned(line, "method", &method) || method >= 47 || !JsonUnsigned(line, "phase", &phase)) return false;
+            if (phase == 1) {
+                ++completed[method];
+                if ((method == 29 || method == 27 || method == 45) &&
+                    (!JsonUnsigned(line, "result", &result) || result != (method == 29 ? 7u : 0u))) return false;
+                if ((method == 27 || method == 29 || method == 30) && line.find("\"steam_token\":\"") == line.npos) return false;
+            }
+        } else if (line.find("\"type\":\"anchor\"") != line.npos) {
+            bool exact = line.find("\"bindings_published\":1,") != line.npos;
+            constexpr unsigned observed[]{6, 8, 12, 20, 27, 29, 30, 39, 40, 44, 45, 46};
+            for (const auto method : observed) {
+                const unsigned expected = method == 8 || method == 44 ? 2u : 1u;
+                const auto tuple = "{\"method\":" + std::to_string(method) + ",\"entered\":" + std::to_string(expected) +
+                    ",\"completed\":" + std::to_string(expected) + "}";
+                exact = line.find(tuple) != line.npos && exact;
+            }
+            countersComplete = exact || countersComplete;
+        }
+    }
+    // Queue contention may legitimately lose individual records even in a small
+    // fixture. Require exact loss-independent counters AND real virtual-call
+    // records, not an impossible promise that every queued record survives.
+    unsigned virtualCompletions = 0;
+    for (unsigned method = 0; method < 44; ++method) virtualCompletions += completed[method];
+    return startup && countersComplete && virtualCompletions != 0;
+}
+#endif
+#endif
+#if defined(RS2_REPORTING_RUNNER)
+#include "steam_reporting_startup_runner_checks.h"
+#endif
 bool Execute(const Inputs& inputs, const std::wstring& root, const Scenario& scenario) {
     const auto directory = Join(root, scenario.name), temporary = Join(directory, L"temp");
     if (!NewDirectory(directory) || !NewDirectory(temporary) || !Copy(inputs.host, directory, L"fixture.exe")) return false;
@@ -245,12 +519,25 @@ bool Execute(const Inputs& inputs, const std::wstring& root, const Scenario& sce
     if (scenario.late) { if (!Copy(companion, directory, L"pending-companion.dll")) return false; }
     else if (scenario.invalid) { if (!BadFile(Join(dllDirectory, L"RS2ServerFix.dll"))) return false; }
     else if (!scenario.missing && !Copy(companion, dllDirectory, L"RS2ServerFix.dll")) return false;
+#if defined(RS2_REPORTING_RUNNER)
+    if (!StageReporting(inputs,scenario,directory)) return false;
+#elif defined(RS2_OBSERVER_RUNNER)
+    if (!StageObserver(inputs, scenario, directory)) return false;
+#endif
     const bool corrected = scenario.active && scenario.companion;
     std::wstring arguments = scenario.options;
     arguments += corrected ? L" --expect-corrected" : L" --expect-original";
     if (scenario.companion) arguments += L" --expect-companion";
     if (scenario.immediate) arguments += L" --immediate-exit";
-    const Child child = Run(directory, temporary, arguments, scenario.markerFailure);
+    const Child child = Run(directory, temporary, arguments, scenario.markerFailure
+#if defined(RS2_REPORTING_RUNNER)
+        // The fixed-count calibration intentionally takes over five minutes.
+        // Allow 15 minutes, below the enclosing CTest deadline, so Run can
+        // terminate and reap a stuck owned child. Ordinary limits stay intact.
+        , scenario.reportMode==13 ? 900000 : 20000,
+          scenario.reportMode==13 ? 16 * 1024 * 1024 : 1024 * 1024
+#endif
+        );
     bool ok = child.created && child.ended && !child.timedOut && !child.preparationFailed && child.captured && child.status == 0;
     const std::string observed = std::string("fixture_state=2 selector=") + (corrected ? "2" : "3") +
         " companion=" + (scenario.companion ? "present" : "absent") + " before_main=true marker_before_main=" +
@@ -264,16 +551,27 @@ bool Execute(const Inputs& inputs, const std::wstring& root, const Scenario& sce
             const DWORD attributes = GetFileAttributesW(Join(base, markerLeaf).c_str());
             ok = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) && ok;
         }
-        ok = StatusLine(child.output, scenario.active, true, false) && ok;
+        ok = StatusLine(inputs, child.output, scenario.active, true, false) && ok;
     } else if (scenario.companion) {
         ok = Marker(child, directory, inputs, scenario.active) && Absent(Join(temporary, markerLeaf)) &&
-            StatusLine(child.output, scenario.active, false, scenario.immediate) && ok;
+            StatusLine(inputs, child.output, scenario.active, false, scenario.immediate) && ok;
     } else {
         ok = Absent(Join(directory, markerLeaf)) && Absent(Join(temporary, markerLeaf)) &&
             child.output.find("[RS2ServerFix]") == child.output.npos && ok;
     }
     rs2fix::Sha256Digest after{};
     ok = Hash(Join(directory, L"fixture.exe"), &after) && after == inputs.host.digest && ok;
+#if defined(RS2_REPORTING_RUNNER)
+    const bool reportingOk=ReportingEvidence(inputs,scenario,child,directory);
+    ok=reportingOk && Hash(inputs.sdk.path,&after) && after==inputs.sdk.digest &&
+        Hash(inputs.client.path,&after) && after==inputs.client.digest && ok;
+    if (!reportingOk) std::cerr << "reporting_evidence=fail\n";
+    if (ok && scenario.reportMode==13) ok=WriteTimingFixture(inputs,root,child);
+#elif defined(RS2_OBSERVER_RUNNER)
+    const bool observerOk = ObserverEvidence(inputs, scenario, child, directory);
+    ok = observerOk && Hash(inputs.sdk.path, &after) && after == inputs.sdk.digest && ok;
+    if (!observerOk) std::cerr << "observer_evidence=fail\n";
+#endif
     if (!scenario.immediate || !ok) {
         std::wcout << L"case=" << scenario.name << L" pid=" << child.pid << L" exit=" << child.status
             << L" timeout=" << child.timedOut << L" result=" << (ok ? L"pass" : L"fail") << L'\n';
@@ -294,6 +592,36 @@ int wmain(int argc, wchar_t** argv) {
     const auto root = Join(temporary, L"RS2ServerFix.startup." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(GetTickCount64()));
     if (!NewDirectory(root) || !tool::IsPathWithin(temporary, root, false)) return 1;
     std::wcout << L"startup_evidence=" << root << std::endl;
+#if defined(RS2_REPORTING_RUNNER)
+    bool all=true;
+    if (inputs.calibrationOnly) {
+        Scenario calibration{L"report-calibration",L"--report-timing-fixture",true,true};
+        calibration.reportMode=13;
+        all=Execute(inputs,root,calibration);
+    } else {
+    const wchar_t* names[]{L"report-observe",L"report-repair",L"report-missing-config",L"report-disabled",
+        L"report-invalid-config",L"report-prerequisite-disabled",L"report-wrong-sdk",L"report-blocked-writer",
+        L"report-client-missing",L"report-wrong-client",L"report-init-false",L"report-core-marker-failed",
+        L"report-preexisting-sdk-hook"};
+    for (unsigned mode=0;mode<std::size(names);++mode) {
+        const wchar_t* options=mode==1 ? L"--report-false-first-full" : mode==8 ? L"--report-client-missing" :
+            mode==10 ? L"--report-init-false" : mode==12 ? L"--prehook-steam-factory" : L"";
+        Scenario scenario{names[mode],options,true,true};
+        scenario.reportMode=mode; scenario.markerFailure=mode==11;
+        all=Execute(inputs,root,scenario) && all;
+    }
+    }
+#elif defined(RS2_OBSERVER_RUNNER)
+    bool all = true;
+    const wchar_t* names[]{L"observer-enabled", L"observer-disabled", L"observer-missing-config", L"observer-invalid-config",
+        L"observer-unsupported-sdk", L"observer-blocked-writer", L"observer-preexisting-sdk-hook"};
+    for (unsigned mode = 0; mode < std::size(names); ++mode) {
+        Scenario scenario{names[mode], mode == 6 ? L"--prehook-steam-factory" : L"", true, true}; scenario.observerMode = mode;
+        all = Execute(inputs, root, scenario) && all;
+    }
+    Scenario markerFailure{L"observer-core-marker-failed", L"", true, true, true};
+    all = Execute(inputs, root, markerFailure) && all;
+#else
     const Scenario scenarios[]{
         {L"01-passive", L"", false, true},
         {L"02-active", L"", true, true},
@@ -323,6 +651,7 @@ int wmain(int argc, wchar_t** argv) {
         all = passed && all;
     }
     std::cout << "immediate_exit_passed=" << exitsPassed << "/128 result=" << (all ? "pass" : "fail") << '\n';
+#endif
     std::wcout << L"retained_startup_evidence=" << root << std::endl;
     return all ? 0 : 1;
 }

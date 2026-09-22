@@ -4,7 +4,7 @@
 #include <string_view>
 namespace {
 void Help() {
-    std::cout << "rs2_pe_contract --kind <bootstrap|companion|companion-passive|companion-active|harness|fixture-bootstrap|fixture-companion-passive|fixture-companion-active|missing-genuine-bootstrap|startup-fixture> --file <absolute existing plain file>\n"
+    std::cout << "rs2_pe_contract --kind <bootstrap|companion|companion-passive|companion-active|companion-observer|companion-reporting|harness|fixture-bootstrap|fixture-companion-passive|fixture-companion-active|fixture-companion-observer|fixture-companion-reporting|missing-genuine-bootstrap|startup-fixture|observer-startup-fixture|reporting-startup-fixture> --file <absolute existing plain file>\n"
         "Sole --help prints this grammar. Options must occur exactly once.\n";
 }
 void Imports(const char* kind, const std::vector<rs2fix::pe::ImportModule>& modules) {

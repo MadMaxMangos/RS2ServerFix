@@ -2,6 +2,7 @@
 #include "deployment_preflight.h"
 #include "companion/recon_profile.h"
 #include "pe_contract_lib.h"
+#include "shared/steam_reporting_status.h"
 #include <memory>
 
 namespace rs2fix::tooling {
@@ -18,10 +19,15 @@ struct RawRuntimeModule {
     std::uint32_t imageSize{};
     std::wstring fullPath;
 };
+struct RuntimeReportingExport {
+    bool present{}, valid{};
+    std::uint32_t rva{}, bytes{}, sectionIndex{}, sectionRva{}, sectionBytes{}, sectionCharacteristics{};
+};
 struct RuntimeModule : RawRuntimeModule {
     FileIdentity fileIdentity{};
     pe::Image image{};
     bool x3audioExports{}, companionExports{};
+    RuntimeReportingExport reportingStatus;
 };
 struct RuntimeInventoryOps {
     void* context{};
@@ -55,6 +61,8 @@ struct RuntimeValidationInputs {
     std::wstring targetRoot;
     RuntimeExpectation expectation{};
     DeploymentMode mode{};
+    bool observerCompanion{}; // Requires active recon and proxy-pass; default contracts stay unchanged.
+    bool reportingCompanion{}; // Explicit 0.4 contract; mutually exclusive with observerCompanion.
     ExpectedReconState expectedRecon{};
     Sha256Digest bootstrapSha256{}, companionSha256{};
     GenuineManifest genuineManifest;
@@ -66,12 +74,28 @@ struct ReconObservation {
     Sha256Digest digest{};
     bool constantsMatch{};
 };
+enum class ReportingStatusState { Unavailable, Uninitialized, Initializing, Busy,
+    Invalid, Rejected, Disabled, Revoked, Stopped, Stale, NotReady, Ready };
+struct ReportingStatusObservation {
+    bool captured{}, headerValid{}, ownerValid{}, identityComplete{}, currentReady{};
+    ReportingStatusState state{ReportingStatusState::Unavailable};
+    std::uint32_t attempts{};
+    std::uint64_t observedQpc{}, ownerSequence{};
+    std::uint64_t revokeReasons{}, lossReasons{}, stopping{}, stoppedQpc{};
+    std::uint64_t recordsWritten{}, lastFlushedSequence{};
+    reporting::StatusHeader header{};
+    reporting::StatusPayload owner{};
+    std::string detail;
+};
 struct RuntimeValidationResult {
     bool passed{};
     std::vector<std::string> findings;
     Sha256Digest hostSha256{}, genuineSha256{}, bootstrapSha256{}, companionSha256{};
+    Sha256Digest sdkSha256{}; // Explicit observer/reporting validation only.
+    Sha256Digest steamClientSha256{}; // Actual loaded module for reporting, not a beside-EXE guess.
     std::vector<std::pair<std::uintptr_t, Sha256Digest>> moduleDigests;
     ReconObservation recon;
+    ReportingStatusObservation reporting; // Never changes the independent recon/artifact passed field.
 };
 // Explicit file-evidence boundaries permit own-code synthetic validation tests;
 // the executable always uses ProductionRuntimeValidationOps.
@@ -86,6 +110,22 @@ struct RuntimeValidationOps {
 };
 const RuntimeValidationOps& ProductionRuntimeValidationOps() noexcept;
 const RuntimeInventoryOps& ProductionRuntimeInventoryOps() noexcept;
+struct RuntimeStatusClockOps {
+    void* context{};
+    bool (*read)(void*, std::uint64_t* frequency, std::uint64_t* now) noexcept{};
+};
+const RuntimeStatusClockOps& ProductionRuntimeStatusClockOps() noexcept;
+// Diagnostic capture success is NOT current readiness or trial qualification.
+// No target function/export is called; only bounded reads through the retained
+// selected-PID handle, with module/process/file qualification on both sides.
+bool ReadReportingStatusWithOps(const RuntimeInventory&, const RuntimeModule&,
+    const Sha256Digest& expectedHost, const Sha256Digest& expectedCompanion,
+    const RuntimeValidationOps&, const RuntimeStatusClockOps&,
+    ReportingStatusObservation*, std::string* error);
+bool ReadReportingStatus(const RuntimeInventory&, const RuntimeModule&,
+    const Sha256Digest& expectedHost, const Sha256Digest& expectedCompanion,
+    ReportingStatusObservation*, std::string* error);
+const char* ReportingStatusStateName(ReportingStatusState) noexcept;
 bool CaptureStableRuntimeInventory(DWORD, const RuntimeInventoryOps&, RuntimeInventory*, std::string* error);
 bool ValidateRuntimeInventory(const RuntimeInventory&, const RuntimeValidationInputs&, RuntimeValidationResult*);
 bool ValidateRuntimeInventoryWithOps(const RuntimeInventory&, const RuntimeValidationInputs&,

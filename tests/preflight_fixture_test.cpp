@@ -160,6 +160,8 @@ int wmain(int argc, wchar_t** argv) {
     auto none = [](PreflightInputs&, Inject&, const std::wstring&) {};
     run("positive", 0, "result=pass", none);
     run("active-stock", 1, "active-requires-current-full-dump", [](auto& in, auto&, const auto&) { in.mode = DeploymentMode::Active; });
+    run("observer-passive", 2, nullptr, [](auto& in, auto&, const auto&) { in.observerCompanion = true; });
+    run("observer-rejects-ordinary-companion", 1, "artifact-contract-hash", [](auto& in, auto&, const auto&) { in.observerCompanion = true; in.mode = DeploymentMode::Active; });
     run("bootstrap-hash", 1, "artifact-contract-hash", [](auto& in, auto&, const auto&) { ++in.bootstrapSha256[0]; });
     run("companion-hash", 1, "artifact-contract-hash", [](auto& in, auto&, const auto&) { ++in.companionSha256[0]; });
     run("bootstrap-contract", 1, "artifact-contract-hash", [](auto& in, auto&, const auto&) { in.bootstrapPath = in.companionPath; in.bootstrapSha256 = in.companionSha256; });

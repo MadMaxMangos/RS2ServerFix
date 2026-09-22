@@ -1,0 +1,6 @@
+LIBRARY rs2_test_steam_api.dll
+EXPORTS
+    SteamInternal_FindOrCreateGameServerInterface
+    SteamInternal_GameServer_Init
+    SteamGameServer_Shutdown
+

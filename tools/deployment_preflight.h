@@ -11,6 +11,8 @@ struct PreflightInputs {
     Sha256Digest bootstrapSha256{}, companionSha256{};
     std::wstring genuineManifestPath, reportPath;
     DeploymentMode mode{DeploymentMode::Passive};
+    bool observerCompanion{}; // Explicit production observer selection; never inferred from metadata.
+    bool reportingCompanion{}; // Explicit 0.4 selection; cannot also select observer.
     SecurityDisposition avEdr{}, wdac{}, appLocker{}, eac{};
 };
 struct PreflightOps {

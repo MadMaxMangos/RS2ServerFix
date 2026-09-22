@@ -11,7 +11,11 @@ release. It is not a general performance patch or a fix for every server crash.
 
 ## What is implemented
 
-The current source version is **0.2.0.0**.
+Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
+companion is **0.3.0.0** and requires its own qualified trial package.
+Native advertisement recovery is a separate **0.4.1.0 experimental target**,
+entering limited operator-authorized server trials. It is not a generally
+qualified production release or a proven Steam-outage fix.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
   exact executable hash, expected instruction bytes and startup checks.
@@ -21,10 +25,11 @@ The current source version is **0.2.0.0**.
 - **Verification tools** — PE/import checks, deployment preflight, runtime module
   inventory and isolated startup/rollback fixtures.
 
-Steam-maintenance investigation and an observation-only Steam interface design
-are ongoing work. **The current DLL does not repair Steam browser counts or
-provide the planned Steam observer.** It does not bypass authentication or
-anti-cheat checks.
+The optional observer records selected Steam calls the server already makes,
+their synchronous results and coverage/loss counters. It adds no SDK calls,
+ticket reads, authentication changes or reconnects. **It does not repair Steam
+browser counts or registrations, and does not bypass anti-cheat checks.** Local
+inert tests are not live-server qualification; use one controlled trial first.
 
 ## How it loads
 
@@ -97,10 +102,76 @@ build/production/passive/Release/RS2ServerFix.dll
 build/production/active/Release/RS2ServerFix.dll
 ```
 
+The optional observer target is `rs2_server_fix_companion_observer`, producing
+`build/production/observer/Release/RS2ServerFix.dll`. It retains the active recon
+correction and requires `RS2SteamObserve.ini` beside the companion:
+
+```ini
+enabled=1
+max_log_mib=512
+```
+
+Keep this small config comment-free. Results require a plain local fixed-drive
+server path; UNC/mapped/removable/reparse paths are not supported. The observer
+also declines copy-on-write IAT pages before any mutation because Windows cannot
+restore their original protection exactly after writing; recon remains active.
+
+Its initial Steam SDK1.57 disk identity is
+`A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9`.
+Do not replace your SDK to force a match. Missing/invalid config or unsupported
+identity disables observation without changing recon. Require separate armed,
+bound and calls-observed notices before relying on a capture. Logs can lose events
+or reach their configured cap; a quiet log does not prove an idle server.
+
+Results are in `RS2SteamObserve` beside the EXE. Steam IDs are HMAC-pseudonymised;
+the private key remains separately in `RS2SteamObserveKeys`. The packaged
+`Run-SteamObserve.cmd` collector verifies identities and copies only allowlisted
+results, never that key store. Do not publicly upload keys or full memory dumps.
+Rollback restores the previous recon-only DLLs with the server stopped; no hot unload.
+
+### Experimental native advertisement recovery
+
+`rs2_server_fix_companion_reporting` produces
+`build/production/reporting/Release/RS2ServerFix.dll`. It retains active recon and
+uses the existing bootstrap and launch command. It preserves native player/bot
+counting, authentication, anti-cheat decisions and publication scheduling.
+
+The first isolated trial uses the supplied [reporting config](config/RS2SteamReport.ini)
+with `schema=2`, `mode=observe`, plus the enabled
+[logging prerequisite](config/RS2SteamObserve.ini), both beside the companion.
+Observe makes no count-request or full-publication selection writes. Only a later
+separately approved `mode=repair` trial may request fresh native counts and select
+full data on already-scheduled native publications. This is not proof of Steam
+registration repair or backend/browser recovery.
+
+In the completed isolated repair trial, local safety, functional coverage and
+per-call latency checks passed. Measured wrapper overhead was approximately
+1.32-1.35 ms per second, exceeding the original strict 1 ms/s budget; the
+performance result remains **FAIL**. Limited staged field trials are an explicit
+operator risk decision, not a reclassification of that result. Full-server load
+and browser-count recovery following an actual Steam outage remain unproven.
+
+Reporting uses scalar-only logs under `RS2SteamReport`, without the verbose 0.3
+Steam-call trace or its private key store. The quota defaults to 512 MiB; actual
+record/write/quota loss disables new reporting mutations, while native forwarding
+continues. `[RS2SteamReport]` notices and the independent read-only DATA status
+distinguish readiness from rejection. Recon's own result remains separate.
+
+The packaged `Run-SteamReport.cmd` reads current status before requesting logs and
+collects a fixed five-minute window. Local safety, coverage, measured performance,
+operator smoke, client effect and outage recovery have separate verdicts. Missing
+timing calibration or insufficient evidence cannot produce a qualification PASS.
+Use only a reviewed, checksum-bound package and its deployment instructions.
+The repository configuration defaults to observe; repair requires an explicit
+deployment decision. A source checkout or a successful build is not a qualified
+deployment package. Proprietary Steam DLLs and private operator bundles are not
+included in this repository.
+
 Full qualification testing also requires locally supplied, preserved executable
 inputs. Set the CMake cache paths `RS2_PR1_BASELINE_PATH`,
-`RS2_CURRENT_STOCK_PATH` and `RS2_CURRENT_FULLDUMP_PATH` to the matching evidence
-files before building all test targets and running:
+`RS2_CURRENT_STOCK_PATH`, `RS2_CURRENT_FULLDUMP_PATH`, and
+`RS2_OBSERVER_SDK_BASELINE_PATH` to the matching evidence files before building all
+test targets and running (the SDK path is read as data, never executed):
 
 ```powershell
 cmake --build build
