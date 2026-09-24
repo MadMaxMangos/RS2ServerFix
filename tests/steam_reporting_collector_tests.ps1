@@ -56,7 +56,7 @@ $created=[uint64]134000000000000000
 $run=Join-Path $caseRoot ('20260917T000000Z-PID123-'+$runId)
 $identity=@{pid='123';process_creation_filetime=[string]$created;'reporting.run_id'=$runId;'reporting.ownerThreadId'='4';
     'reporting.mode'='3';'reporting.qpc_frequency'='1000000'}
-$startup=[ordered]@{type='startup';schema=2;artifact='RS2ServerFix-steam-reporting';version='0.4.1.0';artifact_version=262400;
+$startup=[ordered]@{type='startup';schema=2;artifact='RS2ServerFix-steam-reporting';version='0.4.2.0';artifact_version=262656;
     run_id=$runId;pid=123;process_start_filetime=$created;qpc_frequency=1000000;utc_filetime=$created;qpc=1;
     mode='repair';configured_mode=3;header_validity=31;host_sha256=$script:ReportHostHash;
     qualified_steam_api_sha256=$script:ReportSdkHash;qualified_steamclient_sha256=$script:ReportClientHash;
@@ -690,7 +690,7 @@ foreach($point in @(@($fixtureStart,0,1),@($fixtureEnd,3,8),@($fixtureFinal,4,11
         host_sha256=$script:ReportHostHash;sdk_sha256=$script:ReportSdkHash;steamclient_sha256=$script:ReportClientHash;
         observed_bootstrap_sha256=('B'*64);bootstrap_sha256=('B'*64);observed_companion_sha256=$artifact;companion_sha256=$artifact;
         'reporting.mode'='2';'reporting.qpc_frequency'=[string]$fixtureFrequency;'reporting.ownerThreadId'='4';
-        'reporting.schema'='2';'reporting.bytes'='1288';'reporting.artifact_version'='262400';'reporting.header_validity'='31';
+        'reporting.schema'='2';'reporting.bytes'='1288';'reporting.artifact_version'='262656';'reporting.header_validity'='31';
         'reporting.pid'='123';'reporting.process_creation'=[string]$created;
         'reporting.lastOwnerQpc'=[string]$point[0];'reporting.observed_qpc'=[string]$point[0];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';

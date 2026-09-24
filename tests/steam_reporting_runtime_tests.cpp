@@ -153,9 +153,10 @@ struct Fixture {
         Put(Slot()+0x38,kHolder); Put(Slot()+0x40,Original()); Put(Slot()+0x60,std::uint64_t{30000});
         Put(Base()+task.selectedIdRva,id); Put(Base()+task.counterRva,counter);
     }
-    void SetJson(unsigned count=65) {
+    void SetJson(unsigned count=65,unsigned bots=24,unsigned maximum=64) {
         const auto json=std::string("{\"op\":[{\"k\":\"PI_COUNT\",\"v\":\"")+std::to_string(count)+
-            "\"},{\"k\":\"BotPlayerCount\",\"v\":\"24\"},{\"k\":\"MaxPlayerCount\",\"v\":\"64\"}]}";
+            "\"},{\"k\":\"BotPlayerCount\",\"v\":\""+std::to_string(bots)+
+            "\"},{\"k\":\"MaxPlayerCount\",\"v\":\""+std::to_string(maximum)+"\"}]}";
         std::memcpy(reinterpret_cast<void*>(Heap(0x8000)),json.c_str(),json.size()+1);
         Put(Base()+prepared.gameMode,Heap(0x8000));
         Put(Base()+prepared.gameMode+0x10,static_cast<std::uint64_t>(json.size()));
@@ -335,6 +336,63 @@ void SelectionUsesWitnessRequest() {
     f.Finish(decision,true,true,true);
     RS2_CHECK(f.runtime.counters.fullSelected==1 && !StatusRevoked(f.status));
 }
+void RepairWithDiagnosticDrift() {
+    Fixture f; f.Init();
+    f.Put(f.Heap(0x4000)+0x2E0,std::int32_t{-3});
+    f.Put(f.Heap(0x4000)+0x2EC,std::int32_t{65});
+    f.Put(f.Heap(0x4000)+0x2F0,std::int32_t{0});
+    f.Put(f.Heap(0x6000)+0x94,std::uint32_t{21});
+    f.Put(f.Heap(0x6000)+0x98,std::uint32_t{63});
+    f.Put(f.Base()+f.prepared.members+8,f.Heap(0x9000)+63*0x20);
+    f.SetJson(63,0);
+    auto expectedHeap=f.heap;
+    const std::uint32_t stagedBots=0;
+    std::memcpy(expectedHeap.data()+0x6094,&stagedBots,sizeof(stagedBots));
+    expectedHeap[0x60A0]=1;
+    f.Pump();
+    // Whole owned heap is unchanged except the admitted B/request pair, covering
+    // game H/S/max and native PI as well as bytes between the staged fields.
+    RS2_CHECK(std::memcmp(expectedHeap.data(),f.heap.data(),f.heap.size())==0);
+    RS2_CHECK(f.runtime.sourceReady && f.CachedBots()==0 && f.Requested()==1 &&
+        f.runtime.producer.pending.active && !f.runtime.producer.fresh.valid);
+    auto pending=f.Builder();
+    RS2_CHECK(pending.attempted && !pending.eligible &&
+        pending.event.header.reason==static_cast<unsigned>(Reason::FreshnessExpired));
+    f.Finish(pending);
+    f.Consume(); // Owned fixture transition only, not native execution.
+    auto selected=f.Builder();
+    RS2_CHECK(selected.attempted && selected.eligible &&
+        selected.event.payload.builder.pi==63 && selected.event.payload.builder.bots==0 &&
+        selected.event.payload.builder.maximum==64);
+    f.Finish(selected,true,true,true); // Simulated outcome, not forwarding proof.
+    RS2_CHECK(f.runtime.counters.fullSelected==1 && !StatusRevoked(f.status) &&
+        f.runtime.producer.fault==Reason::None && !f.forbiddenRead);
+    unsigned requests{},witnesses{};
+    ReportRecord record{};
+    while (DequeueReport(f.ring,&record)==ReportReadResult::Record) {
+        const auto kind=static_cast<RecordKind>(record.header.kind);
+        if (kind!=RecordKind::Request && kind!=RecordKind::Witness) continue;
+        if (kind==RecordKind::Request) ++requests; else ++witnesses;
+        RS2_CHECK(record.payload.request.humanPlayers==65 && record.payload.request.worldBots==0 &&
+            record.payload.request.pi==63 && record.payload.request.maximum==64 &&
+            record.payload.request.stagedBots==0 && record.payload.request.requestSequence==1);
+        RS2_CHECK(record.header.sourceEpoch==f.runtime.counters.sourceEpoch &&
+            record.header.bindingEpoch==f.runtime.counters.bindingEpoch);
+    }
+    RS2_CHECK(requests==1 && witnesses==1);
+}
+void InvalidBotsRejectBeforeStaging() {
+    Fixture f; f.Init();
+    f.Put(f.Heap(0x4000)+0x2F0,std::int32_t{65});
+    f.Put(f.Heap(0x6000)+0x94,std::uint32_t{21});
+    const auto before=f.heap;
+    f.Pump();
+    RS2_CHECK(std::memcmp(before.data(),f.heap.data(),f.heap.size())==0);
+    RS2_CHECK(!f.runtime.sourceReady && f.CachedBots()==21 && f.Requested()==0 &&
+        f.runtime.producer.requestSequence==0 && !f.runtime.producer.pending.active &&
+        f.runtime.producer.fault==Reason::None && !StatusRevoked(f.status));
+    RS2_CHECK(f.runtime.counters.reasons[static_cast<unsigned>(Reason::UnsupportedCounts)]>0);
+}
 void EpochInvalidationKeepsRequestFloor() {
     {
         Fixture f; f.Init(); f.Pump(); f.Consume();
@@ -464,6 +522,7 @@ void ReportingRuntimeTests() {
     ObserveAndKnownSpin(); InstalledSnapshotOwnsDiagnostics();
     RepairWitnessAndPreparedMismatch(); EpochInvalidationKeepsRequestFloor();
     SelectionUsesWitnessRequest();
+    RepairWithDiagnosticDrift(); InvalidBotsRejectBeforeStaging();
     EvidenceLossPreventsSelection(); CleanupLifecycleCrossing(); SameOwnerEntryCrossingReasons(); LifecycleFailuresAndShutdown();
 }
 } // namespace rs2fix::testcases

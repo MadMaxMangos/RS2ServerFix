@@ -154,7 +154,7 @@ void IdentityPrivacyAndKinds() {
     RS2_CHECK(PublishStatus(f.status,changed));
     obs::PumpWriterForTest(f.writer);
     const auto text=ReadText(f.Events());
-    RS2_CHECK(text.find("\"schema\":2")!=std::string::npos && text.find("\"version\":\"0.4.1.0\"")!=std::string::npos);
+    RS2_CHECK(text.find("\"schema\":2")!=std::string::npos && text.find("\"version\":\"0.4.2.0\"")!=std::string::npos);
     RS2_CHECK(text.find("\"run_id\":\"000102030405060708090a0b0c0d0e0f\"")!=std::string::npos);
     RS2_CHECK(text.find("\"mode\":\"repair\"")!=std::string::npos && text.find("\"qualified_steam_api_sha256\":")!=std::string::npos);
     for (const auto type:{"state","request","witness","builder-enter","builder-return","builder-unwind","anchor"})

@@ -172,8 +172,8 @@ bool CheckArtifactContract(const wchar_t* path, ArtifactKind kind, ContractRepor
     else {
         const auto& version = report->version;
         const VersionQuad expectedVersion{0, static_cast<WORD>(IsReportingCompanion(kind) ? 4 : IsObserverCompanion(kind) ? 3 : 2),
-            static_cast<WORD>(IsReportingCompanion(kind) ? 1 : 0), 0};
-        const wchar_t* expectedVersionText = IsReportingCompanion(kind) ? L"0.4.1.0" : IsObserverCompanion(kind) ? L"0.3.0.0" : L"0.2.0.0";
+            static_cast<WORD>(IsReportingCompanion(kind) ? 2 : 0), 0};
+        const wchar_t* expectedVersionText = IsReportingCompanion(kind) ? L"0.4.2.0" : IsObserverCompanion(kind) ? L"0.3.0.0" : L"0.2.0.0";
         Require(version.fileVersion == expectedVersion && version.productVersion == expectedVersion &&
             version.fileVersionText == expectedVersionText && version.productVersionText == expectedVersionText, "version_mismatch", report);
         Require(version.translations.size() == 1 && version.translations[0] == std::pair<WORD, WORD>{WORD{0x0409}, WORD{0x04B0}},

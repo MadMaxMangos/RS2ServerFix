@@ -337,7 +337,7 @@ function Assert-ReportSnapshot($Snapshot, $First) {
     }
     Assert-ReportFields $f @{ host_sha256=$script:ReportHostHash; sdk_sha256=$script:ReportSdkHash;
         steamclient_sha256=$script:ReportClientHash; 'reporting.schema'='2'; 'reporting.bytes'='1288';
-        'reporting.artifact_version'='262400'; 'reporting.header_validity'='31';
+        'reporting.artifact_version'='262656'; 'reporting.header_validity'='31';
         'reporting.pid'=$f['pid'];'reporting.process_creation'=$f['process_creation_filetime'];
         observed_bootstrap_sha256=$f['bootstrap_sha256'];observed_companion_sha256=$f['companion_sha256'];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -438,7 +438,7 @@ function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64
                 if ($r[$key] -isnot [uint64]) { throw 'Startup numeric field has wrong JSON type.' }
             }
             if ($null -ne $startup -or $count -ne 1) { throw 'Duplicate/misplaced reporting startup.' }
-            Assert-ReportFields $r @{ schema='2'; artifact='RS2ServerFix-steam-reporting'; version='0.4.1.0'; artifact_version='262400';
+            Assert-ReportFields $r @{ schema='2'; artifact='RS2ServerFix-steam-reporting'; version='0.4.2.0'; artifact_version='262656';
                 run_id=$Identity['reporting.run_id']; pid=$Identity['pid']; process_start_filetime=$Identity['process_creation_filetime'];
                 qpc_frequency=$Identity['reporting.qpc_frequency']; configured_mode=$Identity['reporting.mode']; header_validity='31';
                 record_bytes='256'; ring_capacity='256'; batch_limit='32'; max_log_bytes=[string]$QuotaBytes }
@@ -1097,7 +1097,7 @@ function Read-ReportMarker([string]$Path, [string]$Executable, [uint32]$Selected
     if (![IO.Path]::GetFileName($plain).Equals("RS2ServerFix.loader.$SelectedId.log",[StringComparison]::OrdinalIgnoreCase)) { throw 'Loader marker PID filename mismatch.' }
     $stream=[RS2ReportCollection.Files]::Open($plain,$false); $Locks.Add($stream)
     $text=Read-ReportText $stream 8192; $fields=Read-ReportFields $text
-    $required=@{schema='3';version='0.4.1.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
+    $required=@{schema='3';version='0.4.2.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
         executable_size=[string](Get-Item -LiteralPath $Executable).Length;sha256=$script:ReportHostHash;build_identity='current-full-dump';
         bootstrap='X3DAudio1_7.dll';bootstrap_beside_executable='true';companion='RS2ServerFix.dll';companion_beside_executable='true';
         genuine_module='system32';genuine_initialize_present='true';genuine_calculate_present='true';trigger='exe-crt-initialize';

@@ -408,7 +408,7 @@ set(RS2_REPORTING_SOURCES
   src/companion/steam_reporting_task.cpp src/companion/steam_reporting_client.cpp
   src/companion/steam_reporting_runtime.cpp src/companion/steam_reporting_forward.cpp)
 rs2_companion(rs2_server_fix_companion_reporting production/reporting
-  "RS2ServerFix Active Recon Steam Reporting Companion" "0.4.1.0" "0,4,1,0"
+  "RS2ServerFix Active Recon Steam Reporting Companion" "0.4.2.0" "0,4,2,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_server_fix_companion_reporting PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
 target_compile_definitions(rs2_server_fix_companion_reporting PRIVATE
@@ -470,7 +470,7 @@ add_custom_command(OUTPUT "${RS2_REPORTING_FIXTURE_PROFILE}"
 add_custom_target(rs2_reporting_fixture_profiles DEPENDS "${RS2_REPORTING_FIXTURE_PROFILE}")
 rs2_bootstrap(rs2_reporting_fixture_bootstrap test-reporting/bootstrap "RS2ServerFix Test Fixture Bootstrap")
 rs2_companion(rs2_reporting_fixture_companion test-reporting/companion
-  "RS2ServerFix Test Fixture Steam Reporting Companion" "0.4.1.0" "0,4,1,0"
+  "RS2ServerFix Test Fixture Steam Reporting Companion" "0.4.2.0" "0,4,2,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_reporting_fixture_companion PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
 target_compile_definitions(rs2_reporting_fixture_companion PRIVATE RS2_RECON_ACTIVE RS2_STEAM_OBSERVER RS2_STEAM_REPORTING)
@@ -493,14 +493,14 @@ add_test(NAME reporting_startup_cases COMMAND rs2_reporting_startup_runner
   --bootstrap $<TARGET_FILE:rs2_reporting_fixture_bootstrap>
   --companion $<TARGET_FILE:rs2_reporting_fixture_companion>
   --sdk $<TARGET_FILE:rs2_reporting_test_api> --client $<TARGET_FILE:rs2_reporting_test_client>
-  --expected-companion-version 0.4.1.0
+  --expected-companion-version 0.4.2.0
   --genuine-manifest "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest")
 add_test(NAME reporting_timing_calibration COMMAND rs2_reporting_startup_runner
   --host $<TARGET_FILE:rs2_reporting_startup_fixture>
   --bootstrap $<TARGET_FILE:rs2_reporting_fixture_bootstrap>
   --companion $<TARGET_FILE:rs2_reporting_fixture_companion>
   --sdk $<TARGET_FILE:rs2_reporting_test_api> --client $<TARGET_FILE:rs2_reporting_test_client>
-  --expected-companion-version 0.4.1.0
+  --expected-companion-version 0.4.2.0
   --genuine-manifest "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest"
   --calibration-only)
 # The runner's 900-second owned-child timeout must precede the enclosing test.

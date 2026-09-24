@@ -8,7 +8,7 @@
 namespace rs2fix::reporting {
 inline constexpr std::uint64_t kStatusMagic = 0x3154505232535255ULL;
 inline constexpr std::uint32_t kStatusSchema = 2;
-inline constexpr std::uint32_t kReportingArtifactVersion = 0x00040100U; // 0.4.1.0
+inline constexpr std::uint32_t kReportingArtifactVersion = 0x00040200U; // 0.4.2.0
 inline constexpr std::size_t kStatusReasonSlots = 64;
 inline constexpr std::size_t kStatusDurationClasses = 4;
 inline constexpr std::size_t kStatusDurationBuckets = 6;

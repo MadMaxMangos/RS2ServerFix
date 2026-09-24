@@ -13,9 +13,12 @@ release. It is not a general performance patch or a fix for every server crash.
 
 Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
 companion is **0.3.0.0** and requires its own qualified trial package.
-Native advertisement recovery is a separate **0.4.1.0 experimental target**,
-entering limited operator-authorized server trials. It is not a generally
-qualified production release or a proven Steam-outage fix.
+Native advertisement recovery is a separate **0.4.2.0 experimental target**
+for limited operator-authorized trials. This revision allows the observed
+negative-spectator and over-capacity human accounting drift without replacing
+the game's native advertised counts or changing authentication. Bot/capacity,
+memory and lifecycle safeguards remain. It is not a generally qualified
+production release or a proven Steam-outage fix.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
   exact executable hash, expected instruction bytes and startup checks.

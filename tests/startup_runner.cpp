@@ -61,7 +61,7 @@ void Usage() {
 #if defined(RS2_REPORTING_RUNNER)
     std::cout << "rs2_reporting_startup_runner --host <absolute-file> --bootstrap <absolute-file>\n"
         "  --companion <absolute-file> --sdk <absolute-inert-fixture-dll> --client <absolute-inert-client-dll>\n"
-        "  --expected-companion-version 0.4.1.0 --genuine-manifest <absolute-file> [--calibration-only]\n"
+        "  --expected-companion-version 0.4.2.0 --genuine-manifest <absolute-file> [--calibration-only]\n"
         "Sole --help performs no process or file work.\n";
 #elif defined(RS2_OBSERVER_RUNNER)
     std::cout << "rs2_observer_startup_runner --host <absolute-file> --bootstrap <absolute-file>\n"
@@ -91,8 +91,8 @@ bool Parse(int argc, wchar_t** argv, Inputs* inputs) {
         const std::wstring_view key(argv[i]);
         if (key == L"--expected-companion-version") {
 #if defined(RS2_REPORTING_RUNNER)
-            if (!inputs->expectedVersion.empty() || std::wcscmp(argv[i + 1], L"0.4.1.0")) return false;
-            inputs->expectedVersion = "0.4.1.0";
+            if (!inputs->expectedVersion.empty() || std::wcscmp(argv[i + 1], L"0.4.2.0")) return false;
+            inputs->expectedVersion = "0.4.2.0";
 #else
             if (!inputs->expectedVersion.empty() || std::wcscmp(argv[i + 1], L"0.3.0.0")) return false;
             inputs->expectedVersion = "0.3.0.0";

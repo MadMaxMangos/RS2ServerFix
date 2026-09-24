@@ -100,10 +100,12 @@ public:
 
         GameFields game{};
         if (!Field(id.game, 0x2E0, game)) return Reason::SourceUnavailable;
-        if (game.spectators < 0 || game.maximum < 0 || game.maximum > 255 || game.humans < 0 || game.bots < 0 ||
-            static_cast<std::uint64_t>(game.humans) + static_cast<std::uint64_t>(game.bots) >
-                static_cast<std::uint64_t>(game.maximum)) return Reason::UnsupportedCounts;
-        if (game.spectators) return Reason::SpectatorsPresent;
+        // Human/spectator accounting can drift and is not the advertised count.
+        // Bots are staged into the native wrapper: reject B>M here, before the
+        // store and the producer's later sticky-fault check. Never clamp H or S.
+        if (game.maximum < 0 || game.maximum > 255 || game.humans < 0 ||
+            game.bots < 0 || game.bots > game.maximum) return Reason::UnsupportedCounts;
+        if (game.spectators > 0) return Reason::SpectatorsPresent;
         output.humans = static_cast<std::uint32_t>(game.humans);
         output.bots = static_cast<std::uint32_t>(game.bots);
         output.maximum = static_cast<std::uint32_t>(game.maximum);

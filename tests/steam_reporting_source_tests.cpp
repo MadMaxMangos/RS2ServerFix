@@ -181,6 +181,9 @@ struct Fixture {
             else if (f.mutation == 6) f.Put(kHost,std::uint16_t{0});
             else if (f.mutation == 7) f.Find(kHost)->region.protect=PAGE_NOACCESS;
             else if (f.mutation == 8) f.Put(kInfo+0x0C,std::uint64_t{1ULL<<61});
+            else if (f.mutation == 9) f.Put(kGame+0x2E0,std::int32_t{-3});
+            else if (f.mutation == 10) f.Put(kGame+0x2E0,std::int32_t{0});
+            else if (f.mutation == 11) f.Put(kGame+0x2E0,std::int32_t{1});
         }
         return !f.rejectInterface && object == kInterface && lifecycle == kLifecycle;
     }
@@ -270,17 +273,68 @@ void ReadinessAndCounts() {
     }
     { Fixture f; f.Put(kGame + 0x2E0, std::int32_t{1}); RS2_CHECK(f.Run() == Reason::SpectatorsPresent); }
     { Fixture f; f.Put(kWrapper + 0x9C, std::int32_t{63}); RS2_CHECK(f.Run() == Reason::CapacityMismatch); }
-    for (const auto address : {kGame + 0x2E0, kGame + 0x2E4, kGame + 0x2EC, kGame + 0x2F0,
+    for (const auto address : {kGame + 0x2E4, kGame + 0x2EC, kGame + 0x2F0,
         kWrapper + 0x94, kWrapper + 0x98}) {
         Fixture f; f.Put(address, std::int32_t{-1}); RS2_CHECK(f.Run() == Reason::UnsupportedCounts);
     }
     { Fixture f; f.Put(kGame + 0x2E4, std::int32_t{256}); RS2_CHECK(f.Run() == Reason::UnsupportedCounts); }
     { Fixture f; f.Put(kGame + 0x2EC, INT32_MAX); f.Put(kGame + 0x2F0, INT32_MAX);
       RS2_CHECK(f.Run() == Reason::UnsupportedCounts); }
-    { Fixture f; f.Put(kGame + 0x2EC, std::int32_t{41}); RS2_CHECK(f.Run() == Reason::UnsupportedCounts); }
     { Fixture f; f.Put(kWrapper + 0x98, std::int32_t{4097}); RS2_CHECK(f.Run() == Reason::UnsupportedCounts); }
     for (const auto field : {kWrapper + 0xA0, kWrapper + 0xA1}) {
         Fixture f; f.Put(field, std::uint8_t{2}); RS2_CHECK(f.Run() == Reason::SourceUnavailable);
+    }
+}
+void DiagnosticCountDrift() {
+    struct Case {
+        std::int32_t spectators, humans, bots, maximum, pi;
+        Reason expected;
+    };
+    const Case cases[]{
+        {-1,63,0,64,62,Reason::None}, {-2,64,0,64,63,Reason::None},
+        {-3,65,0,64,63,Reason::None}, {0,65,0,64,63,Reason::None},
+        {0,41,24,64,63,Reason::None}, {0,0,64,64,64,Reason::None},
+        {0,0,65,64,64,Reason::UnsupportedCounts}, {0,1,0,0,1,Reason::None},
+        {INT32_MIN,INT32_MAX,0,64,63,Reason::None}
+    };
+    for (const auto& test:cases) {
+        Fixture f;
+        f.Put(kGame+0x2E0,test.spectators); f.Put(kGame+0x2EC,test.humans);
+        f.Put(kGame+0x2F0,test.bots); f.Put(kGame+0x2E4,test.maximum);
+        f.Put(kWrapper+0x94,test.bots); f.Put(kWrapper+0x98,test.pi);
+        f.Put(kWrapper+0x9C,test.maximum);
+        SourceSnapshot output{}; output.humans=777;
+        RS2_CHECK(f.Run(&output)==test.expected);
+        if (test.expected==Reason::None) {
+            // PI is independent native input, never reconstructed from H/S/B.
+            RS2_CHECK(output.humans==static_cast<std::uint32_t>(test.humans) &&
+                output.bots==static_cast<std::uint32_t>(test.bots) &&
+                output.maximum==static_cast<std::uint32_t>(test.maximum) &&
+                output.outer.pi==static_cast<std::uint32_t>(test.pi));
+            RS2_CHECK(f.interfaceCalls==2);
+        } else {
+            RS2_CHECK(output.humans==0 && output.identity.world==0 && f.interfaceCalls==0);
+        }
+    }
+}
+void DriftBetweenSourcePasses() {
+    for (const unsigned mutation:{9U,10U,11U,1U}) {
+        Fixture f;
+        f.Put(kGame+0x2E0,std::int32_t{-1}); f.Put(kGame+0x2EC,std::int32_t{65});
+        f.Put(kGame+0x2F0,std::int32_t{0});
+        f.Put(kWrapper+0x94,std::int32_t{0}); f.Put(kWrapper+0x98,std::int32_t{63});
+        // Accepted runs after the Game read: mutate only after pass one's fields.
+        f.mutateOnInterface=1; f.mutation=mutation;
+        const auto expected=mutation==11 ? Reason::SpectatorsPresent :
+            mutation==1 ? Reason::SourceLifetime : Reason::None;
+        SourceSnapshot output{}; output.humans=777;
+        RS2_CHECK(f.Run(&output)==expected);
+        RS2_CHECK(f.interfaceCalls==(mutation==11 ? 1U : 2U));
+        if (expected==Reason::None) {
+            RS2_CHECK(output.humans==65 && output.bots==0 && output.outer.pi==63);
+        } else {
+            RS2_CHECK(output.humans==0 && output.identity.world==0);
+        }
     }
 }
 void ClassAndProtectionGuards() {
@@ -534,6 +588,8 @@ void ReportingSourceTests() {
     QualifiedSnapshot();
     StructuralAndLifetimeGuards();
     ReadinessAndCounts();
+    DiagnosticCountDrift();
+    DriftBetweenSourcePasses();
     ClassAndProtectionGuards();
     ReobservationAndIdentity();
     GroupedReadFailureAndTear();

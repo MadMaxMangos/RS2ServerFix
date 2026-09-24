@@ -606,7 +606,7 @@ void ReportNotice(const reporting::StatusHeader* header, bool ready,
     if (identified) Hex(header->runId, sizeof(header->runId), runId);
     const auto mode = header ? static_cast<reporting::Mode>(header->configuredMode) : reporting::Mode::Invalid;
     const int count = std::snprintf(report.line, sizeof(report.line),
-        "[RS2SteamReport] v0.4.1.0; status=%s; mode=%s; reason=%s; run_id=%s; pid=%lu\r\n",
+        "[RS2SteamReport] v0.4.2.0; status=%s; mode=%s; reason=%s; run_id=%s; pid=%lu\r\n",
         ready ? "ready" : "disabled", reporting::ModeName(mode), reporting::ReasonName(reason),
         identified ? runId : "unavailable", header ? static_cast<DWORD>(header->pid) : 0UL);
     if (count > 0 && static_cast<std::size_t>(count) < sizeof(report.line)) {
@@ -642,7 +642,7 @@ bool ReportingStartup(Writer& writer) noexcept {
     Hex(identities.steamClientDigest.data(), identities.steamClientDigest.size(), client);
     JsonBuffer json(writer.formatBuffer, kAnchorBytes);
     json.Append("{\"type\":\"startup\",\"schema\":2,\"artifact\":\"RS2ServerFix-steam-reporting\","
-        "\"version\":\"0.4.1.0\",\"artifact_version\":%u,\"run_id\":\"%s\",\"pid\":%u,"
+        "\"version\":\"0.4.2.0\",\"artifact_version\":%u,\"run_id\":\"%s\",\"pid\":%u,"
         "\"process_start_filetime\":%llu,\"qpc_frequency\":%llu,\"utc_filetime\":%llu,"
         "\"qpc\":%lld,\"mode\":\"%s\",\"configured_mode\":%u,\"header_validity\":%u,"
         "\"host_sha256\":\"%s\",\"qualified_steam_api_sha256\":\"%s\","
