@@ -47,6 +47,9 @@ constexpr bool EqualCounts(const NativeCounts& a, const NativeCounts& b) noexcep
     return a.pi == b.pi && a.bots == b.bots && a.maximum == b.maximum;
 }
 struct Config { Mode mode; };
+enum class Diagnostics : std::uint32_t { Invalid = 0, Normal, Detailed };
+struct ConfigV3 { Mode mode; Diagnostics diagnostics; };
+inline constexpr std::uint32_t kConfigSchemaV3 = 3;
 inline constexpr std::uint32_t kConfigSchema = 2;
 inline constexpr std::size_t kConfigBytes = 4096;
 inline constexpr std::size_t kJsonBytes = 65536;
@@ -59,6 +62,7 @@ inline constexpr std::uint32_t kFreshnessSeconds = 45;
 inline constexpr std::uint32_t kManagementHz = 4;
 
 const char* ModeName(Mode) noexcept;
+const char* DiagnosticsName(Diagnostics) noexcept;
 const char* ReasonName(Reason) noexcept;
 static_assert(std::is_trivial_v<NativeCounts> && std::is_standard_layout_v<NativeCounts>);
 } // namespace rs2fix::reporting

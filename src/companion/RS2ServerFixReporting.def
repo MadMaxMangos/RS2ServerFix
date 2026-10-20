@@ -1,4 +1,5 @@
 LIBRARY RS2ServerFix
 EXPORTS
     RS2ServerFix_InitializeV3 @1
-    RS2SteamReport_StatusV2 @2 DATA
+    RS2SteamReport_StatusV3 @2 DATA
+    RS2LeechRecovery_StatusV1 @3 DATA

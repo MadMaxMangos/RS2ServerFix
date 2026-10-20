@@ -2,7 +2,8 @@
 #include "deployment_preflight.h"
 #include "companion/recon_profile.h"
 #include "pe_contract_lib.h"
-#include "shared/steam_reporting_status.h"
+#include "shared/steam_reporting_snapshot_v3.h"
+#include "shared/leech_recovery_status.h"
 #include <memory>
 
 namespace rs2fix::tooling {
@@ -28,6 +29,7 @@ struct RuntimeModule : RawRuntimeModule {
     pe::Image image{};
     bool x3audioExports{}, companionExports{};
     RuntimeReportingExport reportingStatus;
+    RuntimeReportingExport recoveryStatus;
 };
 struct RuntimeInventoryOps {
     void* context{};
@@ -62,7 +64,7 @@ struct RuntimeValidationInputs {
     RuntimeExpectation expectation{};
     DeploymentMode mode{};
     bool observerCompanion{}; // Requires active recon and proxy-pass; default contracts stay unchanged.
-    bool reportingCompanion{}; // Explicit 0.4 contract; mutually exclusive with observerCompanion.
+    bool reportingCompanion{}; // Explicit 0.6/V3 contract; mutually exclusive with observerCompanion.
     ExpectedReconState expectedRecon{};
     Sha256Digest bootstrapSha256{}, companionSha256{};
     GenuineManifest genuineManifest;
@@ -82,9 +84,16 @@ struct ReportingStatusObservation {
     std::uint32_t attempts{};
     std::uint64_t observedQpc{}, ownerSequence{};
     std::uint64_t revokeReasons{}, lossReasons{}, stopping{}, stoppedQpc{};
-    std::uint64_t recordsWritten{}, lastFlushedSequence{};
+    bool logIdentityAvailable{}, consoleDiagnosticsAvailable{}, workerPauseChanged{};
+    std::uint64_t workerSequence{}, consoleSequence{}, workerPauseReason{}, fatalTransportReason{};
+    reporting::OwnerTransport transport{};
+    reporting::WorkerTransport worker{};
+    reporting::ConsoleDiagnostics console{};
+    reporting::LogIdentity log{};
     reporting::StatusHeader header{};
     reporting::StatusPayload owner{};
+    reporting::RecoverySnapshotResult recoveryResult{reporting::RecoverySnapshotResult::Unavailable};
+    reporting::RecoveryStatusSnapshot recovery{};
     std::string detail;
 };
 struct RuntimeValidationResult {

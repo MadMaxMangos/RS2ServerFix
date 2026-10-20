@@ -1,6 +1,7 @@
 #include "pe_contract_lib.h"
 #include "tool_paths.h"
-#include "shared/steam_reporting_status.h"
+#include "shared/steam_reporting_status_v3.h"
+#include "shared/leech_recovery_status.h"
 #include <algorithm>
 #include <set>
 namespace rs2fix::tooling {
@@ -46,11 +47,12 @@ bool CodeExport(const pe::Image& image, const pe::ExportSymbol& symbol) {
 }
 void CheckExports(const pe::Image& image, ArtifactKind kind, ContractReport* report) {
     const bool bootstrap = IsBootstrap(kind), reporting = IsReportingCompanion(kind);
-    const std::size_t count = bootstrap || reporting ? 2 : 1;
+    const std::size_t count = reporting ? 3 : bootstrap ? 2 : 1;
     Require(image.exportFunctionCount == count && image.exports.size() == count, "export_count_mismatch", report);
     bool calculate = false, initialize = false, companion = false;
     for (const auto& symbol : image.exports) {
-        if (reporting && symbol.name == "RS2SteamReport_StatusV2" && symbol.ordinal == 2) continue;
+        if (reporting && symbol.name == "RS2SteamReport_StatusV3" && symbol.ordinal == 2) continue;
+        if (reporting && symbol.name == "RS2LeechRecovery_StatusV1" && symbol.ordinal == 3) continue;
         Require(CodeExport(image, symbol), "export_not_direct_code", report);
         if (bootstrap && symbol.name == "X3DAudioCalculate" && symbol.ordinal == 1) calculate = true;
         else if (bootstrap && symbol.name == "X3DAudioInitialize" && symbol.ordinal == 2) initialize = true;
@@ -59,24 +61,29 @@ void CheckExports(const pe::Image& image, ArtifactKind kind, ContractReport* rep
     }
     Require(bootstrap ? calculate && initialize : companion, "required_export_missing", report);
     if (reporting) {
-        std::uint32_t statusRva{};
-        Require(ReportingStatusExport(image, &statusRva), "reporting_status_export_mismatch", report);
+        std::uint32_t statusRva{}, recoveryRva{};
+        const bool statusValid=ReportingStatusExport(image, &statusRva), recoveryValid=RecoveryStatusExport(image, &recoveryRva);
+        Require(statusValid, "reporting_status_export_mismatch", report);
+        Require(recoveryValid, "recovery_status_export_mismatch", report);
+        if (statusValid && recoveryValid) Require(
+            static_cast<std::uint64_t>(statusRva)+sizeof(reporting::StatusWireV3)<=recoveryRva ||
+            static_cast<std::uint64_t>(recoveryRva)+sizeof(reporting::RecoveryStatusWireV1)<=statusRva,
+            "reporting_recovery_status_exports_overlap", report);
     }
 }
 }
-bool ReportingStatusExport(const pe::Image& image, std::uint32_t* rva) noexcept {
+namespace {
+bool DataStatusExport(const pe::Image& image, const char* name, std::uint32_t ordinal,
+    std::size_t bytes, std::size_t alignment, std::uint32_t* rva) noexcept {
     if (!rva) return false;
     *rva = 0;
     const pe::ExportSymbol* status = nullptr;
     unsigned names = 0, ordinals = 0;
     for (const auto& symbol : image.exports) {
-        if (symbol.name == "RS2SteamReport_StatusV2") { status = &symbol; ++names; }
-        if (symbol.ordinal == 2) ++ordinals;
+        if (symbol.name == name) { status = &symbol; ++names; }
+        if (symbol.ordinal == ordinal) ++ordinals;
     }
-    constexpr std::size_t bytes = sizeof(reporting::StatusWire);
-    constexpr std::size_t alignment = alignof(reporting::StatusWire);
-    static_assert(bytes == 1288 && alignment == 8);
-    if (names != 1 || ordinals != 1 || !status || status->ordinal != 2 || !status->forwarder.empty() ||
+    if (names != 1 || ordinals != 1 || !status || status->ordinal != ordinal || !status->forwarder.empty() ||
         !status->rva || status->rva % alignment || status->rva >= image.sizeOfImage ||
         bytes > static_cast<std::uint64_t>(image.sizeOfImage) - status->rva) return false;
     const auto end = static_cast<std::uint64_t>(status->rva) + bytes;
@@ -96,6 +103,15 @@ bool ReportingStatusExport(const pe::Image& image, std::uint32_t* rva) noexcept 
     if (containing != 1) return false;
     *rva = status->rva;
     return true;
+}
+}
+bool ReportingStatusExport(const pe::Image& image, std::uint32_t* rva) noexcept {
+    static_assert(sizeof(reporting::StatusWireV3) == 3896 && alignof(reporting::StatusWireV3) == 8);
+    return DataStatusExport(image,"RS2SteamReport_StatusV3",2,sizeof(reporting::StatusWireV3),8,rva);
+}
+bool RecoveryStatusExport(const pe::Image& image, std::uint32_t* rva) noexcept {
+    static_assert(sizeof(reporting::RecoveryStatusWireV1) == 256 && alignof(reporting::RecoveryStatusWireV1) == 8);
+    return DataStatusExport(image,"RS2LeechRecovery_StatusV1",3,sizeof(reporting::RecoveryStatusWireV1),8,rva);
 }
 bool ParseArtifactKind(std::wstring_view text, ArtifactKind* kind) noexcept {
     if (!kind) return false;
@@ -134,6 +150,8 @@ bool CheckArtifactContract(const wchar_t* path, ArtifactKind kind, ContractRepor
     Require(image.delayImports.empty(), "delay_imports_present", report);
     std::set<std::string> expected{"kernel32.dll"};
     if (!IsBootstrap(kind) && kind != ArtifactKind::StartupFixture && kind != ArtifactKind::ObserverStartupFixture && kind != ArtifactKind::ReportingStartupFixture) expected.insert("bcrypt.dll");
+    // Reporting uses ACL/token inspection only for the opt-in recovery control
+    // boundary. The observer retains its independent private-writer contract.
     if (IsObserverCompanion(kind) || IsReportingCompanion(kind)) expected.insert("advapi32.dll");
     if (kind == ArtifactKind::ObserverStartupFixture || kind == ArtifactKind::ReportingStartupFixture) expected.insert("rs2_test_steam_api.dll");
     if (IsExecutable(kind)) expected.insert("x3daudio1_7.dll");
@@ -145,6 +163,24 @@ bool CheckArtifactContract(const wchar_t* path, ArtifactKind kind, ContractRepor
         Require(!module.symbols.empty(), "empty_import_module", report);
     }
     Require(actual == expected, "direct_import_set_mismatch", report);
+    if (IsReportingCompanion(kind)) {
+        // Exact dependencies of the approved control ACL and account checks;
+        // no broader ADVAPI allowance for reporting or its companion fixture.
+        std::set<std::string> names;
+        for (const auto& module:image.normalImports) if (Lower(module.name)=="advapi32.dll")
+            for (const auto& symbol:module.symbols)
+                Require(!symbol.byOrdinal && names.insert(symbol.name).second,
+                    "reporting_control_named_import_mismatch", report);
+        const std::set<std::string> required{
+            "CheckTokenMembership", "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            "ConvertSidToStringSidW", "ConvertStringSidToSidW", "CopySid", "CreateWellKnownSid",
+            "DuplicateToken", "EqualSid", "GetAce", "GetLengthSid", "GetSecurityDescriptorDacl",
+            "GetSecurityDescriptorOwner", "GetSecurityInfo", "GetTokenInformation", "IsValidAcl",
+            "IsValidSecurityDescriptor", "IsValidSid", "IsWellKnownSid", "MapGenericMask",
+            "OpenProcessToken", "OpenThreadToken", "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            "ImpersonateNamedPipeClient", "RevertToSelf"};
+        Require(names==required, "reporting_control_import_set_mismatch", report);
+    }
     if (!IsExecutable(kind)) CheckExports(image, kind, report);
     else {
         bool found = false;
@@ -171,9 +207,9 @@ bool CheckArtifactContract(const wchar_t* path, ArtifactKind kind, ContractRepor
     if (!ReadVersionIdentity(normalized.c_str(), &report->version, &error)) report->findings.push_back("version:" + error);
     else {
         const auto& version = report->version;
-        const VersionQuad expectedVersion{0, static_cast<WORD>(IsReportingCompanion(kind) ? 4 : IsObserverCompanion(kind) ? 3 : 2),
-            static_cast<WORD>(IsReportingCompanion(kind) ? 2 : 0), 0};
-        const wchar_t* expectedVersionText = IsReportingCompanion(kind) ? L"0.4.2.0" : IsObserverCompanion(kind) ? L"0.3.0.0" : L"0.2.0.0";
+        const VersionQuad expectedVersion{0, static_cast<WORD>(IsReportingCompanion(kind) ? 6 : IsObserverCompanion(kind) ? 3 : 2),
+            static_cast<WORD>(IsReportingCompanion(kind) ? 2 : 0),0};
+        const wchar_t* expectedVersionText = IsReportingCompanion(kind) ? L"0.6.2.0" : IsObserverCompanion(kind) ? L"0.3.0.0" : L"0.2.0.0";
         Require(version.fileVersion == expectedVersion && version.productVersion == expectedVersion &&
             version.fileVersionText == expectedVersionText && version.productVersionText == expectedVersionText, "version_mismatch", report);
         Require(version.translations.size() == 1 && version.translations[0] == std::pair<WORD, WORD>{WORD{0x0409}, WORD{0x04B0}},

@@ -4,6 +4,7 @@
 #include "companion/sha256.h"
 #include "shared/digest.h"
 #include "../tests/steam_api_fixture.h"
+#include "../tests/steam_reporting_native_log_fixture.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -137,6 +138,65 @@ bool ReportingFixtureModule(const wchar_t* path, const char* signatureName,
     return signature && names==exports && rs2fix::HashBytesSha256(image->rawBytes.data(),image->rawBytes.size(),hash);
 }
 
+bool NativeLoggingFixtureProfile(const rs2fix::pe::Image& image,
+    const std::map<std::string,std::uint32_t>& symbols,std::ostringstream& out) {
+    using namespace rs2fix::fixture_log;
+    constexpr const char* tables[]{"FixtureNativeRedirectorVtable","FixtureNativeFileVtable",
+        "FixtureNativeArchiveVtable","FixtureNativeManagerVtable","FixtureNativeConsoleVtable",
+        "FixtureNativeInheritedVtable","FixtureNativeDebugVtable","FixtureNativeEventVtable"};
+    if(!symbols.count("FixtureNativeLog") || !symbols.count("FixtureNativeLogState")) return false;
+    for(const auto* name:tables) if(!symbols.count(name)) return false;
+    const auto entry=symbols.at("FixtureNativeLog"),state=symbols.at("FixtureNativeLogState");
+    const auto* stateSection=rs2fix::pe::FindSection(image,state,kBytes);
+    if(!stateSection || (stateSection->characteristics&(IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE|IMAGE_SCN_MEM_EXECUTE))!=
+        (IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE)) return false;
+    const auto& directory=image.dataDirectories[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    Bytes pdata;std::string error;
+    if(!directory.virtualAddress || !directory.size || directory.size%12 ||
+        !rs2fix::pe::ReadImageRva(image,directory.virtualAddress,directory.size,&pdata,&error)) return false;
+    std::uint32_t rowRva{},row[3]{};
+    for(std::size_t at=0;at<pdata.size();at+=12) {
+        std::uint32_t candidate[3]{};std::memcpy(candidate,pdata.data()+at,12);
+        if(candidate[0]!=entry) continue;
+        if(rowRva) return false;
+        rowRva=directory.virtualAddress+static_cast<std::uint32_t>(at);std::memcpy(row,candidate,12);
+    }
+    Bytes code,unwind;
+    if(!rowRva || row[1]<=entry || row[1]-entry>8192 || (row[2]&3) ||
+        !rs2fix::pe::ReadImageRva(image,entry,row[1]-entry,&code,&error) ||
+        !rs2fix::pe::ReadImageRva(image,row[2],4,&unwind,&error) || unwind[0]!=1) return false;
+    const auto unwindBytes=4+2*((static_cast<std::uint32_t>(unwind[2])+1)&~1U);
+    if(!rs2fix::pe::ReadImageRva(image,row[2],unwindBytes,&unwind,&error)) return false;
+    for(const auto* name:tables) {
+        const auto rva=symbols.at(name);Bytes pointer;std::uint64_t address{};
+        const auto* section=rs2fix::pe::FindSection(image,rva,8);
+        if(!section || (section->characteristics&(IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE|IMAGE_SCN_MEM_EXECUTE))!=IMAGE_SCN_MEM_READ ||
+            !rs2fix::pe::ReadImageRva(image,rva,8,&pointer,&error)) return false;
+        std::memcpy(&address,pointer.data(),8);if(address!=image.imageBase+entry) return false;
+    }
+    std::uint32_t write{};
+    for(const auto& module:image.normalImports) if(!_stricmp(module.name.c_str(),"KERNEL32.dll"))
+        for(const auto& symbol:module.symbols) if(!symbol.byOrdinal) {
+            if(symbol.name=="WriteFile") write=symbol.iatRva;
+        }
+    if(!write || (write&7)) return false;
+    out << "namespace reporting {\ninline constexpr std::uint8_t kFixtureNativeCode[]" << Array(code.data(),code.size())
+        << ";\ninline constexpr std::uint8_t kFixtureNativeUnwind[]" << Array(unwind.data(),unwind.size()) << ";\n"
+        << "inline constexpr ReportingSpan kFixtureNativeSpans[]{ {{" << entry << ",sizeof(kFixtureNativeCode),kFixtureNativeCode},SpanKind::Code},"
+        << "{{" << row[2] << ",sizeof(kFixtureNativeUnwind),kFixtureNativeUnwind},SpanKind::ImmutableData}};\n"
+        << "inline constexpr PointerRvaRecipe kFixtureNativePointers[]{";
+    for(const auto* name:tables) out << '{' << symbols.at(name) << ',' << entry << "},";
+    out << "};\ninline constexpr RuntimeFunctionRecipe kFixtureNativeExceptions[]{ {" << rowRva << ',' << entry << ',' << row[1] << ',' << row[2] << "}};\n"
+        << "inline constexpr PumpImportRecipe kFixtureNativeImports[]{ {" << write << ",\"KERNEL32.dll\",\"WriteFile\"}};\n"
+        << "inline constexpr NativeLoggingProfile kFixtureNativeLoggingProfile{{kFixtureNativeSpans,2,kFixtureNativePointers,8,kFixtureNativeExceptions,1,kFixtureNativeImports[0]},kFixtureNativeImports,1};\n"
+        << "inline constexpr std::uint32_t kFixtureNativeLogEntry=" << entry << ";\n"
+        << "inline constexpr NativeLogLayout kFixtureNativeLogLayout{" << state+kSlot << ',' << state+kRedirector << ','
+        << symbols.at(tables[0]) << ',' << symbols.at(tables[1]) << ',' << symbols.at(tables[4]) << ',' << symbols.at(tables[5]) << ','
+        << symbols.at(tables[6]) << ',' << symbols.at(tables[7]) << ',' << symbols.at(tables[2]) << ',' << state+kManagerSlot << ','
+        << symbols.at(tables[3]) << ',' << state+kForce << ',' << state+kCritical << ',' << state+kExit << ',' << state+kTimes << ','
+        << state+kInitialized << ',' << state+kNameSlot << ',' << state+kReentry << ',' << state+kReentry+4 << ',' << state+kReentry+8 << ',' << state+kReentry+12 << "};\n}\n";
+    return true;
+}
 bool ReportingProfile(const wchar_t* sdkPath, const wchar_t* clientPath,
     const rs2fix::pe::Image& image, const std::map<std::string,std::uint32_t>& symbols,
     const rs2fix::Sha256Digest& host, std::ostringstream& out) {
@@ -351,6 +411,7 @@ int wmain(int argc, wchar_t** argv) {
     out << "#pragma once\n#include \"shared/startup_profile.h\"\n#include \"companion/recon_profile.h\"\n";
     if (observer) out << "#include \"companion/steam_observer_profile.h\"\n";
     if (reporting) out << "#include \"companion/steam_reporting_profile.h\"\n"
+        "#include \"companion/steam_reporting_native_profile.h\"\n#include \"companion/steam_reporting_native_source.h\"\n"
         "#include \"companion/steam_reporting_source.h\"\n#include \"companion/steam_reporting_prepared.h\"\n"
         "#include \"companion/steam_reporting_task.h\"\n#include \"companion/steam_reporting_ancestry.h\"\n";
     out << "namespace rs2fix {\ninline constexpr char kFixtureOnlySignature[] = \"RS2-OWN-CODE-FIXTURE-NOT-FOR-DEPLOYMENT\";\n";
@@ -372,6 +433,7 @@ int wmain(int argc, wchar_t** argv) {
         << Array(original.data(), original.size()) << ',' << Array(corrected.data(), corrected.size()) << "};\n";
     if (observer && !ObserverProfile(argv[4], image, symbols, host, out,reporting)) return 18;
     if (reporting && !ReportingProfile(argv[4],argv[6],image,symbols,host,out)) return 19;
+    if (reporting && !NativeLoggingFixtureProfile(image,symbols,out)) return 20;
     out << "}\n";
     if (!Emit(argv[2], out.str())) return 17;
     std::printf("fixture_host_sha256=%s function_size=%zu generated=true\n",

@@ -2,6 +2,7 @@
 #include "test_framework.h"
 #include <array>
 #include <cwchar>
+#include <cstring>
 
 namespace rs2fix::testcases {
 namespace {
@@ -105,5 +106,49 @@ void RunPathTests() {
     RS2_CHECK(QueryFileIdentity(output, &identity, &error));
     RS2_CHECK(SameFileIdentity(identity, identity));
     RS2_CHECK(!SameFileIdentity(identity, {}));
+
+    // Bind V3 receipts to the held file, preserving the complete 128-bit ID.
+    // The running test image is sufficient; no server log or game is opened.
+    HANDLE file = CreateFileW(output, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    RS2_CHECK(file != INVALID_HANDLE_VALUE);
+    if (file != INVALID_HANDLE_VALUE) {
+        FILE_ID_INFO native{};
+        FileIdentity128 full{};
+        RS2_CHECK(GetFileInformationByHandleEx(file, FileIdInfo, &native, sizeof(native)));
+        RS2_CHECK(QueryFileIdentity128(file, &full, &error));
+        RS2_CHECK(error == ERROR_SUCCESS && full.valid);
+        RS2_CHECK(full.volumeSerial == native.VolumeSerialNumber);
+        RS2_CHECK(std::memcmp(full.fileId, native.FileId.Identifier, sizeof(full.fileId)) == 0);
+        RS2_CHECK(SameFileIdentity128(full, full));
+        RS2_CHECK(!SameFileIdentity128(full, {}));
+        auto changed = full;
+        changed.fileId[15] ^= 1;
+        RS2_CHECK(!SameFileIdentity128(full, changed));
+        changed = full;
+        changed.volumeSerial ^= (1ULL << 63);
+        RS2_CHECK(!SameFileIdentity128(full, changed));
+        // A failed query must erase a previous successful identity, and must
+        // not close the caller's handle even on argument rejection.
+        RS2_CHECK(!QueryFileIdentity128(nullptr, &full, &error));
+        RS2_CHECK(!full.valid && error == ERROR_INVALID_PARAMETER);
+        RS2_CHECK(!QueryFileIdentity128(file, nullptr, &error));
+        RS2_CHECK(QueryFileIdentity128(file, &full, &error));
+        RS2_CHECK(!QueryFileIdentity128(INVALID_HANDLE_VALUE, &full, &error));
+        RS2_CHECK(!full.valid && error == ERROR_INVALID_PARAMETER);
+        RS2_CHECK(CloseHandle(file));
+    }
+    // A non-file handle exercises the OS-query failure, not just input checks.
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    RS2_CHECK(event != nullptr);
+    if (event != nullptr) {
+        FileIdentity128 invalid{};
+        invalid.valid = true;
+        RS2_CHECK(!QueryFileIdentity128(event, &invalid, &error));
+        RS2_CHECK(!invalid.valid && error != ERROR_SUCCESS);
+        RS2_CHECK(SetEvent(event));
+        RS2_CHECK(CloseHandle(event));
+    }
 }
 } // namespace rs2fix::testcases

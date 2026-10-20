@@ -6,6 +6,7 @@ struct ReportExpected {
     bool writer;
     report::Mode mode;
     report::Reason reason;
+    bool waiting{};
 };
 ReportExpected ReportExpectation(unsigned scenario) {
     switch (scenario) {
@@ -14,9 +15,9 @@ ReportExpected ReportExpectation(unsigned scenario) {
     case 2: return {false,false,report::Mode::Invalid,report::Reason::ConfigMissing};
     case 3: return {false,false,report::Mode::Disabled,report::Reason::ConfigDisabled};
     case 4: return {false,false,report::Mode::Invalid,report::Reason::ConfigInvalid};
-    case 5: return {false,false,report::Mode::Repair,report::Reason::ObserverRequired};
+    case 5: return {true,true,report::Mode::Repair,report::Reason::None}; // Observer INI no longer gates reporting.
     case 6: case 12: return {false,false,report::Mode::Repair,report::Reason::SdkMismatch};
-    case 7: return {false,false,report::Mode::Repair,report::Reason::WriterFailed};
+    case 7: return {false,true,report::Mode::Repair,report::Reason::None,true};
     case 8: case 9: return {false,true,report::Mode::Repair,report::Reason::SteamClientMismatch};
     case 10: return {false,true,report::Mode::Repair,report::Reason::InitFailed};
     case 11: return {false,false,report::Mode::Repair,report::Reason::ReconIneligible};
@@ -41,14 +42,14 @@ bool StageReporting(const Inputs& inputs,const Scenario& scenario,const std::wst
     if (!CreateText(Join(directory,L"RS2SteamObserve.ini"),mode==5 ? "enabled=0\r\n" :
         "enabled=1\r\nmax_log_mib=16\r\n")) return false;
     if (mode!=2) {
-        const char* config=mode==0 ? "schema=2\r\nmode=observe\r\n" :
-            mode==3 ? "schema=2\r\nmode=disabled\r\n" : mode==4 ? "schema=2\r\nmode=repair\r\nmode=repair\r\n" :
-            "schema=2\r\nmode=repair\r\n";
+        const char* config=mode==0 ? "schema=3\r\nmode=observe\r\ndiagnostics=normal\r\n" :
+            mode==3 ? "schema=3\r\nmode=disabled\r\ndiagnostics=normal\r\n" : mode==4 ? "schema=3\r\nmode=repair\r\nmode=repair\r\ndiagnostics=normal\r\n" :
+            "schema=3\r\nmode=repair\r\ndiagnostics=normal\r\n";
         if (!CreateText(Join(directory,L"RS2SteamReport.ini"),config)) return false;
     }
     if (mode==6 && !AppendOwnOverlay(Join(directory,L"rs2_test_steam_api.dll"),"owned-reporting-sdk-overlay")) return false;
     if (mode==9 && !AppendOwnOverlay(Join(directory,kFixtureSteamClientLeaf),"owned-reporting-client-overlay")) return false;
-    if (mode==7 && !CreateText(Join(directory,L"RS2SteamReport"),"owned-obstruction")) return false;
+    if (mode==7 && !CreateText(Join(directory,L"Launch.log"),"owned-obstruction")) return false;
     return true;
 }
 bool UnsignedText(const std::string& text,std::uint64_t* value) {
@@ -103,6 +104,10 @@ bool TimingAdd(std::uint64_t& total,std::uint64_t value) {
     total+=value; return true;
 }
 bool TimingOrdinals(const Child& child,const FixtureTiming& timing) {
+    std::map<std::string,std::string> fixture;
+    std::uint64_t warm{};
+    if(!OutputFields(child.output,"report_fixture=",&fixture) ||
+        !FieldUnsigned(fixture,"logger_warm_pumps",&warm) || warm>20) return false;
     report::DurationCounters all[4]{},main[4]{};
     std::uint64_t residual[4]{},maxima[4]{},auxCalls[4]{},auxTicks[4]{};
     std::uint64_t previousPumpAfter{},priorPumpAfter{},currentPumpBefore{},previousBuilderAfter{};
@@ -117,7 +122,7 @@ bool TimingOrdinals(const Child& child,const FixtureTiming& timing) {
         const bool selected=index>=6003 && (index-6003)%2==0;
         const bool tail=index==8048;
         const auto expectedOrdinal=index<=6001 ? index : 6002+(index-6002)/2;
-        const auto expectedCall=selected ? 6+(index-6003)/2 : 5+expectedOrdinal;
+        const auto expectedCall=selected ? 6+(index-6003)/2 : 5+warm+expectedOrdinal;
         const char* role=index==0 ? "warmup" : (index<=6000 ? "main" :
             (index==6001 ? "bridge" : (selected ? "selected" : "support")));
         if (!OutputFields(child.output.substr(at,end-at+1),prefix.c_str(),&values) || values.size()!=13 ||
@@ -181,7 +186,8 @@ bool ReadFixtureTiming(const Child& child,std::uint64_t frequency,FixtureTiming*
         !OutputFields(child.output,"report_timing=",&fields) || !FieldEquals(fields,"report_timing","pass") ||
         !FieldEquals(fields,"failure_reason","none") ||
         !FieldEquals(fields,"measurement_id","rs2-wrapper-own-deferred-v2") ||
-        !FieldEquals(fields,"protocol_id","rs2-deferred-v2-fixed6000-1024") ||
+        !FieldEquals(fields,"protocol_id","rs2-native-log-v3-writefile-fixed6000-1024-350ms") ||
+        !FieldEquals(fields,"main_pump_sleep_ms","50") || !FieldEquals(fields,"builder_support_sleep_ms","350") ||
         !FieldEquals(fields,"envelope","outer-wrapper-minus-recorded-own-minus-inner-original") ||
         !FieldEquals(fields,"inner_original_pairs","exact-call-checked") ||
         !FieldEquals(fields,"residual_bound","empirical-not-wcrt") ||
@@ -301,61 +307,56 @@ bool ReportingLogEvidence(const Inputs& inputs,const Scenario& scenario,const Ch
     const std::wstring& directory,const std::map<std::string,std::string>& before,
     const std::map<std::string,std::string>& after) {
     const auto expected=ReportExpectation(scenario.reportMode);
-    const auto resultRoot=Join(directory,L"RS2SteamReport");
-    if (!Absent(Join(directory,L"RS2SteamObserve")) || !Absent(Join(directory,L"RS2SteamObserveKeys"))) return false;
-    if (!expected.writer) {
-        if (scenario.reportMode!=7) return Absent(resultRoot);
-        std::string obstruction;
-        return Read(resultRoot,&obstruction,64) && obstruction=="owned-obstruction";
-    }
-    const auto run=before.find("run_id");
-    if (run==before.end() || !HexString(run->second,32)) return false;
-    const auto attributes=GetFileAttributesW(resultRoot.c_str());
-    if (attributes==INVALID_FILE_ATTRIBUTES || !(attributes&FILE_ATTRIBUTE_DIRECTORY) || (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) return false;
-    std::error_code error; std::filesystem::directory_iterator runs(resultRoot,error);
-    if (error) return false;
-    std::wstring runDirectory;
-    for (const auto& candidate:runs) {
-        const auto path=candidate.path().wstring();
-        const auto attr=GetFileAttributesW(path.c_str());
-        if (!runDirectory.empty() || attr==INVALID_FILE_ATTRIBUTES || !(attr&FILE_ATTRIBUTE_DIRECTORY) ||
-            (attr&FILE_ATTRIBUTE_REPARSE_POINT)) return false;
-        runDirectory=path;
-    }
-    const std::wstring runWide(run->second.begin(),run->second.end());
-    const auto suffix=L"-PID"+std::to_wstring(child.pid)+L"-"+runWide;
-    if (runDirectory.size()<suffix.size() || runDirectory.substr(runDirectory.size()-suffix.size())!=suffix) return false;
+    if (!Absent(Join(directory,L"RS2SteamReport")) || !Absent(Join(directory,L"RS2SteamObserve")) ||
+        !Absent(Join(directory,L"RS2SteamObserveKeys"))) return false;
     std::string bytes;
     const std::size_t logLimit=scenario.reportMode==13 ? 16*1024*1024 : 1024*1024;
-    if (!Read(Join(runDirectory,L"events.jsonl"),&bytes,logLimit) || bytes.empty() || bytes.back()!='\n') return false;
+    if(!Read(Join(directory,L"Launch.log"),&bytes,logLimit)) return false;
+    if(expected.waiting) return bytes=="owned-obstruction";
+    if(!expected.writer) return bytes.empty();
+    const auto run=before.find("run_id");
+    if(run==before.end() || !HexString(run->second,32)) return false;
+    std::uint64_t bootstrap{};
+    if(!FieldUnsigned(before,"startup_observed",&bootstrap)) return false;
+    if(!bootstrap) return !expected.healthy && bytes.empty();
+    if(bytes.empty() || bytes.back()!='\n') return false;
+    std::uint8_t runBytes[16]{};
+    for(unsigned i=0;i<16;++i) runBytes[i]=static_cast<std::uint8_t>(std::stoul(run->second.substr(i*2,2),nullptr,16));
     for (const auto* forbidden:{"steam_token","steamId","caller_rva","registration","payload", "endpoint", ".key",
         "1234605616436508552","1122334455667788"}) if (bytes.find(forbidden)!=bytes.npos) return false;
     std::uint64_t creation{},frequency{},normalAttempts{},fullSelected{},selectedTrue{},written{},flushed{},expectedRequests{},expectedWitnesses{};
     if (!FieldUnsigned(before,"process_creation",&creation) || !FieldUnsigned(before,"qpc_frequency",&frequency) ||
         !FieldUnsigned(before,"normalAttempts",&normalAttempts) || !FieldUnsigned(before,"fullSelected",&fullSelected) ||
-        !FieldUnsigned(before,"selectedTrue",&selectedTrue) || !FieldUnsigned(after,"records_written",&written) ||
-        !FieldUnsigned(after,"last_flushed_sequence",&flushed) || !FieldUnsigned(before,"request",&expectedRequests) ||
+        !FieldUnsigned(before,"selectedTrue",&selectedTrue) || !FieldUnsigned(after,"submitted_sequence",&written) ||
+        !FieldUnsigned(after,"observed_sequence",&flushed) || !FieldUnsigned(before,"request",&expectedRequests) ||
         !FieldUnsigned(before,"witness",&expectedWitnesses)) return false;
     std::uint64_t sequence=0,requests=0,witnesses=0,enters=0,returns=0,selected=0,trueSelected=0,falseSelected=0,anchors=0;
     std::map<std::uint64_t,bool> builders;
     bool startup=false; std::size_t cursor=0;
+    std::uint64_t lastKind{},lastAnchor{},lastAnchorQpc{};
     while (cursor<bytes.size()) {
         const auto start=cursor;
         const auto end=bytes.find('\n',cursor);
         if (end==bytes.npos || end-cursor>8192) return false;
-        const auto line=bytes.substr(cursor,end-cursor); cursor=end+1;
+        const auto framed=report::native_log::InspectLine(bytes.data()+cursor,end-cursor+1,
+            report::native_log::PrefixMode::LogOnly,true);
+        if(framed.kind!=report::native_log::LineKind::Frame ||
+            !report::native_log::BelongsToRun(bytes.data()+cursor+framed.messageOffset,framed.messageBytes,runBytes)) return false;
+        const auto markerBytes=sizeof(report::native_log::kMarker)-1;
+        const auto line=bytes.substr(cursor+framed.messageOffset+markerBytes,framed.messageBytes-markerBytes);cursor=end+1;
         std::string type,identity; std::uint64_t pid{},schema{};
         if (line.empty() || line.front()!='{' || line.back()!='}' || !JsonText(line,"type",&type) ||
             !JsonText(line,"run_id",&identity) || identity!=run->second || !JsonUnsigned(line,"pid",&pid) || pid!=child.pid ||
-            !JsonUnsigned(line,"schema",&schema) || schema!=2) return false;
+            !JsonUnsigned(line,"schema",&schema) || schema!=3) return false;
         if (type=="startup") {
             if (startup || sequence || start!=0) return false;
-            startup=true; std::uint64_t recordedCreation{},recordedFrequency{},mode{};
+            startup=true; std::uint64_t recordedCreation{},recordedFrequency{},mode{},artifact{};
             std::string host,sdk,client,version;
             if (!JsonUnsigned(line,"process_start_filetime",&recordedCreation) || recordedCreation!=creation ||
                 !JsonUnsigned(line,"qpc_frequency",&recordedFrequency) || recordedFrequency!=frequency ||
                 !JsonUnsigned(line,"configured_mode",&mode) || mode!=static_cast<std::uint32_t>(expected.mode) ||
                 !JsonText(line,"version",&version) || version!=inputs.expectedVersion ||
+                !JsonUnsigned(line,"artifact_version",&artifact) || artifact!=0x00060200 ||
                 !JsonText(line,"host_sha256",&host) || host!=LowerDigest(inputs.host.digest) ||
                 !JsonText(line,"qualified_steam_api_sha256",&sdk) || sdk!=LowerDigest(inputs.sdk.digest) ||
                 !JsonText(line,"qualified_steamclient_sha256",&client) || client!=LowerDigest(inputs.client.digest)) return false;
@@ -367,6 +368,7 @@ bool ReportingLogEvidence(const Inputs& inputs,const Scenario& scenario,const Ch
             !JsonUnsigned(line,"binding_epoch",&binding) || !JsonUnsigned(line,"kind",&kind) ||
             !JsonUnsigned(line,"reason",&reason) || reason>=static_cast<unsigned>(report::Reason::Count) ||
             !JsonUnsigned(line,"flags",&flags) || !JsonUnsigned(line,"thread_id",&thread) || !thread) return false;
+        if(lastKind==7 && kind!=8) return false;
         sequence=current;
         if (type=="state") {
             std::uint64_t duration{}; if (kind!=1 || !JsonUnsigned(line,"client_qualification_ms",&duration)) return false;
@@ -393,17 +395,24 @@ bool ReportingLogEvidence(const Inputs& inputs,const Scenario& scenario,const Ch
                 }
             }
         } else if (type=="anchor") {
-            if (kind!=7) return false; ++anchors;
-        } else return false; // Unwinds/unknown records are not successes in these nonthrowing scenarios.
+            if (kind!=7) return false; ++anchors; lastAnchor=current;lastAnchorQpc=qpc;
+        } else if(type=="transport-summary") {
+            std::uint64_t anchor{},submitted{},observed{},generated{};
+            if(kind!=8 || lastKind!=7 || !JsonUnsigned(line,"anchor_sequence",&anchor) || anchor!=lastAnchor ||
+                qpc!=lastAnchorQpc || !JsonUnsigned(line,"submitted_sequence",&submitted) ||
+                !JsonUnsigned(line,"observed_sequence",&observed) || !JsonUnsigned(line,"generated_sequence",&generated) ||
+                observed>submitted || submitted>generated) return false;
+        } else return false; // Unwinds/pauses are not successes in these healthy nonthrowing scenarios.
+        lastKind=kind;
     }
-    if (!startup || sequence!=written || flushed!=written || enters!=returns || enters!=normalAttempts ||
+    if (!startup || lastKind==7 || sequence!=written || flushed!=written || enters!=returns || enters!=normalAttempts ||
         selected!=fullSelected || trueSelected!=selectedTrue || requests!=expectedRequests || witnesses!=expectedWitnesses) return false;
     for (const auto& builder:builders) if (!builder.second) return false;
     if (!expected.healthy) return requests==0 && witnesses==0 && selected==0;
     if (!anchors || !enters) return false;
     if (scenario.reportMode==13) return requests>=1 && witnesses>=1 && selected==1027 && trueSelected==1027 && !falseSelected;
     return scenario.reportMode==0 ? requests==0 && witnesses==0 && selected==0 :
-        requests==1 && witnesses==1 && selected==3 && trueSelected==2 && falseSelected==1;
+        requests==1 && witnesses==1 && selected==3 && trueSelected==(scenario.reportMode==1 ? 2U : 3U) && falseSelected==(scenario.reportMode==1 ? 1U : 0U);
 }
 bool ReportingEvidence(const Inputs& inputs,const Scenario& scenario,const Child& child,const std::wstring& directory) {
     const auto expected=ReportExpectation(scenario.reportMode);
@@ -416,6 +425,7 @@ bool ReportingEvidence(const Inputs& inputs,const Scenario& scenario,const Child
     std::uint64_t attempts{},selected{},selectedTrue{},builders{},full{},falseBuilds{},consumed{},callbacks{},holders{},clocks{};
     std::uint64_t builderInnerClocks{},pumpInnerClocks{};
     std::uint64_t factories{},inits{},pumps{},loads{},loadFailures{},shutdowns{},unloads{},stopping{},finalPhase{},written{},flushed{};
+    std::uint64_t warm{},drain{},transport{},transportReason{},bootstrap{};
     if (!FieldUnsigned(before,"pid",&pid) || pid!=child.pid || !FieldUnsigned(before,"header_ready",&headerReady) || headerReady!=1 ||
         !FieldUnsigned(before,"process_creation",&creation) || !creation ||
         !FieldUnsigned(before,"qpc_frequency",&frequency) || !frequency ||
@@ -432,12 +442,16 @@ bool ReportingEvidence(const Inputs& inputs,const Scenario& scenario,const Child
         !FieldUnsigned(before,"builder_inner_clock_errors",&builderInnerClocks) || builderInnerClocks ||
         !FieldUnsigned(before,"pump_inner_clock_errors",&pumpInnerClocks) || pumpInnerClocks ||
         !FieldUnsigned(before,"factory_calls",&factories) || !FieldUnsigned(before,"init_calls",&inits) || inits!=1 ||
-        !FieldUnsigned(before,"pump_calls",&pumps) || pumps!=(calibration ? 7030U : 5U) || !FieldUnsigned(before,"client_loads",&loads) ||
+        !FieldUnsigned(before,"pump_calls",&pumps) || !FieldUnsigned(before,"logger_warm_pumps",&warm) || warm>20 ||
+        !FieldUnsigned(before,"logger_drain_pumps",&drain) || drain>(calibration ? 232U : 20U) ||
+        pumps!=warm+drain+(calibration ? 7030U : 5U) ||
+        !FieldUnsigned(before,"transport_state",&transport) || !FieldUnsigned(before,"transport_reason",&transportReason) ||
+        !FieldUnsigned(before,"startup_observed",&bootstrap) || !FieldUnsigned(before,"client_loads",&loads) ||
         !FieldUnsigned(before,"client_load_failures",&loadFailures) || loadFailures ||
         !FieldUnsigned(after,"shutdown_calls",&shutdowns) || shutdowns!=1 ||
         !FieldUnsigned(after,"client_unloads",&unloads) || !FieldUnsigned(after,"stopping",&stopping) ||
-        !FieldUnsigned(after,"phase",&finalPhase) || !FieldUnsigned(after,"records_written",&written) ||
-        !FieldUnsigned(after,"last_flushed_sequence",&flushed)) return false;
+        !FieldUnsigned(after,"phase",&finalPhase) || !FieldUnsigned(after,"submitted_sequence",&written) ||
+        !FieldUnsigned(after,"observed_sequence",&flushed)) return false;
     const bool noClient=scenario.reportMode==8 || scenario.reportMode==10;
     if (loads!=(noClient ? 0U : 1U) || unloads!=loads || factories!=1 ||
         !FieldEquals(before,"init_result",scenario.reportMode==10 ? "false" : "true")) return false;
@@ -449,27 +463,33 @@ bool ReportingEvidence(const Inputs& inputs,const Scenario& scenario,const Child
     FixtureTiming timing{};
     if (calibration && !ReadFixtureTiming(child,frequency,&timing)) return false;
     if (expected.healthy) {
-        if (revoke || loss || phase!=static_cast<std::uint64_t>(scenario.reportMode==0 ? report::ReportPhase::Observing : report::ReportPhase::Repairing) ||
+        if (revoke || loss || transport!=1 || transportReason || bootstrap!=1 ||
+            phase!=static_cast<std::uint64_t>(scenario.reportMode==0 ? report::ReportPhaseV3::Observing : report::ReportPhaseV3::Repairing) ||
             attempts!=(calibration ? 1028U : 4U) || selected!=full || selectedTrue>selected) return false;
         if (scenario.reportMode==0) {
             if (requests || witnesses || selected || full || falseBuilds || consumed) return false;
         } else if (calibration) {
             if (!requests || !witnesses || !consumed || selected!=1027 || selectedTrue!=1027 || falseBuilds) return false;
-        } else if (requests!=1 || witnesses!=1 || consumed!=1 || selected!=3 || selectedTrue!=2 || falseBuilds!=1) return false;
-        const auto prefix=std::string("[RS2SteamReport] v")+inputs.expectedVersion+"; status=ready; mode="+
-            (scenario.reportMode==0 ? "observe" : "repair")+"; reason=none; run_id="+run->second+"; pid="+std::to_string(child.pid);
+        } else if (requests!=1 || witnesses!=1 || consumed!=1 || selected!=3 ||
+            selectedTrue!=(scenario.reportMode==1 ? 2U : 3U) || falseBuilds!=(scenario.reportMode==1 ? 1U : 0U)) return false;
+        const auto prefix=std::string("[RS2SteamReport] v")+inputs.expectedVersion+"; status=ready; event=initial; mode="+
+            (scenario.reportMode==0 ? "observe" : "repair")+"; pid="+std::to_string(child.pid)+"; run_id="+run->second+";";
         if (child.output.find(prefix)==child.output.npos) return false;
+    } else if(expected.waiting) {
+        if(revoke || loss || reason || transport!=0 || transportReason!=1 || bootstrap ||
+            phase!=static_cast<std::uint64_t>(report::ReportPhaseV3::WaitingLogger) || requests || witnesses || attempts || selected ||
+            child.output.find("[RS2SteamReport] v"+inputs.expectedVersion+"; status=waiting-logger;")==child.output.npos) return false;
     } else {
         const auto bit=1ULL<<static_cast<unsigned>(expected.reason);
         if (reason!=static_cast<unsigned>(expected.reason) || revoke!=bit || requests || witnesses ||
             attempts || selected || selectedTrue || full || falseBuilds || consumed ||
-            phase!=static_cast<std::uint64_t>(expected.writer ? report::ReportPhase::Faulted : report::ReportPhase::Rejected)) return false;
-        if (loss!=(scenario.reportMode==7 ? bit : 0)) return false;
+            phase!=static_cast<std::uint64_t>(expected.writer ? report::ReportPhaseV3::Faulted : report::ReportPhaseV3::Rejected)) return false;
+        if (loss) return false;
         if (child.output.find("[RS2SteamReport] v"+inputs.expectedVersion+"; status=disabled;")==child.output.npos) return false;
         if (child.output.find("[RS2SteamReport] v"+inputs.expectedVersion+"; status=ready;")!=child.output.npos) return false;
     }
-    if (expected.writer ? (stopping!=1 || finalPhase!=static_cast<std::uint64_t>(report::ReportPhase::Stopping)) :
-        (stopping!=0 || finalPhase!=static_cast<std::uint64_t>(report::ReportPhase::Rejected) || written || flushed)) return false;
+    if (expected.writer ? (stopping!=1 || finalPhase!=static_cast<std::uint64_t>(report::ReportPhaseV3::Stopping)) :
+        (stopping!=0 || finalPhase!=static_cast<std::uint64_t>(report::ReportPhaseV3::Rejected) || written || flushed)) return false;
     if (scenario.reportMode==12 && child.output.find("steam_prehook=installed-before-audio preserved=true")==child.output.npos) return false;
     return ReportingLogEvidence(inputs,scenario,child,directory,before,after);
 }
@@ -478,10 +498,12 @@ bool WriteTimingFixture(const Inputs& inputs,const std::wstring& root,const Chil
     // check passed. This records OWN-fixture envelopes, never a deployment-ready
     // calibration or a claim that production callbacks used these artifacts.
     std::map<std::string,std::string> fields;
-    std::uint64_t frequency{},creation{};
+    std::uint64_t frequency{},creation{},pumps{},warm{},drain{};
     FixtureTiming timing{};
     if (!OutputFields(child.output,"report_fixture=",&fields) ||
         !FieldUnsigned(fields,"qpc_frequency",&frequency) || !FieldUnsigned(fields,"process_creation",&creation) ||
+        !FieldUnsigned(fields,"pump_calls",&pumps) || !FieldUnsigned(fields,"logger_warm_pumps",&warm) ||
+        !FieldUnsigned(fields,"logger_drain_pumps",&drain) || warm>20 || drain>232 || pumps!=7030+warm+drain ||
         !ReadFixtureTiming(child,frequency,&timing)) return false;
     const auto run=fields.find("run_id");
     if (run==fields.end() || !HexString(run->second,32)) return false;
@@ -489,7 +511,8 @@ bool WriteTimingFixture(const Inputs& inputs,const std::wstring& root,const Chil
     if (!rs2fix::HashBytesSha256(child.output.data(),child.output.size(),&stdoutDigest)) return false;
     auto json=std::string("{\n  \"schema\":5,\n  \"kind\":\"inert-timing-fixture-evidence\",\n")+
         "  \"measurement_id\":\"rs2-wrapper-own-deferred-v2\",\n"+
-        "  \"protocol_id\":\"rs2-deferred-v2-fixed6000-1024\",\n"+
+        "  \"protocol_id\":\"rs2-native-log-v3-writefile-fixed6000-1024-350ms\",\n"+
+        "  \"main_pump_sleep_ms\":50,\n  \"builder_support_sleep_ms\":350,\n"+
         "  \"protocol_complete\":true,\n  \"integrity_pass\":true,\n"+
         "  \"ordinal_stdout_sha256\":\""+LowerDigest(stdoutDigest)+"\",\n"+
         "  \"operator_ready\":false,\n  \"production_artifact_bound\":false,\n  \"real_game_or_sdk_execution\":false,\n"+
@@ -509,7 +532,9 @@ bool WriteTimingFixture(const Inputs& inputs,const std::wstring& root,const Chil
         ",\n  \"builder_selected_count\":"+std::to_string(timing.selectedCount)+
         ",\n  \"pump_maximum_missing_ticks\":"+std::to_string(timing.pumpMaximum)+
         ",\n  \"builder_maximum_missing_ticks\":"+std::to_string(timing.builderMaximum)+
-        ",\n  \"native_pump_calls\":7030,\n  \"native_builder_calls\":1029,"+
+        ",\n  \"native_pump_calls\":"+std::to_string(pumps)+
+        ",\n  \"logger_warm_pumps\":"+std::to_string(warm)+",\n  \"logger_drain_pumps\":"+std::to_string(drain)+
+        ",\n  \"native_builder_calls\":1029,"+
         "\n  \"normal_attempts\":1028,\n  \"full_selected\":1027,"+
         "\n  \"ordinal_record_count\":8050,\n  \"unpaired_warmup_count\":1,\n  \"unpaired_tail_count\":1,"+
         "\n  \"ordinal_evidence\":\"calibration child stdout-stderr.txt; exact ordinal and class totals independently replayed by runner\","+
@@ -536,7 +561,7 @@ bool WriteTimingFixture(const Inputs& inputs,const std::wstring& root,const Chil
         "  \"conservative_overcount\":\"Subtracts only the exact matched inner-original interval. Original prologue/epilogue, QPC/LastError bookend and outer-host overhead remain; unrelated engine/producer work and the later pump are outside the builder envelope.\",\n"+
         "  \"bound_limitation\":\"Per-class maximum residual across all 8048 eligible pairs, without retries or averaged noise subtraction; empirical for these artifacts/run, not worst-case response time. Eligibility does not depend on coverage, cost or latency verdict.\",\n"+
         "  \"aggregate_scope\":\"Exactly 6000 main pump samples and their actual QPC span. Corrected sum charges each main class count with that class maximum over ALL paired main/bridge/support samples; no builder cost or bridge/support own ticks in main aggregate.\",\n"+
-        "  \"builder_stress_scope\":\"1024 accelerated selected builders test per-call limits and maximum missing cost, not normal-cadence whole-window production budget.\",\n"+
+        "  \"builder_stress_scope\":\"1024 selected builders paced at 350ms test per-call limits and maximum missing cost within the native transport budget, not normal-cadence whole-window production budget.\",\n"+
         "  \"required_next_binding\":\"Final production artifact, source identity, representative full-window performance and review acceptance.\",\n  \"classes\":[";
     for (std::size_t i=0;i<report::kStatusDurationClasses;++i) {
         const auto& c=timing.classes[i];

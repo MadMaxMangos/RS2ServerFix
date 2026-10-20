@@ -1,4 +1,5 @@
 /.worktrees/
+/.ai/
 /build*/
 /docs/
 *.suo

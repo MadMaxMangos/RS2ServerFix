@@ -76,16 +76,19 @@ bool SameModules(const std::vector<RuntimeModule>& a, const std::vector<RuntimeM
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) if (a[i].base != b[i].base || a[i].imageSize != b[i].imageSize ||
         !EqualEvidencePath(a[i].fullPath, b[i].fullPath) || !SameFileIdentity(a[i].fileIdentity, b[i].fileIdentity) ||
-        !SameReportingExport(a[i].reportingStatus,b[i].reportingStatus)) return false;
+        !SameReportingExport(a[i].reportingStatus,b[i].reportingStatus) ||
+        !SameReportingExport(a[i].recoveryStatus,b[i].recoveryStatus)) return false;
     return true;
 }
-RuntimeReportingExport RetainReportingExport(const pe::Image& image) {
+RuntimeReportingExport RetainReportingExport(const pe::Image& image, bool recovery=false) {
     RuntimeReportingExport result{};
-    for (const auto& symbol:image.exports) result.present|=symbol.name=="RS2SteamReport_StatusV2";
-    if (!result.present || image.sections.size()>96 || !ReportingStatusExport(image,&result.rva)) return result;
-    const auto* section=pe::FindSection(image,result.rva,sizeof(reporting::StatusWire));
+    for (const auto& symbol:image.exports) result.present|=symbol.name==(recovery ? "RS2LeechRecovery_StatusV1" : "RS2SteamReport_StatusV3");
+    if (!result.present || image.sections.size()>96 ||
+        !(recovery ? RecoveryStatusExport(image,&result.rva) : ReportingStatusExport(image,&result.rva))) return result;
+    const auto bytes=recovery ? sizeof(reporting::RecoveryStatusWireV1) : sizeof(reporting::StatusWireV3);
+    const auto* section=pe::FindSection(image,result.rva,bytes);
     if (!section) { result.rva=0; return result; }
-    result.valid=true; result.bytes=sizeof(reporting::StatusWire);
+    result.valid=true; result.bytes=static_cast<std::uint32_t>(bytes);
     result.sectionIndex=static_cast<std::uint32_t>(section-image.sections.data());
     result.sectionRva=section->virtualAddress; result.sectionBytes=section->virtualSize;
     result.sectionCharacteristics=section->characteristics;
@@ -206,6 +209,7 @@ bool CaptureStableRuntimeInventory(DWORD pid, const RuntimeInventoryOps& ops, Ru
             }
             module.x3audioExports = calculate && initialize;
             module.reportingStatus=RetainReportingExport(module.image);
+            module.recoveryStatus=RetainReportingExport(module.image,true);
             // Raw images serve the parser only. Keeping all loaded images would be an unbounded inventory.
             std::vector<std::uint8_t>().swap(module.image.rawBytes);
             std::vector<pe::ExportSymbol>().swap(module.image.exports);
@@ -267,7 +271,8 @@ bool StatusRead(const RuntimeInventory& inventory,const RuntimeModule& module,
     return process.ops.readMemory(process.ops.context,process.handle,module.base+rva,
         out,bytes,&actual,&error) && actual==bytes;
 }
-bool ResidentStatusModule(const RuntimeInventory& inventory,const RuntimeModule& module) {
+bool ResidentStatusModule(const RuntimeInventory& inventory,const RuntimeModule& module,
+    const RuntimeReportingExport& descriptor) {
     IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
     if (!StatusRead(inventory,module,0,&dos,sizeof(dos)) || dos.e_magic!=IMAGE_DOS_SIGNATURE ||
         dos.e_lfanew<sizeof(dos) || dos.e_lfanew>0x100000 ||
@@ -281,16 +286,16 @@ bool ResidentStatusModule(const RuntimeInventory& inventory,const RuntimeModule&
         nt.OptionalHeader.SizeOfImage!=module.imageSize ||
         nt.OptionalHeader.SizeOfHeaders!=module.image.sizeOfHeaders ||
         nt.OptionalHeader.CheckSum!=module.image.checksum ||
-        module.reportingStatus.sectionIndex>=nt.FileHeader.NumberOfSections) return false;
+        descriptor.sectionIndex>=nt.FileHeader.NumberOfSections) return false;
     const auto sectionTable=static_cast<std::uint64_t>(dos.e_lfanew)+sizeof(nt);
     const auto sectionsEnd=sectionTable+nt.FileHeader.NumberOfSections*sizeof(IMAGE_SECTION_HEADER);
     if (sectionsEnd>nt.OptionalHeader.SizeOfHeaders || sectionsEnd>module.imageSize) return false;
     IMAGE_SECTION_HEADER section{};
-    const auto sectionRva=sectionTable+module.reportingStatus.sectionIndex*sizeof(section);
+    const auto sectionRva=sectionTable+descriptor.sectionIndex*sizeof(section);
     return StatusRead(inventory,module,static_cast<DWORD>(sectionRva),&section,sizeof(section)) &&
-        section.VirtualAddress==module.reportingStatus.sectionRva &&
-        section.Misc.VirtualSize==module.reportingStatus.sectionBytes &&
-        section.Characteristics==module.reportingStatus.sectionCharacteristics;
+        section.VirtualAddress==descriptor.sectionRva &&
+        section.Misc.VirtualSize==descriptor.sectionBytes &&
+        section.Characteristics==descriptor.sectionCharacteristics;
 }
 bool StatusModuleUnchanged(const RuntimeInventory& inventory,const RuntimeModule& module,
     const Sha256Digest& expected,const RuntimeValidationOps& validation) {
@@ -310,33 +315,57 @@ bool StatusModuleUnchanged(const RuntimeInventory& inventory,const RuntimeModule
     FileIdentity file{}; Sha256Digest hash{};
     return matches==1 && validation.queryIdentity(validation.context,module.fullPath.c_str(),&file,&error) &&
         SameFileIdentity(file,module.fileIdentity) && validation.hashModule(validation.context,module,&hash) &&
-        hash==expected && ProcessUnchanged(inventory) && ResidentStatusModule(inventory,module);
+        hash==expected && ProcessUnchanged(inventory) && ResidentStatusModule(inventory,module,module.reportingStatus) &&
+        (!module.recoveryStatus.valid || ResidentStatusModule(inventory,module,module.recoveryStatus));
 }
 struct StatusSticky {
-    std::uint64_t revokeReasons,lossReasons,stopping,stoppedQpc,recordsWritten,lastFlushedSequence;
+    std::uint64_t revokeReasons{},lossReasons{},stopping{},stoppedQpc{},workerPauseReason{},fatalTransportReason{};
 };
-static_assert(sizeof(StatusSticky)==48);
 bool ReadSticky(const RuntimeInventory& inventory,const RuntimeModule& module,StatusSticky* value) {
-    // Independent words, not a purported second seqlocked payload. Sticky
-    // adverse observations are accumulated across BOTH sides and all retries.
-    std::uint64_t words[6]{};
-    for (unsigned i=0;i<6;++i) if (!StatusRead(inventory,module,module.reportingStatus.rva+
-        static_cast<DWORD>(offsetof(reporting::StatusWire,revokeReasons)+i*sizeof(std::uint64_t)),
-        &words[i],sizeof(words[i]))) return false;
-    std::memcpy(value,words,sizeof(*value)); return true;
+    using reporting::StatusWireV3;
+    struct Word { std::size_t offset; std::uint64_t* value; };
+    const Word words[]{
+        {offsetof(StatusWireV3,revokeReasons),&value->revokeReasons},
+        {offsetof(StatusWireV3,lossReasons),&value->lossReasons},
+        {offsetof(StatusWireV3,stopping),&value->stopping},
+        {offsetof(StatusWireV3,stoppedQpc),&value->stoppedQpc},
+        {offsetof(StatusWireV3,workerPauseReason),&value->workerPauseReason},
+        {offsetof(StatusWireV3,fatalTransportReason),&value->fatalTransportReason}};
+    for (const auto& word:words) if (!StatusRead(inventory,module,
+        module.reportingStatus.rva+static_cast<DWORD>(word.offset),word.value,8)) return false;
+    return true;
 }
 void AccumulateSticky(ReportingStatusObservation& out,const StatusSticky& words) {
     out.revokeReasons|=words.revokeReasons; out.lossReasons|=words.lossReasons;
     out.stopping|=words.stopping;
     out.stoppedQpc=(std::max)(out.stoppedQpc,words.stoppedQpc);
-    out.recordsWritten=(std::max)(out.recordsWritten,words.recordsWritten);
-    out.lastFlushedSequence=(std::max)(out.lastFlushedSequence,words.lastFlushedSequence);
+    if (!out.fatalTransportReason) out.fatalTransportReason=words.fatalTransportReason;
+    if (words.workerPauseReason!=out.workerPauseReason) out.workerPauseChanged=true;
+    if (words.workerPauseReason) out.workerPauseReason=words.workerPauseReason;
 }
+struct RemoteStatusRead {
+    const RuntimeInventory& inventory;
+    const RuntimeModule& module;
+    static bool Read(void* context,std::size_t offset,void* output,std::size_t bytes) noexcept {
+        const auto& c=*static_cast<const RemoteStatusRead*>(context);
+        return offset<=sizeof(reporting::StatusWireV3) && bytes<=sizeof(reporting::StatusWireV3)-offset &&
+            StatusRead(c.inventory,c.module,c.module.reportingStatus.rva+static_cast<DWORD>(offset),output,bytes);
+    }
+};
+struct RemoteRecoveryRead {
+    const RuntimeInventory& inventory;
+    const RuntimeModule& module;
+    static bool Read(void* context,std::size_t offset,void* output,std::size_t bytes) noexcept {
+        const auto& c=*static_cast<const RemoteRecoveryRead*>(context);
+        return offset<=sizeof(reporting::RecoveryStatusWireV1) && bytes<=sizeof(reporting::RecoveryStatusWireV1)-offset &&
+            StatusRead(c.inventory,c.module,c.module.recoveryStatus.rva+static_cast<DWORD>(offset),output,bytes);
+    }
+};
 bool StatusHeaderValid(const reporting::StatusHeader& h,const RuntimeInventory& inventory,
     const Sha256Digest& host,std::uint64_t frequency) {
     using namespace reporting;
-    if (h.magic!=kStatusMagic || h.schema!=kStatusSchema || h.bytes!=sizeof(StatusWire) ||
-        h.artifactVersion!=kReportingArtifactVersion || (h.validity&~CompleteHeaderIdentity) ||
+    if (h.magic!=kStatusMagic || h.schema!=kStatusSchemaV3 || h.bytes!=sizeof(StatusWireV3) ||
+        h.artifactVersion!=kReportingArtifactVersionV3 || (h.validity&~CompleteHeaderIdentity) ||
         !Zero(h.reserved,sizeof(h.reserved)) || h.configuredMode>static_cast<std::uint32_t>(Mode::Repair)) return false;
     if ((h.pid && h.pid!=inventory.processId) || (h.processCreation && h.processCreation!=inventory.creationTime)) return false;
     if ((h.validity&ProcessIdentityValid) && (h.pid!=inventory.processId || h.processCreation!=inventory.creationTime)) return false;
@@ -388,14 +417,15 @@ bool ReadReportingStatusWithOps(const RuntimeInventory& inventory,const RuntimeM
         return reject("reporting-status-input-invalid");
     const auto& exportInfo=module.reportingStatus;
     if (!exportInfo.present) { out->detail="reporting-status-export-absent"; return Fail(error,out->detail.c_str()); }
-    if (!exportInfo.valid || exportInfo.bytes!=sizeof(StatusWire) || (exportInfo.rva&7) ||
-        exportInfo.rva>=module.imageSize || sizeof(StatusWire)>module.imageSize-exportInfo.rva ||
+    if (!exportInfo.valid || exportInfo.bytes!=sizeof(StatusWireV3) || (exportInfo.rva&7) ||
+        exportInfo.rva>=module.imageSize || sizeof(StatusWireV3)>module.imageSize-exportInfo.rva ||
         !module.base || module.base>UINTPTR_MAX-module.imageSize || ((module.base+exportInfo.rva)&7))
         return reject("reporting-status-export-invalid");
     unsigned capturedModule{};
     for (const auto& entry:inventory.modules) if (entry.base==module.base && entry.imageSize==module.imageSize &&
         EqualEvidencePath(entry.fullPath,module.fullPath) && SameFileIdentity(entry.fileIdentity,module.fileIdentity) &&
-        SameReportingExport(entry.reportingStatus,exportInfo)) ++capturedModule;
+        SameReportingExport(entry.reportingStatus,exportInfo) &&
+        SameReportingExport(entry.recoveryStatus,module.recoveryStatus)) ++capturedModule;
     if (capturedModule!=1) return reject("reporting-status-module-not-captured");
     ContractReport contract;
     if (!validation.artifactContract(validation.context,module.fullPath.c_str(),ArtifactKind::CompanionReporting,&contract) ||
@@ -407,82 +437,105 @@ bool ReadReportingStatusWithOps(const RuntimeInventory& inventory,const RuntimeM
     if (!clock.read(clock.context,&frequency,&firstQpc) || !frequency ||
         frequency>static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())/45)
         return reject("reporting-status-clock-unavailable");
-    std::uint64_t lastHeaderReady{}, highestSequence{};
-    for (unsigned attempt=1;attempt<=3;++attempt) {
-        out->attempts=attempt;
-        std::uint64_t readyBefore{}, readyAfter{}, before{}, after{};
-        StatusHeader header{}, headerAfter{};
-        StatusPayload payload{};
-        StatusSticky sticky{};
-        const auto read=[&](std::size_t offset,void* target,std::size_t bytes) {
-            return offset<=sizeof(StatusWire) && bytes<=sizeof(StatusWire)-offset &&
-                StatusRead(inventory,module,exportInfo.rva+static_cast<DWORD>(offset),target,bytes);
-        };
-        if (!read(offsetof(StatusWire,headerReady),&readyBefore,8) ||
-            !ReadSticky(inventory,module,&sticky)) return reject("reporting-status-read-rejected-or-partial-no-bypass");
-        AccumulateSticky(*out,sticky);
-        if (readyBefore>2) return reject("reporting-status-header-ready-invalid");
-        if (readyBefore==1 && !read(0,&header,sizeof(header)))
-            return reject("reporting-status-header-read-partial");
-        if (!read(offsetof(StatusWire,ownerSequence),&before,8)) return reject("reporting-status-sequence-read-partial");
-        const bool sampled=readyBefore==1 && before>=2 && !(before&1);
-        if (sampled && !read(offsetof(StatusWire,owner),&payload,sizeof(payload)))
-            return reject("reporting-status-payload-read-partial");
-        if (!read(offsetof(StatusWire,ownerSequence),&after,8) ||
-            !ReadSticky(inventory,module,&sticky) ||
-            !read(offsetof(StatusWire,headerReady),&readyAfter,8))
-            return reject("reporting-status-final-read-partial");
-        AccumulateSticky(*out,sticky); lastHeaderReady=readyAfter;
-        if (readyAfter>2) return reject("reporting-status-header-ready-invalid");
-        if (after<before || before<highestSequence) return reject("reporting-status-sequence-decreased");
-        highestSequence=(std::max)(highestSequence,after);
-        if (readyBefore!=1 || readyAfter!=1) continue;
-        if (!read(0,&headerAfter,sizeof(headerAfter))) return reject("reporting-status-final-header-read-partial");
-        if (std::memcmp(&header,&headerAfter,sizeof(header)) ||
-            !StatusHeaderValid(header,inventory,host,frequency)) return reject("reporting-status-header-identity-mismatch");
-        if (out->headerValid && std::memcmp(&out->header,&header,sizeof(header)))
-            return reject("reporting-status-header-changed-across-attempts");
-        out->header=header; out->headerValid=true;
-        out->identityComplete=header.validity==CompleteHeaderIdentity;
-        if (!sampled || before!=after || (after&1)) continue;
-        if (payload.phase>static_cast<std::uint64_t>(ReportPhase::Faulted) ||
-            payload.reason>=kReasonCount || payload.pending>1 || payload.fresh>1 || payload.builderBound>1 ||
-            payload.ownerThreadId>MAXDWORD) return reject("reporting-status-payload-schema-invalid");
-        out->owner=payload; out->ownerValid=true; out->ownerSequence=after; break;
+    RemoteStatusRead remote{inventory,module};
+    // Qualify immutable identity independently: a malformed CORE must not hide
+    // a resident terminal recovery notice. Neither read grants native authority.
+    StatusHeader independentHeader{};
+    const auto identity=ReadReportingIdentityV3({&remote,RemoteStatusRead::Read},&independentHeader);
+    if (identity==SnapshotResultV3::Coherent &&
+        StatusHeaderValid(independentHeader,inventory,host,frequency)) {
+        out->header=independentHeader; out->headerValid=true; out->identityComplete=true;
+        const auto& recoveryExport=module.recoveryStatus;
+        if (recoveryExport.present) {
+            if (!recoveryExport.valid || recoveryExport.bytes!=sizeof(RecoveryStatusWireV1) ||
+                !SameReportingExport(recoveryExport,RetainReportingExport(contract.image,true)))
+                out->recoveryResult=RecoverySnapshotResult::Invalid;
+            else {
+                RemoteRecoveryRead recoveryRemote{inventory,module};
+                out->recoveryResult=ReadRecoveryStatusSnapshot({&recoveryRemote,RemoteRecoveryRead::Read},
+                    independentHeader,&out->recovery);
+            }
+        }
+        StatusHeader checkedHeader{};
+        if (!StatusModuleUnchanged(inventory,module,companion,validation) ||
+            ReadReportingIdentityV3({&remote,RemoteStatusRead::Read},&checkedHeader)!=SnapshotResultV3::Coherent ||
+            std::memcmp(&checkedHeader,&independentHeader,sizeof(checkedHeader))) {
+            out->headerValid=false; out->identityComplete=false; out->recovery={};
+            out->recoveryResult=RecoverySnapshotResult::Invalid;
+            return reject("reporting-status-independent-identity-changed");
+        }
+    } else {
+        out->recoveryResult=identity==SnapshotResultV3::ReadFailure ? RecoverySnapshotResult::ReadFailure :
+            identity==SnapshotResultV3::Unpublished ? RecoverySnapshotResult::Unavailable : RecoverySnapshotResult::Invalid;
     }
+    StatusSnapshotV3 snapshot{};
+    const auto sampled=ReadStatusSnapshotV3({&remote,RemoteStatusRead::Read},&snapshot);
+    out->attempts=snapshot.attempts;
+    out->revokeReasons=snapshot.wire.revokeReasons; out->lossReasons=snapshot.wire.lossReasons;
+    out->stopping=snapshot.wire.stopping; out->stoppedQpc=snapshot.wire.stoppedQpc;
+    out->fatalTransportReason=snapshot.wire.fatalTransportReason;
+    out->workerPauseReason=snapshot.wire.workerPauseReason; out->workerPauseChanged=snapshot.workerPauseChanged;
+    if (sampled==SnapshotResultV3::Invalid) return reject("reporting-status-v3-schema-or-publication-invalid");
+    if (sampled==SnapshotResultV3::ReadFailure) return reject("reporting-status-read-rejected-or-partial-no-bypass");
+    if (snapshot.headerAvailable) {
+        if (snapshot.wire.header.validity==CompleteHeaderIdentity && identity!=SnapshotResultV3::Coherent)
+            return reject("reporting-status-independent-identity-invalid");
+        if (!StatusHeaderValid(snapshot.wire.header,inventory,host,frequency))
+            return reject("reporting-status-header-identity-mismatch");
+        out->header=snapshot.wire.header; out->headerValid=true;
+        out->identityComplete=out->header.validity==CompleteHeaderIdentity;
+    }
+    if (snapshot.coreAvailable) {
+        out->ownerValid=true; out->owner=snapshot.wire.owner; out->ownerSequence=snapshot.wire.ownerSequence;
+        out->transport=snapshot.wire.ownerTransport; out->worker=snapshot.wire.worker;
+        out->workerSequence=snapshot.wire.workerSequence;
+        out->consoleDiagnosticsAvailable=snapshot.consoleDiagnosticsAvailable;
+        out->consoleSequence=snapshot.wire.consoleSequence; out->console=snapshot.wire.console;
+        out->logIdentityAvailable=snapshot.logIdentityAvailable; out->log=snapshot.wire.log;
+    }
+    std::uint64_t lastHeaderReady{};
+    if (!StatusRead(inventory,module,exportInfo.rva+static_cast<DWORD>(offsetof(StatusWireV3,headerReady)),
+        &lastHeaderReady,8) || lastHeaderReady>2) return reject("reporting-status-header-ready-invalid");
     if (!StatusModuleUnchanged(inventory,module,companion,validation))
-        return reject("reporting-status-module-or-process-changed-after-read");
+        { out->recovery={}; out->recoveryResult=RecoverySnapshotResult::Invalid;
+        return reject("reporting-status-module-or-process-changed-after-read"); }
     if (out->headerValid) {
         std::uint64_t finalReady{}; StatusHeader finalHeader{};
-        if (!StatusRead(inventory,module,exportInfo.rva+static_cast<DWORD>(offsetof(StatusWire,headerReady)),&finalReady,8) ||
+        if (!StatusRead(inventory,module,exportInfo.rva+static_cast<DWORD>(offsetof(StatusWireV3,headerReady)),&finalReady,8) ||
             finalReady!=1 || !StatusRead(inventory,module,exportInfo.rva,&finalHeader,sizeof(finalHeader)) ||
             std::memcmp(&finalHeader,&out->header,sizeof(finalHeader)))
-            return reject("reporting-status-header-changed-after-qualification");
+            { out->recovery={}; out->recoveryResult=RecoverySnapshotResult::Invalid;
+            return reject("reporting-status-header-changed-after-qualification"); }
     }
     StatusSticky finalSticky{};
-    if (!ReadSticky(inventory,module,&finalSticky)) return reject("reporting-status-final-latch-read-partial");
+    const bool finalGates=ReadSticky(inventory,module,&finalSticky);
     AccumulateSticky(*out,finalSticky);
+    if (!finalGates) return reject("reporting-status-final-latch-read-partial");
+    if (out->workerPauseReason>static_cast<std::uint64_t>(TransportReason::SameFileRequalification) ||
+        out->fatalTransportReason>=static_cast<std::uint64_t>(TransportReason::Count) ||
+        (out->fatalTransportReason && out->fatalTransportReason<static_cast<std::uint64_t>(TransportReason::ReceiptGap)))
+        return reject("reporting-status-final-transport-domain-invalid");
     std::uint64_t finalFrequency{}, now{};
     if (!clock.read(clock.context,&finalFrequency,&now) || finalFrequency!=frequency || now<firstQpc)
         return reject("reporting-status-clock-changed");
     out->observedQpc=now; out->captured=true;
     const auto stoppingMask=1ULL<<static_cast<unsigned>(Reason::Stopping);
-    if (out->lossReasons || (out->revokeReasons&~stoppingMask)) out->state=ReportingStatusState::Revoked;
+    if (out->fatalTransportReason || out->lossReasons || (out->revokeReasons&~stoppingMask)) out->state=ReportingStatusState::Revoked;
     else if (out->stopping || out->revokeReasons ||
-        (out->ownerValid && out->owner.phase==static_cast<std::uint64_t>(ReportPhase::Stopping)))
+        (out->ownerValid && out->owner.phase==static_cast<std::uint64_t>(ReportPhaseV3::Stopping)))
         out->state=ReportingStatusState::Stopped;
     else if (!out->headerValid) out->state=lastHeaderReady==0 ? ReportingStatusState::Uninitialized : ReportingStatusState::Initializing;
     else if (!out->ownerValid) out->state=ReportingStatusState::Busy;
-    else if (out->owner.phase==static_cast<std::uint64_t>(ReportPhase::Rejected)) out->state=ReportingStatusState::Rejected;
+    else if (out->owner.phase==static_cast<std::uint64_t>(ReportPhaseV3::Rejected)) out->state=ReportingStatusState::Rejected;
     else if (out->header.configuredMode<static_cast<std::uint32_t>(Mode::Observe)) out->state=ReportingStatusState::Disabled;
     else if (!out->identityComplete) out->state=ReportingStatusState::NotReady;
     else if (!out->owner.lastOwnerQpc || now<out->owner.lastOwnerQpc || now-out->owner.lastOwnerQpc>2*frequency)
         out->state=ReportingStatusState::Stale;
     else {
-        const auto desired=out->header.configuredMode==static_cast<std::uint32_t>(Mode::Observe) ? ReportPhase::Observing : ReportPhase::Repairing;
-        out->currentReady=out->owner.phase==static_cast<std::uint64_t>(desired) &&
-            out->owner.ownerThreadId && out->owner.sourceEpoch && out->owner.bindingEpoch &&
-            out->owner.readyQpc && out->owner.readyQpc<=now && out->owner.builderBound==1;
+        snapshot.wire.revokeReasons=out->revokeReasons; snapshot.wire.lossReasons=out->lossReasons;
+        snapshot.wire.stopping=out->stopping; snapshot.wire.fatalTransportReason=out->fatalTransportReason;
+        snapshot.wire.workerPauseReason=out->workerPauseReason; snapshot.workerPauseChanged=out->workerPauseChanged;
+        out->currentReady=SnapshotCurrentlyReadyV3(snapshot,now,frequency);
         out->state=out->currentReady ? ReportingStatusState::Ready : ReportingStatusState::NotReady;
     }
     out->detail=ReportingStatusStateName(out->state);
@@ -631,6 +684,30 @@ bool WriteRuntimeInventoryReport(const RuntimeInventory& inventory, const Runtim
     if (inputs.reportingCompanion) {
         const auto& status=result.reporting;
         const auto boolean=[](bool value) { return value ? "true" : "false"; };
+        out << "recovery.snapshot_result=" << reporting::RecoverySnapshotResultName(status.recoveryResult) << "\r\n";
+        if (status.recoveryResult==reporting::RecoverySnapshotResult::Coherent) {
+            const auto& recovery=status.recovery.wire;
+            char run[33]{}; constexpr char hex[]="0123456789abcdef";
+            for (unsigned i=0;i<16;++i) { run[2*i]=hex[recovery.runId[i]>>4]; run[2*i+1]=hex[recovery.runId[i]&15]; }
+            out << "recovery.schema=" << recovery.schema << "\r\nrecovery.bytes=" << recovery.bytes
+                << "\r\nrecovery.artifact_version=" << recovery.artifactVersion << "\r\nrecovery.pid=" << recovery.pid
+                << "\r\nrecovery.run_id=" << run << "\r\nrecovery.header_ready=" << recovery.headerReady
+                << "\r\nrecovery.owner_sequence=" << recovery.ownerSequence << "\r\n";
+#define RS2_RECOVERY_FIELD(Key,Field) out << "recovery." Key "=" << recovery.payload.Field << "\r\n"
+            RS2_RECOVERY_FIELD("phase",phase); RS2_RECOVERY_FIELD("event",event); RS2_RECOVERY_FIELD("reason",reason);
+            RS2_RECOVERY_FIELD("outcome",outcome); RS2_RECOVERY_FIELD("flags",flags);
+            RS2_RECOVERY_FIELD("operation_sequence",operationSequence); RS2_RECOVERY_FIELD("transition_sequence",transitionSequence);
+            RS2_RECOVERY_FIELD("qpc",qpc); RS2_RECOVERY_FIELD("source_epoch",sourceEpoch); RS2_RECOVERY_FIELD("sdk_epoch",sdkEpoch);
+            RS2_RECOVERY_FIELD("owner_thread_id",ownerThreadId); RS2_RECOVERY_FIELD("resource_phase",resourcePhase);
+            RS2_RECOVERY_FIELD("native_stage",nativeStage); RS2_RECOVERY_FIELD("exception_code",exceptionCode);
+            RS2_RECOVERY_FIELD("request_id",requestId); RS2_RECOVERY_FIELD("callback_id",callbackId);
+            RS2_RECOVERY_FIELD("callback_result",callbackResult); RS2_RECOVERY_FIELD("api_returned_id",apiReturnedId);
+            RS2_RECOVERY_FIELD("old_sdk_fingerprint",oldSdkFingerprint); RS2_RECOVERY_FIELD("new_sdk_fingerprint",newSdkFingerprint);
+            RS2_RECOVERY_FIELD("old_cache_fingerprint",oldCacheFingerprint); RS2_RECOVERY_FIELD("new_cache_fingerprint",newCacheFingerprint);
+            RS2_RECOVERY_FIELD("finish_deadline_qpc",finishDeadlineQpc); RS2_RECOVERY_FIELD("overall_deadline_qpc",overallDeadlineQpc);
+            RS2_RECOVERY_FIELD("record_sequence",recordSequence); RS2_RECOVERY_FIELD("callback_own_ticks",callbackOwnTicks);
+#undef RS2_RECOVERY_FIELD
+        }
         out << "steamclient_sha256=" << FormatSha256Upper(result.steamClientSha256).data()
             << "\r\nreporting.state=" << ReportingStatusStateName(status.state)
             << "\r\nreporting.detail=" << EncodeEvidenceText(status.detail)
@@ -646,8 +723,13 @@ bool WriteRuntimeInventoryReport(const RuntimeInventory& inventory, const Runtim
             << "\r\nreporting.loss_reasons=" << status.lossReasons
             << "\r\nreporting.stopping=" << status.stopping
             << "\r\nreporting.stopped_qpc=" << status.stoppedQpc
-            << "\r\nreporting.records_written=" << status.recordsWritten
-            << "\r\nreporting.last_flushed_sequence=" << status.lastFlushedSequence << "\r\n";
+            << "\r\nreporting.worker_sequence=" << status.workerSequence
+            << "\r\nreporting.console_sequence=" << status.consoleSequence
+            << "\r\nreporting.worker_pause_reason=" << status.workerPauseReason
+            << "\r\nreporting.fatal_transport_reason=" << status.fatalTransportReason
+            << "\r\nreporting.worker_pause_changed=" << boolean(status.workerPauseChanged)
+            << "\r\nreporting.log_identity_available=" << boolean(status.logIdentityAvailable)
+            << "\r\nreporting.console_diagnostics_available=" << boolean(status.consoleDiagnosticsAvailable) << "\r\n";
         if (status.headerValid) {
             char run[33]{}; constexpr char hex[]="0123456789abcdef";
             for (unsigned i=0;i<16;++i) { run[2*i]=hex[status.header.runId[i]>>4]; run[2*i+1]=hex[status.header.runId[i]&15]; }
@@ -661,6 +743,28 @@ bool WriteRuntimeInventoryReport(const RuntimeInventory& inventory, const Runtim
                 << "\r\nreporting.run_id=" << run << "\r\n";
         }
         if (status.ownerValid) {
+            // Native receipt counters are not V2 flush/durability claims.
+#define RS2_TRANSPORT_FIELD(field) out << "reporting.transport." #field "=" << status.transport.field << "\r\n"
+            RS2_TRANSPORT_FIELD(state); RS2_TRANSPORT_FIELD(reason); RS2_TRANSPORT_FIELD(startupSubmitted);
+            RS2_TRANSPORT_FIELD(actualRepairAdmitted); RS2_TRANSPORT_FIELD(generatedSequence);
+            RS2_TRANSPORT_FIELD(submittedSequence); RS2_TRANSPORT_FIELD(pauseEpoch);
+            RS2_TRANSPORT_FIELD(pauseBoundarySequence); RS2_TRANSPORT_FIELD(transitionSequence);
+            RS2_TRANSPORT_FIELD(transitionQpc); RS2_TRANSPORT_FIELD(forwardedPumpWithoutCapture);
+            RS2_TRANSPORT_FIELD(forwardedBuilderWithoutCapture); RS2_TRANSPORT_FIELD(reservedCredits);
+            RS2_TRANSPORT_FIELD(submitWindowStartQpc); RS2_TRANSPORT_FIELD(submitWindowCount);
+            RS2_TRANSPORT_FIELD(nativeSubmitCalls); RS2_TRANSPORT_FIELD(nativeSubmitElapsedTicks);
+            RS2_TRANSPORT_FIELD(nativeSubmitMaximumTicks); RS2_TRANSPORT_FIELD(nativeSubmitOverFiveMilliseconds);
+            RS2_TRANSPORT_FIELD(lastNativeSubmitQpc); RS2_TRANSPORT_FIELD(qualifiedSinkEpoch);
+#undef RS2_TRANSPORT_FIELD
+#define RS2_WORKER_FIELD(field) out << "reporting.worker." #field "=" << status.worker.field << "\r\n"
+            RS2_WORKER_FIELD(startupObserved); RS2_WORKER_FIELD(preparedSequence); RS2_WORKER_FIELD(observedSequence);
+            RS2_WORKER_FIELD(lastReceiptQpc); RS2_WORKER_FIELD(readerOffset); RS2_WORKER_FIELD(partialBytes);
+            RS2_WORKER_FIELD(ledgerDepth); RS2_WORKER_FIELD(readyDepth); RS2_WORKER_FIELD(ringReadSequence);
+            RS2_WORKER_FIELD(readCycles); RS2_WORKER_FIELD(readBytes); RS2_WORKER_FIELD(formatCalls);
+            RS2_WORKER_FIELD(formatTicks); RS2_WORKER_FIELD(receiptTicks); RS2_WORKER_FIELD(pauseReason);
+            RS2_WORKER_FIELD(pauseConditionSequence); RS2_WORKER_FIELD(pauseConditionQpc);
+            RS2_WORKER_FIELD(lastReadError); RS2_WORKER_FIELD(matchedAwaitingSubmitSequence);
+#undef RS2_WORKER_FIELD
             const auto& owner=status.owner;
 #define RS2_STATUS_FIELD(field) out << "reporting." #field "=" << owner.field << "\r\n"
             RS2_STATUS_FIELD(phase); RS2_STATUS_FIELD(reason); RS2_STATUS_FIELD(ownerThreadId);
@@ -687,6 +791,27 @@ bool WriteRuntimeInventoryReport(const RuntimeInventory& inventory, const Runtim
                 for (std::size_t n=0;n<reporting::kStatusDurationBuckets;++n)
                     out << "reporting.duration." << i << ".bucket." << n << '=' << duration.buckets[n] << "\r\n";
             }
+        }
+        if (status.consoleDiagnosticsAvailable) {
+#define RS2_CONSOLE_FIELD(field) out << "reporting.console." #field "=" << status.console.field << "\r\n"
+            RS2_CONSOLE_FIELD(attempts); RS2_CONSOLE_FIELD(written); RS2_CONSOLE_FIELD(failures);
+            RS2_CONSOLE_FIELD(lastError); RS2_CONSOLE_FIELD(lastAttemptQpc); RS2_CONSOLE_FIELD(lastNoticeEpoch);
+            RS2_CONSOLE_FIELD(skippedTransitions); RS2_CONSOLE_FIELD(workerState);
+#undef RS2_CONSOLE_FIELD
+        }
+        if (status.logIdentityAvailable) {
+            const auto& log=status.log;
+#define RS2_LOG_FIELD(field) out << "reporting.log." #field "=" << log.field << "\r\n"
+            RS2_LOG_FIELD(volumeSerial); RS2_LOG_FIELD(initialEOF); RS2_LOG_FIELD(pathChars);
+            RS2_LOG_FIELD(prefixMode); RS2_LOG_FIELD(transportKind); RS2_LOG_FIELD(durability);
+            RS2_LOG_FIELD(utcFiletime); RS2_LOG_FIELD(calibrationQpcBefore); RS2_LOG_FIELD(calibrationQpcAfter);
+            RS2_LOG_FIELD(initialAtLineBoundary);
+#undef RS2_LOG_FIELD
+            char fileId[33]{}; constexpr char hex[]="0123456789abcdef";
+            for(unsigned i=0;i<16;++i) { fileId[2*i]=hex[log.fileId[i]>>4]; fileId[2*i+1]=hex[log.fileId[i]&15]; }
+            std::wstring path;
+            for(std::size_t i=0;i<log.pathChars;++i) path.push_back(static_cast<wchar_t>(log.path[i]));
+            out << "reporting.log.file_id=" << fileId << "\r\nreporting.log.path=" << EncodeEvidencePath(path) << "\r\n";
         }
         out << "reporting.limitation=Current-DATA-observation-is-not-trial-coverage-or-backend-effect\r\n";
     }

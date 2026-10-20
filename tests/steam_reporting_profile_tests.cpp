@@ -1,4 +1,5 @@
 #include "companion/steam_reporting_profile.h"
+#include "companion/steam_reporting_native_profile.h"
 #include "test_framework.h"
 
 #include <algorithm>
@@ -210,10 +211,47 @@ void ProductionInventoryBounds() {
     const auto& identities=ProductionReportingIdentities();
     RS2_CHECK(identities.steamClientImageSize==0x1766000 && identities.steamClientTimestamp==0x685F401F);
 }
+bool ResolveFixture(void* context, const char* module, const char* name,
+    std::uintptr_t* address, DWORD*) noexcept {
+    auto& image = *static_cast<FakeImage*>(context);
+    if (std::strcmp(module, image.profile.pump.module) || std::strcmp(name, image.profile.pump.name)) return false;
+    *address = FakeImage::kPump;
+    return true;
+}
+void NativeImportQualification() {
+    FakeImage f;
+    const MemoryOps memory{&f, FakeImage::Query, FakeImage::Read};
+    const NativeImportOps imports{&f, ResolveFixture};
+    NativeLoggingProfile profile{f.profile, &f.profile.pump, 1};
+    DWORD error{};
+    const auto check = [&] { return ValidateNativeLoggingProfile(f.base, f.host, profile, memory, imports, &error); };
+    RS2_CHECK(check() == ProfileResult::Ready && error == ERROR_SUCCESS);
+    f.Store<std::uintptr_t>(0x5000, FakeImage::kPump + 1);
+    RS2_CHECK(check() == ProfileResult::ImportMismatch); // Nonnull is not qualified.
+    f.Store<std::uintptr_t>(0x5000, FakeImage::kPump);
+    profile.importCount = kNativeProfileImportLimit + 1;
+    RS2_CHECK(check() == ProfileResult::InvalidProfile);
+    profile.importCount = 1;
+    PumpImportRecipe duplicate[]{f.profile.pump, f.profile.pump};
+    profile.imports = duplicate; profile.importCount = 2;
+    RS2_CHECK(check() == ProfileResult::InvalidProfile);
+    profile.imports = &f.profile.pump; profile.importCount = 1;
+    f.dataProtection = PAGE_READWRITE;
+    RS2_CHECK(check() == ProfileResult::ProtectionMismatch);
+    f.dataProtection = PAGE_READONLY;
+    f.bytes[0x1000 + 1100] ^= 1;
+    RS2_CHECK(check() == ProfileResult::BytesMismatch);
+    const auto& native = ProductionNativeLoggingProfile();
+    RS2_CHECK(native.body.spanCount > kProfileSpanLimit && native.body.spanCount <= kNativeProfileSpanLimit);
+    // The original reporting admission policy remains deliberately narrower.
+    std::uintptr_t ignored{};
+    RS2_CHECK(ValidateReportingProfile(f.base, f.host, native.body, memory, &ignored, &error) == ProfileResult::InvalidProfile);
+}
 } // namespace
 void ReportingProfileTests() {
     ChunkedAndRelocatedIdentity(); ProtectionAndHeaderFailures();
     ProfileBoundsAndSectionMismatch(); UnwindMembershipAndDiscardedRelocations();
     ImportIdentity(); ProductionInventoryBounds();
+    NativeImportQualification();
 }
 } // namespace rs2fix::testcases

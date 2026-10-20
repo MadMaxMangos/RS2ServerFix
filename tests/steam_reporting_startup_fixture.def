@@ -1,4 +1,14 @@
 EXPORTS
+    FixtureNativeLog
+    FixtureNativeLogState DATA
+    FixtureNativeRedirectorVtable DATA
+    FixtureNativeFileVtable DATA
+    FixtureNativeArchiveVtable DATA
+    FixtureNativeManagerVtable DATA
+    FixtureNativeConsoleVtable DATA
+    FixtureNativeInheritedVtable DATA
+    FixtureNativeDebugVtable DATA
+    FixtureNativeEventVtable DATA
     FixtureState DATA
     FixtureInitializerSlot DATA
     FixtureInitializerThunk

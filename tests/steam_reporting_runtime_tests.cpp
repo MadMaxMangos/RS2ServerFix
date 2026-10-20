@@ -31,8 +31,8 @@ struct Fixture {
     // The declared executable section is DATA here and is never executed.
     std::vector<unsigned char> image=std::vector<unsigned char>(0x10000);
     std::vector<unsigned char> heap=std::vector<unsigned char>(0x10000);
-    StatusWire status{};
-    ReportRing ring{};
+    StatusWireV3 status{};
+    ReportRingV3 ring{};
     obs::DispatchState dispatch{};
     Runtime runtime{};
     SourceLayout source{0x3100,0x3108,0x3110,0x3118};
@@ -130,7 +130,7 @@ struct Fixture {
         header.configuredMode=static_cast<std::uint32_t>(mode);
         header.qpcFrequency=static_cast<std::uint64_t>(frequency);
         header.pid=GetCurrentProcessId(); header.runId[0]=1;
-        RS2_CHECK(InitializeStatus(status,header,{}));
+        RS2_CHECK(InitializeStatusV3(status,header,{}));
         RS2_CHECK(InitializeReportRing(ring,status,GetCurrentThreadId()));
         obs::InitializeDispatch(dispatch,{},{});
         dispatch.bindingCount=1; dispatch.bindings[0].accepted=true;
@@ -146,6 +146,13 @@ struct Fixture {
         config.builderWrapper=Wrapper(); config.source=source; config.prepared=prepared; config.task=task;
         config.noticeContext=this; config.notice=Notice; config.qualifyClient=QualifiedClient;
         RS2_CHECK(InitializeRuntime(runtime,config,frequency)==Reason::None);
+        // Runtime-only seam: transport protocol/file evidence is tested by the
+        // separate native worker fixtures. This is not a live readiness claim.
+        runtime.transport.state=static_cast<std::uint64_t>(TransportState::Running);
+        runtime.transport.reason=0; runtime.transport.startupSubmitted=1;
+        runtime.transport.qualifiedSinkEpoch=1;
+        StoreStatusWord(status.logIdentityReady,1);
+        StoreStatusWord(status.worker.startupObserved,1);
     }
     void SetTask(std::uint32_t id,std::uint32_t counter) {
         std::memset(reinterpret_cast<void*>(Slot()),0,0x78);
@@ -224,7 +231,11 @@ struct Fixture {
         InterlockedExchange64(&dispatch.lifecycle,static_cast<LONG64>(kIdle));
         sink.initFinished(sink.context,kIdle,true,success);
     }
-    void Pump() { ManagePump(runtime,CallerClass::NormalPump,Now()); }
+    void Pump() {
+        CaptureReservation credit{};
+        ManagePump(runtime,CallerClass::NormalPump,Now(),credit);
+        ReleaseCapture(runtime,credit);
+    }
     void Consume() {
         // Simulated native producer transition, not an execution/timing claim.
         Put(Heap(0x6000)+0xA0,std::uint8_t{0}); Put(Heap(0x6000)+0xA1,std::uint8_t{0});
@@ -238,6 +249,7 @@ struct Fixture {
         // Caller-reported outcomes only. No native forwarding/dirty-byte store
         // is executed by this core fixture; the separate entry fixture owns it.
         FinishBuilder(runtime,decision,returned,result,selected,Now(),10);
+        ReleaseCapture(runtime,decision.credit);
     }
     bool Revoked(Reason reason) const {
         return (ReadStatusWord(status.revokeReasons)&(1ULL<<static_cast<unsigned>(reason)))!=0;
@@ -279,9 +291,9 @@ void InstalledSnapshotOwnsDiagnostics() {
         f.runtime.schedule.anchorBits==222 && f.runtime.schedule.errors==12);
     RS2_CHECK(f.runtime.schedule.tier==ScheduleTier::Retry30m && f.runtime.schedule.delayUnits==1800000);
     bool boundState{};
-    ReportRecord event{};
+    ReportRecordV3 event{};
     while (DequeueReport(f.ring,&event)==ReportReadResult::Record) {
-        if (event.header.kind!=static_cast<unsigned>(RecordKind::State) || !event.payload.state.bound) continue;
+        if (event.header.kind!=static_cast<unsigned>(RecordKindV3::State) || !event.payload.state.bound) continue;
         boundState=true;
         RS2_CHECK(event.header.sourceEpoch==f.runtime.counters.sourceEpoch &&
             event.header.bindingEpoch==f.runtime.counters.bindingEpoch);
@@ -368,11 +380,11 @@ void RepairWithDiagnosticDrift() {
     RS2_CHECK(f.runtime.counters.fullSelected==1 && !StatusRevoked(f.status) &&
         f.runtime.producer.fault==Reason::None && !f.forbiddenRead);
     unsigned requests{},witnesses{};
-    ReportRecord record{};
+    ReportRecordV3 record{};
     while (DequeueReport(f.ring,&record)==ReportReadResult::Record) {
-        const auto kind=static_cast<RecordKind>(record.header.kind);
-        if (kind!=RecordKind::Request && kind!=RecordKind::Witness) continue;
-        if (kind==RecordKind::Request) ++requests; else ++witnesses;
+        const auto kind=static_cast<RecordKindV3>(record.header.kind);
+        if (kind!=RecordKindV3::Request && kind!=RecordKindV3::Witness) continue;
+        if (kind==RecordKindV3::Request) ++requests; else ++witnesses;
         RS2_CHECK(record.payload.request.humanPlayers==65 && record.payload.request.worldBots==0 &&
             record.payload.request.pi==63 && record.payload.request.maximum==64 &&
             record.payload.request.stagedBots==0 && record.payload.request.requestSequence==1);
@@ -425,7 +437,7 @@ void EpochInvalidationKeepsRequestFloor() {
 }
 void EvidenceLossPreventsSelection() {
     Fixture f; f.Init(); f.Pump(); f.Consume();
-    ReportRecord filler{}; filler.header.kind=static_cast<std::uint32_t>(RecordKind::State);
+    ReportRecordV3 filler{}; filler.header.kind=static_cast<std::uint32_t>(RecordKindV3::State);
     const auto used=ReadStatusWord(f.ring.reportWriteSequence)-ReadStatusWord(f.ring.reportReadSequence);
     for (auto i=used;i<kReportRecordCapacity;++i) {
         std::uint64_t sequence{};
@@ -498,7 +510,7 @@ void LifecycleFailuresAndShutdown() {
         std::memcpy(producer.data(),&f.runtime.producer,producer.size());
         const auto counters=f.runtime.counters; const auto reads=f.reads;
         const auto now=f.Now();
-        std::thread foreign([&] { ManagePump(f.runtime,CallerClass::NormalPump,now); }); foreign.join();
+        std::thread foreign([&] { CaptureReservation credit{}; ManagePump(f.runtime,CallerClass::NormalPump,now,credit); }); foreign.join();
         RS2_CHECK(f.Revoked(Reason::ForeignThread) && f.reads==reads);
         RS2_CHECK(std::memcmp(producer.data(),&f.runtime.producer,producer.size())==0 &&
             std::memcmp(&counters,&f.runtime.counters,sizeof(counters))==0);
@@ -514,9 +526,127 @@ void LifecycleFailuresAndShutdown() {
         RS2_CHECK(f.Get<std::uintptr_t>(f.Slot()+0x40)==callback); // No native table cleanup in lifecycle callback.
         const auto decision=f.Builder();
         RS2_CHECK(!decision.attempted && !decision.eligible && f.reads==reads);
-        RS2_CHECK(ReadStatusWord(f.status.owner.phase)==static_cast<std::uint64_t>(ReportPhase::Stopping));
+        RS2_CHECK(ReadStatusWord(f.status.owner.phase)==static_cast<std::uint64_t>(ReportPhaseV3::Stopping));
     }
 }
+
+void CaptureCreditsAndPause() {
+    Fixture f(Mode::Observe); f.Init(); f.Pump();
+    CaptureReservation parent{},child{};
+    RS2_CHECK(ReserveCapture(f.runtime,parent,9) && ReserveCapture(f.runtime,child,9));
+    RS2_CHECK(parent.remaining==9 && child.remaining==9 && f.runtime.transport.reservedCredits==18);
+    ReleaseCapture(f.runtime,child);
+    RS2_CHECK(parent.remaining==9 && f.runtime.transport.reservedCredits==9);
+    ReleaseCapture(f.runtime,parent);
+    RS2_CHECK(!f.runtime.transport.reservedCredits);
+
+    ReportRecordV3 filler{}; filler.header.kind=1; filler.header.qpc=f.Now();
+    while (f.runtime.counters.reportSequence<250) {
+        std::uint64_t sequence{};
+        RS2_CHECK(EnqueueReport(f.ring,filler,&sequence)==ReportWriteResult::Accepted);
+        f.runtime.counters.reportSequence=sequence; f.runtime.transport.generatedSequence=sequence;
+    }
+    const auto attempts=f.runtime.counters.normalAttempts,reads=f.reads;
+    const auto callback=f.Get<std::uintptr_t>(f.Slot()+0x40);
+    auto blocked=f.Builder();
+    RS2_CHECK(!blocked.attempted && f.runtime.counters.normalAttempts==attempts && f.reads==reads);
+    RS2_CHECK(f.runtime.transport.state==static_cast<std::uint64_t>(TransportState::Paused));
+    RS2_CHECK(f.runtime.transport.reason==static_cast<std::uint64_t>(TransportReason::CreditPressure));
+    RS2_CHECK(f.runtime.counters.reportSequence==251 && f.runtime.transport.pauseBoundarySequence==251);
+    RS2_CHECK(!StatusRevoked(f.status) && f.Get<std::uintptr_t>(f.Slot()+0x40)==callback);
+    auto again=f.Builder();
+    RS2_CHECK(!again.attempted && f.runtime.counters.reportSequence==251);
+    ReportRecordV3 record{}; unsigned pauses{};
+    while (DequeueReport(f.ring,&record)==ReportReadResult::Record) {
+        if (record.header.kind==static_cast<std::uint32_t>(RecordKindV3::Control)) {
+            ++pauses; RS2_CHECK(record.payload.control.event==1 && record.payload.control.generatedBefore==250);
+        }
+    }
+    RS2_CHECK(pauses==1);
+}
+void PauseFinishesPairAndPreservesFloor() {
+    Fixture f; f.Init(); f.Pump(); f.Consume();
+    auto decision=f.Builder();
+    RS2_CHECK(decision.attempted && decision.eligible && decision.credit.active);
+    const auto floor=f.runtime.producer.lastRequestQpc;
+    const auto request=f.runtime.producer.requestSequence,witness=f.runtime.producer.witnessSequence;
+    const auto callback=f.Get<std::uintptr_t>(f.Slot()+0x40);
+    PauseRuntimeTransport(f.runtime,TransportReason::ReaderBehind,f.Now());
+    const auto boundary=f.runtime.transport.pauseBoundarySequence;
+    RS2_CHECK(!f.runtime.producer.pending.active && !f.runtime.producer.fresh.valid);
+    RS2_CHECK(f.runtime.producer.lastRequestQpc==floor && f.Get<std::uintptr_t>(f.Slot()+0x40)==callback);
+    // Selection may have happened before pause became pending during original.
+    f.Finish(decision,true,true,true);
+    RS2_CHECK(f.runtime.counters.reportSequence==boundary+1 && f.runtime.counters.normalReturns==1);
+    RS2_CHECK(!f.runtime.transport.reservedCredits && !StatusRevoked(f.status));
+    ReportRecordV3 discarded{};
+    while (DequeueReport(f.ring,&discarded)==ReportReadResult::Record) {}
+    f.runtime.transport.submittedSequence=f.runtime.counters.reportSequence;
+    RS2_CHECK(PublishOwnerV3(f.status,f.runtime.counters,f.runtime.transport));
+    WorkerTransport worker{}; worker.startupObserved=1;
+    worker.preparedSequence=f.runtime.counters.reportSequence; worker.observedSequence=boundary;
+    RS2_CHECK(PublishWorkerV3(f.status,worker));
+    RefreshRuntimeTransport(f.runtime,{TransportReason::None,true,0},f.Now());
+    RS2_CHECK(f.runtime.transport.state==static_cast<std::uint64_t>(TransportState::Paused));
+    worker.observedSequence=f.runtime.counters.reportSequence;
+    RS2_CHECK(PublishWorkerV3(f.status,worker));
+    RefreshRuntimeTransport(f.runtime,{TransportReason::None,true,0},f.Now());
+    RS2_CHECK(f.runtime.transport.state==static_cast<std::uint64_t>(TransportState::Running));
+    RS2_CHECK(!f.runtime.producer.fresh.valid && f.runtime.producer.lastRequestQpc==floor);
+    f.Pump(); // Native request already clear, but the20second floor is still active.
+    RS2_CHECK(f.runtime.producer.requestSequence==request && f.runtime.producer.witnessSequence==witness);
+    RS2_CHECK(!f.runtime.producer.fresh.valid && f.Get<std::uintptr_t>(f.Slot()+0x40)==callback);
+    // Simulate an elapsed floor and still-set pre-pause native request without sleeping.
+    PauseRuntimeTransport(f.runtime,TransportReason::ReaderBehind,f.Now());
+    while (DequeueReport(f.ring,&discarded)==ReportReadResult::Record) {}
+    f.runtime.transport.submittedSequence=f.runtime.counters.reportSequence;
+    RS2_CHECK(PublishOwnerV3(f.status,f.runtime.counters,f.runtime.transport));
+    worker.preparedSequence=worker.observedSequence=f.runtime.counters.reportSequence;
+    RS2_CHECK(PublishWorkerV3(f.status,worker));
+    f.Put(f.Heap(0x6000)+0xA0,std::uint8_t{1});
+    f.runtime.producer.lastRequestQpc=f.Now()-f.frequency*21;
+    RefreshRuntimeTransport(f.runtime,{TransportReason::None,true,0},f.Now());
+    f.Pump();
+    RS2_CHECK(f.runtime.resumeWaitNativeClear && f.runtime.producer.requestSequence==request);
+    // The simulated native timer must advance before its new reset can prove
+    // consumption; leaving it at0 would correctly yield ProducerAmbiguous.
+    f.Put(f.Heap(0x6000)+0xA4,12.0F);
+    f.Put(f.Heap(0x6000)+0xA0,std::uint8_t{0}); f.Pump();
+    RS2_CHECK(!f.runtime.resumeWaitNativeClear && f.runtime.producer.requestSequence==request+1);
+    RS2_CHECK(f.runtime.producer.pending.active && !f.runtime.producer.fresh.valid);
+    f.Consume();
+    RS2_CHECK(f.runtime.producer.fresh.valid && f.runtime.producer.witnessSequence==witness+1);
+}
+void AnchorSummaryCadence() {
+    Fixture f(Mode::Observe); f.Init(); f.Pump();
+    ReportRecordV3 discarded{};
+    while (DequeueReport(f.ring,&discarded)==ReportReadResult::Record) {}
+    const auto checkPair=[&] {
+        ReportRecordV3 anchor{},summary{},extra{};
+        RS2_CHECK(DequeueReport(f.ring,&anchor)==ReportReadResult::Record);
+        RS2_CHECK(DequeueReport(f.ring,&summary)==ReportReadResult::Record);
+        RS2_CHECK(anchor.header.kind==static_cast<std::uint32_t>(RecordKindV3::Anchor));
+        RS2_CHECK(summary.header.kind==static_cast<std::uint32_t>(RecordKindV3::TransportSummary));
+        RS2_CHECK(summary.header.sequence==anchor.header.sequence+1 && summary.payload.transport.anchorSequence==anchor.header.sequence);
+        RS2_CHECK(summary.header.qpc==anchor.header.qpc && summary.payload.transport.generatedSequence==anchor.header.sequence-1);
+        RS2_CHECK(DequeueReport(f.ring,&extra)==ReportReadResult::Empty && !f.runtime.transport.reservedCredits);
+    };
+    PublishRuntimeStatus(f.runtime,f.Now(),true); checkPair();
+    f.runtime.lastAnchor=f.Now()-f.frequency*2;
+    PublishRuntimeStatus(f.runtime,f.Now(),true);
+    RS2_CHECK(DequeueReport(f.ring,&discarded)==ReportReadResult::Empty);
+    f.runtime.config.diagnostics=Diagnostics::Detailed;
+    PublishRuntimeStatus(f.runtime,f.Now(),true); checkPair();
+    f.runtime.lastAnchor=f.Now()-f.frequency*100;
+    PublishRuntimeStatus(f.runtime,f.Now(),true); checkPair(); // One pair, not100catch-up pairs.
+    CaptureReservation shortCredit{};
+    RS2_CHECK(ReserveCapture(f.runtime,shortCredit,1));
+    f.runtime.lastAnchor=f.Now()-f.frequency*2;
+    PublishRuntimeStatus(f.runtime,f.Now(),true,&shortCredit);
+    RS2_CHECK(shortCredit.remaining==1 && !StatusRevoked(f.status));
+    ReleaseCapture(f.runtime,shortCredit); checkPair();
+}
+
 } // namespace
 void ReportingRuntimeTests() {
     ObserveAndKnownSpin(); InstalledSnapshotOwnsDiagnostics();
@@ -524,5 +654,6 @@ void ReportingRuntimeTests() {
     SelectionUsesWitnessRequest();
     RepairWithDiagnosticDrift(); InvalidBotsRejectBeforeStaging();
     EvidenceLossPreventsSelection(); CleanupLifecycleCrossing(); SameOwnerEntryCrossingReasons(); LifecycleFailuresAndShutdown();
+    CaptureCreditsAndPause(); PauseFinishesPairAndPreservesFloor(); AnchorSummaryCadence();
 }
 } // namespace rs2fix::testcases

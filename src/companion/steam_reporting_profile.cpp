@@ -1,4 +1,5 @@
 #include "companion/steam_reporting_profile.h"
+#include "companion/steam_reporting_native_profile.h"
 
 #include <algorithm>
 #include <cstring>
@@ -107,11 +108,14 @@ bool Covered(const ReportingProfile& profile, std::uint32_t rva,
     }
     return false;
 }
-bool ProfileShape(const StartupProfile& host, const ReportingProfile& p) noexcept {
+struct ProfileLimits { std::size_t spans, pointers, exceptions; };
+constexpr ProfileLimits kReportingLimits{kProfileSpanLimit, kProfilePointerLimit, kProfileExceptionLimit};
+constexpr ProfileLimits kLoggingLimits{kNativeProfileSpanLimit, kNativeProfilePointerLimit, kNativeProfileExceptionLimit};
+bool ProfileShape(const StartupProfile& host, const ReportingProfile& p, const ProfileLimits& limits) noexcept {
     if (!host.imageSize || !host.checksumCount || host.checksumCount>2 ||
-        !p.spans || !p.spanCount || p.spanCount>kProfileSpanLimit ||
-        !p.pointers || !p.pointerCount || p.pointerCount>kProfilePointerLimit ||
-        !p.exceptions || !p.exceptionCount || p.exceptionCount>kProfileExceptionLimit ||
+        !p.spans || !p.spanCount || p.spanCount>limits.spans ||
+        !p.pointers || !p.pointerCount || p.pointerCount>limits.pointers ||
+        !p.exceptions || !p.exceptionCount || p.exceptionCount>limits.exceptions ||
         !p.pump.module || !p.pump.name || (p.pump.slotRva&7) ||
         !Range(host.imageSize,p.pump.slotRva,sizeof(std::uintptr_t))) return false;
     std::size_t bytes=p.pointerCount*8+p.exceptionCount*12+8;
@@ -221,20 +225,14 @@ bool PumpImport(const ImageContext& image, const PumpImportRecipe& p,
     }
     return false;
 }
-} // namespace
-
-const ReportingProfile& ProductionReportingProfile() noexcept { return kReportingProduction; }
-const ReportingIdentities& ProductionReportingIdentities() noexcept { return kIdentities; }
-const char* ReportingProfileInventorySha256() noexcept { return kInventorySha256; }
-
-ProfileResult ValidateReportingProfile(std::uintptr_t base, const StartupProfile& host,
+ProfileResult ValidateProfile(std::uintptr_t base, const StartupProfile& host,
     const ReportingProfile& profile, const MemoryOps& memory,
-    std::uintptr_t* pumpOriginal, DWORD* error) noexcept {
+    std::uintptr_t* pumpOriginal, DWORD* error, const ProfileLimits& limits) noexcept {
     if (error) *error=ERROR_INVALID_DATA;
     if (pumpOriginal) *pumpOriginal=0;
     if (!base || !memory.read || !memory.query || !pumpOriginal ||
         host.imageSize>(std::numeric_limits<std::uintptr_t>::max)()-base ||
-        !ProfileShape(host,profile)) return ProfileResult::InvalidProfile;
+        !ProfileShape(host,profile,limits)) return ProfileResult::InvalidProfile;
     ImageContext image{base,host.imageSize,0,{},&memory,error};
     if (!Headers(image,host)) return ProfileResult::ImageMismatch;
     std::uint8_t scratch[kProfileReadChunk]{};
@@ -271,6 +269,66 @@ ProfileResult ValidateReportingProfile(std::uintptr_t base, const StartupProfile
     if (!PumpImport(image,profile.pump,&original)) return ProfileResult::ImportMismatch;
     *pumpOriginal=original;
     if (error) *error=ERROR_SUCCESS;
+    return ProfileResult::Ready;
+}
+} // namespace
+
+const ReportingProfile& ProductionReportingProfile() noexcept { return kReportingProduction; }
+const ReportingIdentities& ProductionReportingIdentities() noexcept { return kIdentities; }
+const char* ReportingProfileInventorySha256() noexcept { return kInventorySha256; }
+
+ProfileResult ValidateReportingProfile(std::uintptr_t base, const StartupProfile& host,
+    const ReportingProfile& profile, const MemoryOps& memory,
+    std::uintptr_t* pumpOriginal, DWORD* error) noexcept {
+    // Preserve the legacy verifier's exact bounds and output contract.
+    return ValidateProfile(base, host, profile, memory, pumpOriginal, error, kReportingLimits);
+}
+
+ProfileResult ValidateNativeLoggingProfile(std::uintptr_t base, const StartupProfile& host,
+    const NativeLoggingProfile& profile, const MemoryOps& memory,
+    const NativeImportOps& imports, DWORD* error) noexcept {
+    if (error) *error = ERROR_INVALID_DATA;
+    if (!profile.imports || !profile.importCount || profile.importCount > kNativeProfileImportLimit ||
+        !imports.resolve) return ProfileResult::InvalidProfile;
+    const auto& first = profile.imports[0];
+    const auto& body = profile.body;
+    if (!first.module || !first.name || !body.pump.module || !body.pump.name ||
+        first.slotRva != body.pump.slotRva || std::strcmp(first.module, body.pump.module) ||
+        std::strcmp(first.name, body.pump.name)) return ProfileResult::InvalidProfile;
+    std::uintptr_t original{};
+    const auto result = ValidateProfile(base, host, body, memory, &original, error, kLoggingLimits);
+    if (result != ProfileResult::Ready) return result;
+    if (error) *error = ERROR_INVALID_DATA;
+    std::size_t bytes = body.pointerCount * 8 + body.exceptionCount * 12 + profile.importCount * 8;
+    for (std::size_t i = 0; i < body.spanCount; ++i) bytes += body.spans[i].span.size;
+    if (bytes > kProfileByteBudget) return ProfileResult::InvalidProfile;
+    ImageContext image{base, host.imageSize, 0, {}, &memory, error};
+    if (!Headers(image, host)) return ProfileResult::ImageMismatch;
+    for (std::size_t i = 0; i < profile.importCount; ++i) {
+        const auto& item = profile.imports[i];
+        if (!item.module || !item.name || (item.slotRva & 7) || !Range(host.imageSize, item.slotRva, 8))
+            return ProfileResult::InvalidProfile;
+        for (std::size_t j = 0; j < i; ++j)
+            if (Overlaps(item.slotRva, 8, profile.imports[j].slotRva, 8)) return ProfileResult::InvalidProfile;
+        for (std::size_t j = 0; j < body.spanCount; ++j)
+            if (Overlaps(item.slotRva, 8, body.spans[j].span.rva, body.spans[j].span.size))
+                return ProfileResult::InvalidProfile;
+        for (std::size_t j = 0; j < body.pointerCount; ++j)
+            if (Overlaps(item.slotRva, 8, body.pointers[j].slotRva, 8)) return ProfileResult::InvalidProfile;
+        for (std::size_t j = 0; j < body.exceptionCount; ++j)
+            if (Overlaps(item.slotRva, 8, body.exceptions[j].entryRva, 12)) return ProfileResult::InvalidProfile;
+        std::uintptr_t actual{}, expected{};
+        if (!PumpImport(image, item, &actual)) {
+            if (error) *error = ERROR_INVALID_DATA;
+            return ProfileResult::ImportMismatch;
+        }
+        if (!imports.resolve(imports.context, item.module, item.name, &expected, error) ||
+            !expected || actual != expected) {
+            if (error && !*error) *error = ERROR_PROC_NOT_FOUND;
+            return ProfileResult::ImportMismatch;
+        }
+    }
+    if (error) *error = ERROR_SUCCESS;
     return ProfileResult::Ready;
 }
 } // namespace rs2fix::reporting

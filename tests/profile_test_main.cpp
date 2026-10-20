@@ -1,6 +1,6 @@
 #include "test_framework.h"
 #include "pe_contract_lib.h"
-#include "shared/steam_reporting_status.h"
+#include "shared/steam_reporting_status_v3.h"
 
 namespace {
 rs2fix::pe::Image ReportingImage() {
@@ -9,11 +9,11 @@ rs2fix::pe::Image ReportingImage() {
     image.sections.push_back({".text", 0x1000, 0x1000, 0x400, 0x1000,
         IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE});
     // StatusWire can occupy the virtual zero-filled data tail, so the data
-    // descriptor must not accidentally require 1288 raw file-backed bytes.
+    // descriptor must not accidentally require 3896 raw file-backed bytes.
     image.sections.push_back({".data", 0x3000, 0x1000, 0, 0,
         IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE});
     image.exports.push_back({"RS2ServerFix_InitializeV3", 1, 0x1100, {}});
-    image.exports.push_back({"RS2SteamReport_StatusV2", 2, 0x3100, {}});
+    image.exports.push_back({"RS2SteamReport_StatusV3", 2, 0x3080, {}});
     image.exportFunctionCount = 2;
     return image;
 }
@@ -27,11 +27,11 @@ void ReportingContractChecks() {
     RS2_CHECK(!ParseArtifactKind(L"companion-report", &kind));
     auto valid = ReportingImage();
     std::uint32_t rva{};
-    RS2_CHECK(ReportingStatusExport(valid, &rva) && rva == 0x3100);
+    RS2_CHECK(ReportingStatusExport(valid, &rva) && rva == 0x3080);
     RS2_CHECK(!ReportingStatusExport(valid, nullptr));
-    valid.exports[1].rva = 0x4000 - static_cast<std::uint32_t>(sizeof(rs2fix::reporting::StatusWire));
+    valid.exports[1].rva = 0x4000 - static_cast<std::uint32_t>(sizeof(rs2fix::reporting::StatusWireV3));
     RS2_CHECK(ReportingStatusExport(valid, &rva)); // Exact virtual-section end.
-    for (unsigned fault = 0; fault < 15; ++fault) {
+    for (unsigned fault = 0; fault < 16; ++fault) {
         auto image = ReportingImage();
         switch (fault) {
         case 0: image.exports[1].forwarder = "OTHER.status"; break;
@@ -50,6 +50,7 @@ void ReportingContractChecks() {
         case 13: image.sections.push_back({".overlap", 0x3200, 0x100, 0, 0,
             IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE}); break;
         case 14: image.exports[1].rva = UINT32_MAX - 7; image.sizeOfImage = UINT32_MAX; break;
+        case 15: image.exports[1].name = "RS2SteamReport_StatusV2"; break;
         }
         rva = 123;
         RS2_CHECK(!ReportingStatusExport(image, &rva) && rva == 0);
@@ -57,10 +58,12 @@ void ReportingContractChecks() {
 }
 }
 namespace rs2fix::testcases { void RunProfileEvidenceTests(); void RunObserverFileProfileTests(); }
+namespace rs2fix::testcases { void NativeLogFileProfileTests(); }
 int main() {
     ReportingContractChecks();
     rs2fix::testcases::RunProfileEvidenceTests();
     rs2fix::testcases::RunObserverFileProfileTests();
+    rs2fix::testcases::NativeLogFileProfileTests();
     std::cout << "checks=" << rs2fix::test::g_checks << " failures=" << rs2fix::test::g_failures << '\n';
     return rs2fix::test::g_failures ? 1 : 0;
 }

@@ -17,7 +17,8 @@ static_assert(sizeof("host_open_sharing_violation") - 1 <= kMaxEnumFragment);
 static_assert(sizeof("pr1-crash-full-dump") - 1 <= kMaxEnumFragment);
 ReporterStorage g_reporter{};
 
-bool ValidReport(const ConsoleReportContext& report) noexcept {
+}
+bool ValidConsoleReport(const ConsoleReportContext& report) noexcept {
     if (report.bytes < 2 || report.bytes >= kConsoleLineCapacity ||
         report.line[report.bytes] != '\0' || report.line[report.bytes - 2] != '\r' ||
         report.line[report.bytes - 1] != '\n') return false;
@@ -25,6 +26,7 @@ bool ValidReport(const ConsoleReportContext& report) noexcept {
         if (report.line[i] < 32 || report.line[i] > 126) return false;
     return true;
 }
+namespace {
 ULONGLONG Ticks(void*) noexcept { return GetTickCount64(); }
 void SleepFor(void*, DWORD delay) noexcept { Sleep(delay); }
 HANDLE StdOutput(void*, DWORD* error) noexcept {
@@ -92,7 +94,7 @@ ConsoleReportResult RunConsoleReporter(const ConsoleReportContext& report,
                                       const ConsoleStatusOps& ops) noexcept {
     ConsoleReportResult result{};
     result.error = ERROR_INVALID_PARAMETER;
-    if (!ValidReport(report) || !ops.ticks || !ops.sleep || !ops.getStdOutput || !ops.write)
+    if (!ValidConsoleReport(report) || !ops.ticks || !ops.sleep || !ops.getStdOutput || !ops.write)
         return result;
     const ULONGLONG started = ops.ticks(ops.context);
     // The iteration bound also prevents a broken test clock from creating a wait.
@@ -127,7 +129,7 @@ ReporterStartResult TryStartReporter(ReporterStorage* storage,
     const ConsoleReportContext& report, const ConsoleStatusOps& ops) noexcept {
     ReporterStartResult result{};
     result.error = ERROR_INVALID_PARAMETER;
-    if (!storage || !ValidReport(report) || !ops.startThread || !ops.closeThread ||
+    if (!storage || !ValidConsoleReport(report) || !ops.startThread || !ops.closeThread ||
         !ops.ticks || !ops.sleep || !ops.getStdOutput || !ops.write) return result;
     if (InterlockedCompareExchange(&storage->claimed, 1, 0) != 0) {
         result.error = ERROR_ALREADY_EXISTS;

@@ -1,6 +1,9 @@
 #pragma once
 
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
+#if !defined(RS2_REPORTING_TESTING)
+#error The V2 private reporting writer is historical test code, never a production reporting transport.
+#endif
 #include "companion/steam_observer_log.h"
 #include "companion/steam_reporting_records.h"
 

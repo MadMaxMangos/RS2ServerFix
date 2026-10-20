@@ -9,13 +9,13 @@ bool Equal(const char* data, std::size_t count, const char* word) noexcept {
     return count == size && std::memcmp(data, word, size) == 0;
 }
 bool Space(char c) noexcept { return c == ' ' || c == '\t'; }
-} // namespace
-
-Reason ParseConfig(const char* bytes, std::size_t size, Config* output) noexcept {
-    if (output) *output = {Mode::Invalid};
+template<class Configuration> Reason Parse(const char* bytes, std::size_t size, Configuration* output) noexcept {
+    if (output) *output = {};
     if (!output || !bytes || !size || size > kConfigBytes) return Reason::ConfigInvalid;
-    bool schema = false, mode = false;
+    constexpr bool native = std::is_same_v<Configuration, ConfigV3>;
+    bool schema = false, mode = false, diagnostics = false;
     Mode selected = Mode::Invalid;
+    Diagnostics detail = Diagnostics::Invalid;
     std::size_t cursor = 0;
     while (cursor < size) {
         const auto start = cursor;
@@ -38,7 +38,7 @@ Reason ParseConfig(const char* bytes, std::size_t size, Config* output) noexcept
         while (keyEnd > first && Space(bytes[keyEnd - 1])) --keyEnd;
         while (value < last && Space(bytes[value])) ++value;
         if (Equal(bytes + first, keyEnd - first, "schema")) {
-            if (schema || !Equal(bytes + value, last - value, "2"))
+            if (schema || !Equal(bytes + value, last - value, native ? "3" : "2"))
                 return Reason::ConfigInvalid;
             schema = true;
         } else if (Equal(bytes + first, keyEnd - first, "mode")) {
@@ -48,16 +48,23 @@ Reason ParseConfig(const char* bytes, std::size_t size, Config* output) noexcept
             else if (Equal(bytes + value, last - value, "repair")) selected = Mode::Repair;
             else return Reason::ConfigInvalid;
             mode = true;
+        } else if constexpr (native) {
+            if (!Equal(bytes + first, keyEnd - first, "diagnostics") || diagnostics) return Reason::ConfigInvalid;
+            if (Equal(bytes + value, last - value, "normal")) detail = Diagnostics::Normal;
+            else if (Equal(bytes + value, last - value, "detailed")) detail = Diagnostics::Detailed;
+            else return Reason::ConfigInvalid;
+            diagnostics = true;
         } else return Reason::ConfigInvalid;
     }
-    if (!schema || !mode) return Reason::ConfigInvalid;
+    if (!schema || !mode || (native && !diagnostics)) return Reason::ConfigInvalid;
     output->mode = selected;
+    if constexpr (native) output->diagnostics = detail;
     return selected == Mode::Disabled ? Reason::ConfigDisabled : Reason::None;
 }
 
-Reason ReadConfig(const wchar_t* directory, Config* output, DWORD* error) noexcept {
+template<class Configuration> Reason Read(const wchar_t* directory, Configuration* output, DWORD* error) noexcept {
     if (error) *error = ERROR_INVALID_PARAMETER;
-    if (output) *output = {Mode::Invalid};
+    if (output) *output = {};
     if (!directory || !output) return Reason::ConfigInvalid;
     auto* path = static_cast<wchar_t*>(VirtualAlloc(nullptr, kPathCapacity * sizeof(wchar_t),
         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -88,15 +95,21 @@ Reason ReadConfig(const wchar_t* directory, Config* output, DWORD* error) noexce
         !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
         GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= sizeof(bytes) &&
         ReadFile(file, bytes, static_cast<DWORD>(size.QuadPart), &read, nullptr) &&
-        read == static_cast<DWORD>(size.QuadPart)) result = ParseConfig(bytes, read, output);
+        read == static_cast<DWORD>(size.QuadPart)) result = Parse(bytes, read, output);
     // The held read-only handle disallows concurrent writes/deletion while parsing.
     // Malformed content and all I/O failures revoke any partially parsed mode.
     if (!CloseHandle(file)) { result = Reason::ConfigInvalid; localError = GetLastError(); }
     if (result != Reason::None && result != Reason::ConfigDisabled) {
-        output->mode = Mode::Invalid;
+        *output = {};
         if (!localError) localError = ERROR_INVALID_DATA;
     }
     if (error) *error = localError;
     return result;
 }
+} // namespace
+
+Reason ParseConfig(const char* bytes, std::size_t size, Config* output) noexcept { return Parse(bytes, size, output); }
+Reason ReadConfig(const wchar_t* directory, Config* output, DWORD* error) noexcept { return Read(directory, output, error); }
+Reason ParseConfigV3(const char* bytes, std::size_t size, ConfigV3* output) noexcept { return Parse(bytes, size, output); }
+Reason ReadConfigV3(const wchar_t* directory, ConfigV3* output, DWORD* error) noexcept { return Read(directory, output, error); }
 } // namespace rs2fix::reporting

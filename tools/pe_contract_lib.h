@@ -23,4 +23,5 @@ bool ParseArtifactKind(std::wstring_view text, ArtifactKind* kind) noexcept;
 // this verifies the full shared StatusWire extent in image data, not contents.
 // Valid zero-filled data is permitted; no raw file bytes are required for it.
 bool ReportingStatusExport(const pe::Image&, std::uint32_t* rva) noexcept;
+bool RecoveryStatusExport(const pe::Image&, std::uint32_t* rva) noexcept;
 }

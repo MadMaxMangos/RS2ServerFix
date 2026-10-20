@@ -11,9 +11,44 @@ function Reject([scriptblock]$Action,[string]$Why) {
 $caseRoot=Join-Path ([IO.Path]::GetTempPath()) ('RS2ReportingCollectorTests-'+[Guid]::NewGuid().ToString('N'))
 $null=[IO.Directory]::CreateDirectory($caseRoot)
 Write-Host "Owned inert fixtures: $caseRoot"
+function FixtureUtc([uint64]$Qpc,$Boot) {
+    $mid=[System.Numerics.BigInteger]$Boot.calibration_qpc_before+
+        [System.Numerics.BigInteger]::Divide(([System.Numerics.BigInteger]$Boot.calibration_qpc_after-$Boot.calibration_qpc_before),2)
+    $delta=[System.Numerics.BigInteger]$Qpc-$mid
+    $ticks=[System.Numerics.BigInteger]::Divide(([System.Numerics.BigInteger]::Abs($delta)*10000000),$Boot.qpc_frequency)
+    return [uint64]([System.Numerics.BigInteger]$Boot.utc_calibration_filetime+$(if($delta -lt 0){-$ticks}else{$ticks}))
+}
+function FixtureJson($Record) {
+    # Match the native writer's canonical leading fields and nested-object tails.
+    $ordered=[ordered]@{}
+    foreach($key in @('schema','type','run_id','pid','sequence','qpc','utc_derived_filetime')) {
+        if($Record.Contains($key)){$ordered[$key]=$Record[$key]}
+    }
+    foreach($key in $Record.Keys){if(!$ordered.Contains($key) -and $key -cnotin @('startup','durations')){$ordered[$key]=$Record[$key]}}
+    foreach($key in @('startup','durations')){if($Record.Contains($key)){$ordered[$key]=$Record[$key]}}
+    return ($ordered|ConvertTo-Json -Depth 8 -Compress)
+}
 function LogFile([string]$Name,$Records) {
     $path=Join-Path $caseRoot $Name
-    $lines=@($Records|ForEach-Object { $_|ConvertTo-Json -Depth 8 -Compress })
+    $lines=New-Object 'Collections.Generic.List[string]'
+    $offset=0;$boot=$Records[0]
+    foreach($record in $Records) {
+        $r=[ordered]@{};foreach($key in $record.Keys){$r[$key]=$record[$key]}
+        if($r.type -cne 'startup'){$r.sequence=[uint64]$r.sequence+$offset}
+        if(!$r.Contains('utc_derived_filetime')){$r.utc_derived_filetime=FixtureUtc $r.qpc $boot}
+        $lines.Add((FixtureJson $r))
+        if($r.type -ceq 'anchor') {
+            $summary=Common 1 ([uint64]$r.sequence+1) $r.qpc
+            $summary.type='transport-summary';$summary.kind=8
+            foreach($key in @('native_submit_calls','native_submit_elapsed_ticks','native_submit_maximum_ticks',
+                'native_submit_over_five_milliseconds','forwarded_pump_without_capture','forwarded_builder_without_capture',
+                'transport_reason','pause_epoch','pause_boundary_sequence','submitted_sequence','observed_sequence','timing_accounted_through_qpc')) {$summary[$key]=0}
+            $summary.anchor_sequence=$r.sequence;$summary.transport_state=1;$summary.generated_sequence=[uint64]$r.sequence-1
+            $summary.source_epoch=$r.source_epoch;$summary.binding_epoch=$r.binding_epoch
+            $summary.utc_derived_filetime=FixtureUtc $r.qpc $boot
+            $lines.Add((FixtureJson $summary));++$offset
+        }
+    }
     Save-ReportText $path (($lines -join "`n")+"`n")
     return $path
 }
@@ -25,7 +60,9 @@ Reject { Read-ReportJson '{"sequence":01}' } 'Noncanonical number accepted.'
 Reject { Read-ReportJson '{"sequence":1,"nested":{}}' } 'Unknown nested object accepted.'
 Reject { Read-ReportFields "schema=1`r`nschema=2`r`n" } 'Duplicate evidence field accepted.'
 Check ((Read-ReportFields "reporting.lastOwnerQpc=10`r`n")['reporting.lastOwnerQpc'] -ceq '10') 'Native camelCase field rejected.'
-Check ((Read-ReportConfiguration "schema=2`r`nmode=repair`r`n" $true).mode -ceq 'repair') 'Repair semantic configuration rejected.'
+Check ((Read-ReportConfiguration "schema=3`r`nmode=repair`r`ndiagnostics=normal`r`n" $true).mode -ceq 'repair') 'Repair semantic configuration rejected.'
+Reject { Read-ReportConfiguration "schema=2`nmode=repair`n" $true } 'V2 configuration accepted by V3 collector.'
+Reject { Read-ReportConfiguration "schema=3`nmode=repair`n" $true } 'Missing diagnostics accepted.'
 Check ((Read-ReportConfiguration "enabled=1`r`nmax_log_mib=00016`r`n" $false).quota_mib -eq 16) 'Native-compatible leading-zero quota rejected.'
 Reject { Read-ReportConfiguration "schema=2`r`r`nmode=observe`n" $true } 'Extra CR differs from native parser.'
 Reject { Read-ReportConfiguration "schema=2`nmode=observe`nmode=repair`n" $true } 'Duplicate mode accepted.'
@@ -51,20 +88,75 @@ $rewritten=Join-Path $caseRoot 'rewritten.jsonl'; Save-ReportText $rewritten ('X
 Reject { Assert-ReportPrefix $partial $rewritten } 'Earlier log prefix rewrite accepted.'
 Reject { Resolve-ReportPlain (Join-Path $caseRoot '..\outside') $true } 'Traversal accepted.'
 
+# The actual streaming extractor, not a second permissive test decoder. Short
+# test limits drive the fixed production policy path without huge fixture files.
+function NativeLine([string]$Run,[int]$Sequence=1,[string]$Prefix='Log: ') {
+    return $Prefix+'[RS2ServerFix:event] {"schema":3,"type":"state","run_id":"'+$Run+'","pid":123,"sequence":'+$Sequence+"}`r`n"
+}
+function NativeCaptureCase([string]$Name,[string]$Text,[long]$Offset=0,[bool]$Boundary=$true,[int]$Prefix=0,[long]$Bytes=536870912,[long]$Frames=2000000) {
+    $path=Join-Path $caseRoot ($Name+'.log'); Save-ReportText $path $Text
+    $s=[RS2ReportCollection.Files]::OpenNative($path)
+    try{$id=[RS2ReportCollection.Files]::NativeInfo($s,$path)}finally{$s.Dispose()}
+    $native=[RS2ReportCollection.NativeCapture]::new($path,($path+'.raw'),($path+'.selected'),$id.Volume,$id.FileId,$Offset,$Boundary,$Prefix,('a'*32),$Bytes,$Frames)
+    return @{capture=$native;path=$path;identity=$id;selected=($path+'.selected');raw=($path+'.raw')}
+}
+$native=NativeCaptureCase 'mixed-native' ((('unrelated '*20000)+"`n")+'ScriptLog: chat '+(NativeLine ('a'*32))+(NativeLine ('b'*32))+(NativeLine ('a'*32)))
+try {
+    $native.capture.CopyAvailable();$native.capture.Finish()
+    Check ($native.capture.CompleteSelectedFrames -eq 1 -and !$native.capture.StopReason) 'Mixed run/chat/unrelated line selection incorrect.'
+    Check ($native.capture.ReadBytes -eq (Get-Item -LiteralPath $native.path).Length) 'Raw bytes not counted once.'
+    Check ($native.capture.PrefixSha256 -ceq (Get-FileHash -LiteralPath $native.raw -Algorithm SHA256).Hash.ToLowerInvariant()) 'Raw prefix hash mismatch.'
+}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'partial-start-native' ('discarded suffix'+"`n"+(NativeLine ('a'*32))) 3 $false
+try{$native.capture.CopyAvailable();Check ($native.capture.CompleteSelectedFrames -eq 1) 'Initial partial unrelated suffix swallowed bootstrap.'}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'byte-cap-native' (('unrelated '*500)+"`n"+(NativeLine ('a'*32))) 0 $true 0 256
+try{$native.capture.CopyAvailable();$native.capture.Finish();Check ($native.capture.StopReason -ceq 'history-byte-limit' -and $native.capture.ReadBytes -eq 256 -and $native.capture.RequiredEnd -gt $native.capture.CapturedEnd) 'Byte cap lost offsets or silently rebased.'}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'frame-cap-native' ((NativeLine ('a'*32) 1)+(NativeLine ('a'*32) 2)) 0 $true 0 4096 1
+try{$native.capture.CopyAvailable();Check ($native.capture.StopReason -ceq 'frame-limit' -and $native.capture.CompleteSelectedFrames -eq 1) 'Selected frame cap was not enforced.'}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'elapsed-native' ((NativeLine ('a'*32) 1 '[0001.25] Log: ')+(NativeLine ('a'*32) 2 '[100000.25] Log: ')+(NativeLine ('a'*32) 3 '[1.25] Log: ')) 0 $true 1
+try{$native.capture.CopyAvailable();Check ($native.capture.CompleteSelectedFrames -eq 2) 'Exact elapsed prefix grammar differs.'}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'partial-tail-native' (NativeLine ('a'*32)).TrimEnd("`r","`n")
+try{
+    $native.capture.CopyAvailable();Check ($native.capture.CompleteSelectedFrames -eq 0 -and $native.capture.SelectedPartialTail) 'Partial selected tail was fabricated as complete.'
+    [IO.File]::AppendAllText($native.path,"`r`n")
+    $native.capture.CopyAvailable();Check ($native.capture.CompleteSelectedFrames -eq 1 -and !$native.capture.SelectedPartialTail) 'Append did not finish selected frame.'
+}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'truncate-native' ('old unrelated'+"`n")
+try{$native.capture.CopyAvailable();[IO.File]::WriteAllText($native.path,'x');Reject {$native.capture.CopyAvailable()} 'Truncated held log was accepted.'}finally{$native.capture.Dispose()}
+$native=NativeCaptureCase 'replace-native' ('old unrelated'+"`n")
+try{
+    [IO.File]::Move($native.path,($native.path+'.archived'));[IO.File]::WriteAllText($native.path,'replacement')
+    Reject {$native.capture.CopyAvailable()} 'Replaced named log silently followed.'
+}finally{$native.capture.Dispose()}
+
 $runId='0123456789abcdef0123456789abcdef'
 $created=[uint64]134000000000000000
 $run=Join-Path $caseRoot ('20260917T000000Z-PID123-'+$runId)
 $identity=@{pid='123';process_creation_filetime=[string]$created;'reporting.run_id'=$runId;'reporting.ownerThreadId'='4';
     'reporting.mode'='3';'reporting.qpc_frequency'='1000000'}
-$startup=[ordered]@{type='startup';schema=2;artifact='RS2ServerFix-steam-reporting';version='0.4.2.0';artifact_version=262656;
-    run_id=$runId;pid=123;process_start_filetime=$created;qpc_frequency=1000000;utc_filetime=$created;qpc=1;
-    mode='repair';configured_mode=3;header_validity=31;host_sha256=$script:ReportHostHash;
+$startup=[ordered]@{schema=3;type='startup';run_id=$runId;pid=123;sequence=0;qpc=1;
+    artifact='RS2ServerFix-steam-reporting';version='0.6.2.0';artifact_version=393728;
+    process_start_filetime=$created;qpc_frequency=1000000;mode='repair';configured_mode=3;header_validity=31;
+    diagnostics='normal';anchor_interval_seconds=10;host_sha256=$script:ReportHostHash;
     qualified_steam_api_sha256=$script:ReportSdkHash;qualified_steamclient_sha256=$script:ReportClientHash;
-    max_log_bytes=16MB;record_bytes=256;ring_capacity=256;batch_limit=32;authentication_changed=$false;
-    verbose_observer_trace=$false;termination_may_lose_tail=$true;directory=$run}
+    transport='native';durability='unknown';utc_kind='derived';utc_calibration_filetime=$created;
+    calibration_qpc_before=1;calibration_qpc_after=1;volume_serial=1;file_id=('b'*32);
+    initial_eof=0;initial_at_line_boundary=1;prefix_mode=0;record_bytes=256;ring_capacity=256;batch_limit=32;
+    ledger_capacity=256;ready_capacity=8;message_limit=8192;native_service_hz=4;native_frames_per_opportunity=2;
+    native_frames_per_second=8;request_floor_seconds=20;authentication_changed=$false;native_counting_preserved=$true;
+    termination_may_lose_tail=$true;log_path=$run;
+    startup=[ordered]@{build_identity=1;recon_mode=1;recon_outcome=1;recon_reason=0;recon_qualified=1;
+        initialize_result=0;marker_complete=1;marker_error=0;startup_accepted=1}}
+foreach($pair in @(@('volumeSerial','volume_serial'),@('file_id','file_id'),@('initialEOF','initial_eof'),
+    @('initialAtLineBoundary','initial_at_line_boundary'),@('prefixMode','prefix_mode'),@('utcFiletime','utc_calibration_filetime'),
+    @('calibrationQpcBefore','calibration_qpc_before'),@('calibrationQpcAfter','calibration_qpc_after'))) {
+    $identity['reporting.log.'+$pair[0]]=[string]$startup[$pair[1]]
+}
+$identity['reporting.log.path']=$run
+
 function Common([int]$Kind,[uint64]$Sequence,[uint64]$Qpc) {
     return [ordered]@{type=@('','state','request','witness','builder-enter','builder-return','builder-unwind','anchor')[$Kind];
-        schema=2;run_id=$runId;pid=123;sequence=$Sequence;qpc=$Qpc;source_epoch=1;binding_epoch=1;kind=$Kind;reason=0;flags=0;thread_id=4}
+        schema=3;run_id=$runId;pid=123;sequence=$Sequence;qpc=$Qpc;source_epoch=1;binding_epoch=1;kind=$Kind;reason=0;flags=0;thread_id=4}
 }
 function ScheduleState {
     $r=Common 1 1 2
@@ -127,6 +219,129 @@ $valid=LogFile 'valid.jsonl' $records
 $log=Read-ReportLog $valid $identity $run 16MB 0 100
 Check ($log.pairs.Count -eq 1 -and $log.pairs[0].selected -eq 1 -and $log.counters.selected_true -eq 1) 'Valid Return selection or event reconciliation failed.'
 Check ($log.population_samples -eq 2 -and $log.human_observed) 'Human population evidence lost.'
+$pairBytes=[IO.File]::ReadAllText($valid)
+$withoutSummary=Join-Path $caseRoot 'partial-anchor-pair.jsonl'
+Save-ReportText $withoutSummary ((@([IO.File]::ReadLines($valid)|Where-Object{$_ -notmatch '"type":"transport-summary"'}) -join "`n")+"`n")
+$partialPair=Read-ReportLog $withoutSummary $identity $run 16MB 0 100
+Check ($partialPair.pending_summary -and $partialPair.last_sequence -eq 5) 'Trailing anchor without summary was lost or treated as complete.'
+$missingAdjacent=Join-Path $caseRoot 'missing-adjacent-summary.jsonl'
+$ordinary=ScheduleState;$ordinary.sequence=6;$ordinary.qpc=6;$ordinary.utc_derived_filetime=FixtureUtc 6 $startup
+Save-ReportText $missingAdjacent ([IO.File]::ReadAllText($withoutSummary)+(FixtureJson $ordinary)+"`n")
+Reject {Read-ReportLog $missingAdjacent $identity $run 16MB 0 100} 'Ordinary record replaced mandatory adjacent summary.'
+$badSummary=Join-Path $caseRoot 'bad-summary.jsonl';Save-ReportText $badSummary ($pairBytes.Replace('"anchor_sequence":5','"anchor_sequence":4'))
+Reject {Read-ReportLog $badSummary $identity $run 16MB 0 100} 'Summary linked to wrong anchor was accepted.'
+$badUtc=Join-Path $caseRoot 'bad-derived-utc.jsonl';Save-ReportText $badUtc ($pairBytes.Replace(('"utc_derived_filetime":'+$created),('"utc_derived_filetime":'+($created+1))))
+Reject {Read-ReportLog $badUtc $identity $run 16MB 0 100} 'Derived UTC inconsistency was accepted.'
+function ControlFixture([int]$Event,[uint64]$Sequence,[uint64]$Qpc) {
+    $r=Common 1 $Sequence $Qpc;$r.type='control';$r.kind=9
+    foreach($key in @('transport_state','transport_reason','abandoned_pending_request','abandoned_witness',
+        'last_request_qpc','generated_before','submitted_before','observed_before','forwarded_pump_without_capture',
+        'forwarded_builder_without_capture','timing_accounted_through_qpc')){$r[$key]=0}
+    $r.event=$Event;$r.pause_epoch=1;$r.pause_boundary_sequence=7;$r.generated_before=$Sequence-1
+    if($Event -eq 1){$r.transport_state=2;$r.transport_reason=8;$r.abandoned_pending_request=1;$r.abandoned_witness=1}
+    else{$r.transport_state=1;$r.submitted_before=$Sequence-1;$r.observed_before=$Sequence-1}
+    $r.utc_derived_filetime=FixtureUtc $Qpc $startup;return $r
+}
+$controls=Join-Path $caseRoot 'pause-resume.jsonl'
+Save-ReportText $controls ($pairBytes+(FixtureJson (ControlFixture 1 7 6))+"`n"+(FixtureJson (ControlFixture 2 8 7))+"`n")
+$pauseLog=Read-ReportLog $controls $identity $run 16MB 6 10
+Check ($pauseLog.transport_paused -and $pauseLog.last_sequence -eq 8) 'Pause boundary coverage was lost on resume.'
+$insidePause=Join-Path $caseRoot 'ordinary-inside-pause.jsonl'
+$ordinary.sequence=8;$ordinary.qpc=7;$ordinary.utc_derived_filetime=FixtureUtc 7 $startup
+Save-ReportText $insidePause ($pairBytes+(FixtureJson (ControlFixture 1 7 6))+"`n"+(FixtureJson $ordinary)+"`n")
+Reject {Read-ReportLog $insidePause $identity $run 16MB 0 100} 'Unadmitted ordinary record inside pause was accepted.'
+$orphan=Join-Path $caseRoot 'resume-without-pause.jsonl'
+Save-ReportText $orphan ($pairBytes+(FixtureJson (ControlFixture 2 7 6))+"`n")
+Reject {Read-ReportLog $orphan $identity $run 16MB 0 100} 'Orphan resume was accepted.'
+
+# Recovery remains a separate diagnostic stream with exact flat schema and
+# emission clocks. Repeated publication never adds the one callback measurement.
+function RecoveryFixture([uint64]$Sequence=1,[uint64]$Qpc=8) {
+    $r=Common 1 $Sequence $Qpc;$r.type='recovery';$r.kind=10
+    foreach($name in $script:RecoveryPayloadNames){$r['recovery_'+$name]=[uint64]0}
+    $r.recovery_phase=9;$r.recovery_event=1;$r.recovery_reason=18;$r.recovery_flags=516
+    $r.recovery_operation_sequence=1;$r.recovery_transition_sequence=1;$r.recovery_qpc=1;$r.recovery_owner_thread_id=4
+    $r.recovery_old_sdk_fingerprint=[uint64]::MaxValue;$r.recovery_new_sdk_fingerprint=[uint64]9223372036854775808
+    $r.recovery_old_cache_fingerprint=[uint64]9007199254740993;$r.recovery_new_cache_fingerprint=[uint64]::MaxValue
+    $r.utc_derived_filetime=FixtureUtc $Qpc $startup
+    return $r
+}
+$recoveryRecord=RecoveryFixture
+$recoveryLog=LogFile 'recovery-flat.jsonl' @($startup,$recoveryRecord)
+$modeError=$null;try{$null=Read-ReportLog $recoveryLog $identity $run 16MB 0 100}catch{$modeError=$_.Exception.Message}
+Check ($modeError -ceq 'recovery-collection-mode-required') 'Unpaused recovery normal-mode gate lost its explicit reason.'
+$recovery=Read-ReportLog $recoveryLog $identity $run 16MB 0 100 @() -TrainingRecoveryMode
+Check ($recovery.recovery_records.Count -eq 1 -and $recovery.recovery_records[0]['recovery_old_sdk_fingerprint'] -eq [uint64]::MaxValue -and
+    $recovery.recovery_records[0]['recovery_old_cache_fingerprint'] -eq [uint64]9007199254740993) 'Recovery fingerprints lost exact unsigned64 values.'
+Check ($recovery.last_qpc -eq 8 -and $recovery.recovery_records[0]['recovery_qpc'] -eq 1 -and
+    $recovery.recovery_callback_measurements.Count -eq 0) 'Fault observation QPC replaced emission QPC or unavailable timing became zero.'
+$guardProbe=RecoveryFixture;$guardProbe.recovery_phase=10;$guardProbe.recovery_reason=63
+$guardProbe.recovery_outcome=9;$guardProbe.recovery_flags=513
+$guardRead=Read-ReportLog (LogFile 'recovery-guard-probe.jsonl' @($startup,$guardProbe)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode
+Check ($guardRead.recovery_records.Count -eq 1 -and $guardRead.recovery_records[0]['recovery_reason'] -eq 63) 'Read-only guard result was not accepted.'
+$guardProbe.recovery_reason=64
+Reject {Read-ReportLog (LogFile 'recovery-guard-out-of-range.jsonl' @($startup,$guardProbe)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Out-of-range guard result accepted.'
+foreach($badField in @('recovery_phase','recovery_event','recovery_reason','recovery_outcome','recovery_resource_phase','recovery_native_stage','recovery_callback_result')) {
+    $r=RecoveryFixture;$r[$badField]=99
+    Reject {Read-ReportLog (LogFile ('recovery-invalid-'+$badField+'.jsonl') @($startup,$r)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Invalid recovery domain accepted.'
+}
+foreach($badCase in @('missing','extra','old-quota','header-reason','flags','missing-observed','unavailable-nonzero','sequence')) {
+    $r=RecoveryFixture
+    switch($badCase) {
+        missing {$r.Remove('recovery_qpc')};extra {$r.extra=0};old-quota {$r.recovery_unused_quota=0}
+        header-reason {$r.reason=18};flags {$r.recovery_flags=32768};missing-observed {$r.recovery_flags=16384}
+        unavailable-nonzero {$r.recovery_callback_own_ticks=1};sequence {$r.recovery_record_sequence=1}
+    }
+    Reject {Read-ReportLog (LogFile ('recovery-'+$badCase+'.jsonl') @($startup,$r)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} "Malformed recovery $badCase accepted."
+}
+$timed=RecoveryFixture;$timed.recovery_flags=18964;$timed.recovery_request_id=77;$timed.recovery_callback_own_ticks=0
+$timedCopy=RecoveryFixture 2 9;$timedCopy.recovery_flags=$timed.recovery_flags;$timedCopy.recovery_request_id=77
+$timings=Read-ReportLog (LogFile 'recovery-timing-copies.jsonl' @($startup,$timed,$timedCopy)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode
+Check ($timings.recovery_callback_measurements.Count -eq 1 -and $timings.recovery_callback_measurements[0].ticks -ceq '0' -and
+    $timings.recovery_callback_measurements[0].limitation.Contains('pre-claim')) 'Measured zero/copy dedup/lower-bound limitation lost.'
+$timedCopy.recovery_callback_own_ticks=1
+Reject {Read-ReportLog (LogFile 'recovery-timing-conflict.jsonl' @($startup,$timed,$timedCopy)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Conflicting finalised Create timing accepted.'
+$pausedRecovery=Join-Path $caseRoot 'paused-recovery.jsonl'
+Save-ReportText $pausedRecovery ($pairBytes+(FixtureJson (ControlFixture 1 7 6))+"`n"+(FixtureJson (RecoveryFixture 8 7))+"`n")
+$modeError=$null;try{$null=Read-ReportLog $pausedRecovery $identity $run 16MB 0 100}catch{$modeError=$_.Exception.Message}
+Check ($modeError -ceq 'recovery-collection-mode-required') 'Paused recovery normal-mode gate became native failure.'
+$pausedRecoveryRead=Read-ReportLog $pausedRecovery $identity $run 16MB 0 100 @() -TrainingRecoveryMode
+Check ($pausedRecoveryRead.transport_paused -and $pausedRecoveryRead.recovery_records.Count -eq 1) 'Reserved terminal recovery record lost during pause.'
+foreach($badCase in @('phase','event','restart','reason')) {
+    $r=RecoveryFixture 8 7
+    switch($badCase){phase {$r.recovery_phase=7};event {$r.recovery_event=3};restart {$r.recovery_flags=512};reason {$r.recovery_reason=0}}
+    $badPath=Join-Path $caseRoot ('paused-recovery-'+$badCase+'.jsonl')
+    Save-ReportText $badPath ($pairBytes+(FixtureJson (ControlFixture 1 7 6))+"`n"+(FixtureJson $r)+"`n")
+    Reject {Read-ReportLog $badPath $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Nonreserved recovery pause event accepted.'
+}
+$inventoryRecovery=@{pid='123';'reporting.pid'='123';'reporting.run_id'=$runId;'reporting.schema'='3';'reporting.bytes'='3896';
+    'reporting.artifact_version'='393728';'reporting.header_valid'='true';'reporting.identity_complete'='true';
+    'reporting.header_validity'='31';'reporting.qpc_frequency'='1000000';'recovery.snapshot_result'='Coherent';
+    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='393728';'recovery.pid'='123';
+    'recovery.run_id'=$runId;'recovery.header_ready'='1';'recovery.owner_sequence'='2'}
+foreach($name in $script:RecoveryPayloadNames){$inventoryRecovery['recovery.'+$name]=[string]$recoveryRecord['recovery_'+$name]}
+$null=Assert-ReportRecoveryFields $inventoryRecovery
+Check (@($inventoryRecovery.Keys|Where-Object{$_.StartsWith('recovery.')}).Count -eq 34) 'Coherent recovery inventory key budget changed.'
+$inventoryRecovery['recovery.owner_sequence']='4';$null=Assert-ReportRecoveryFields $inventoryRecovery
+Check $true 'Legitimate per-sample sequence progress rejected.'
+foreach($result in @('Busy','Unavailable','Invalid','ReadFailure')) {
+    $unavailable=@{'recovery.snapshot_result'=$result};$null=Assert-ReportRecoveryFields $unavailable
+    Check $true "Exact $result token rejected."
+    $unavailable['recovery.qpc']='1';Reject {Assert-ReportRecoveryFields $unavailable} 'Stale recovery payload accepted with noncoherent result.'
+}
+Reject {Assert-ReportRecoveryFields @{'recovery.snapshot_result'='busy'}} 'Lowercase recovery busy accepted.'
+$missingRecovery=@{}+$inventoryRecovery;$missingRecovery.Remove('recovery.callback_own_ticks')
+Reject {Assert-ReportRecoveryFields $missingRecovery} 'Missing coherent recovery key accepted.'
+$extraRecovery=@{}+$inventoryRecovery;$extraRecovery['recovery.current_ready']='true'
+Reject {Assert-ReportRecoveryFields $extraRecovery} 'Synthetic recovery readiness key accepted.'
+$timingInventory=@{}+$inventoryRecovery
+$timingInventory['recovery.flags']=[string]$timed.recovery_flags;$timingInventory['recovery.request_id']='77'
+$timingInventory['recovery.callback_own_ticks']='0'
+$timingRecordLog=LogFile 'recovery-status-record-copies.jsonl' @($startup,$timed)
+$combinedTiming=Read-ReportLog $timingRecordLog $identity $run 16MB 0 100 @(@{fields=$timingInventory}) -TrainingRecoveryMode
+Check ($combinedTiming.recovery_callback_measurements.Count -eq 1) 'Status/record copies added callback cost twice.'
+$timingInventory['recovery.callback_own_ticks']='1'
+Reject {Read-ReportLog $timingRecordLog $identity $run 16MB 0 100 @(@{fields=$timingInventory}) -TrainingRecoveryMode} 'Conflicting status/record finalised timing accepted.'
 $bad=@($records);$bad[4]=Build 5 4 2 3 1
 Reject { Read-ReportLog (LogFile 'wrong-pair.jsonl' $bad) $identity $run 16MB 0 100 } 'Wrong build pair accepted.'
 $bad=@($records);$bad[3]=Build 4 3 1 3 1
@@ -143,7 +358,8 @@ Reject { Read-ReportLog $valid $identity ($run+'-wrong') 16MB 0 100 } 'Wrong run
 
 function Snapshot([uint64]$Qpc,[uint64]$Counter) {
     $f=@{'reporting.revoke_reasons'='0';'reporting.loss_reasons'='0';'reporting.stopping'='0';
-        'reporting.run_id'=$runId;'reporting.owner_valid'='true';'reporting.timingAccountedThroughQpc'=[string]$Qpc}
+        'reporting.run_id'=$runId;'reporting.owner_valid'='true';'reporting.timingAccountedThroughQpc'=[string]$Qpc;
+        'recovery.snapshot_result'='Unavailable'}
     foreach($key in @('normalAttempts','fullSelected','selectedTrue','normalReturns','falseReturns','nativeUnwinds','managementCalls',
         'normalPumpClassifications','normalBuilderClassifications','requestSequence','witnessSequence','buildSequence','reportSequence','distinctSelectedWitnesses')) { $f['reporting.'+$key]=[string]$Counter }
     $f['reporting.falseReturns']='0';$f['reporting.nativeUnwinds']='0'
@@ -175,6 +391,14 @@ $samples=@((Snapshot 1000000 0),(Snapshot 121000000 10),(Snapshot 181000000 12),
 $pairSet=@(0..5|ForEach-Object { @{entry=[uint64](122000000+30000000*$_);returned=[uint64](122000001+30000000*$_);
     selected=1;result=1;witness=($_+1);unwind=$false} })
 $windowLog=@{source_changes=$false;epoch_baseline_available=$true;pairs=$pairSet;window_requests=3;window_selections=3;population_samples=3;human_observed=$true}
+$windowLog.transport_paused=$true
+$pausedWindow=Measure-ReportWindow $samples $windowLog 1000000 1000000 'repair' $calibration $artifact
+Check ($pausedWindow.local_safety -ceq 'PASS' -and $pausedWindow.local_coverage -ceq 'INCONCLUSIVE' -and $pausedWindow.local_performance -ceq 'INCONCLUSIVE') 'Transport pause became loss, coverage pass, or a performance conclusion.'
+$windowLog.Remove('transport_paused')
+$windowLog.pending_summary=$true
+$partialWindow=Measure-ReportWindow $samples $windowLog 1000000 1000000 'repair' $calibration $artifact
+Check ($partialWindow.local_coverage -ceq 'INCONCLUSIVE' -and $partialWindow.local_performance -ceq 'INCONCLUSIVE') 'Partial anchor pair gained coverage/performance conclusion.'
+$windowLog.Remove('pending_summary')
 $out=Measure-ReportWindow $samples $windowLog 1000000 1000000 'repair' $calibration $artifact
 Check ($out.local_safety -ceq 'PASS' -and $out.local_coverage -ceq 'PASS' -and $out.local_performance -ceq 'PASS') 'Healthy fixed repair window failed.'
 Check ($out.warmup_seconds -eq 120 -and $out.score_seconds -eq 180 -and $out.warmup.complete) 'Warmup/scored windows not retained.'
@@ -291,7 +515,7 @@ Save-ReportText (Join-Path $package 'SHA256SUMS') (($sums -join "`r`n")+"`r`n")
 $locks=New-Object 'Collections.Generic.List[IO.FileStream]'
 try {
     $verified=Read-ReportPackage $package $locks
-    Check ($verified.Files.Count -eq 12 -and $locks.Count -eq 13) 'Required package contract changed.'
+    Check ($verified.Files.Count -eq 16 -and $locks.Count -eq 17) 'Required training package contract changed.'
     Check (!(Read-ReportTimingCalibration $verified.Files $package).qualified) 'Absent calibration trusted.'
     Reject { [IO.File]::WriteAllText((Join-Path $package 'dlls\RS2ServerFix.dll'),'changed') } 'Package file changed while held.'
 } finally { foreach($locked in $locks){$locked.Dispose()} }
@@ -385,7 +609,7 @@ Check ($out.local_safety -ceq 'FAIL') 'Observe selection counter ignored.'
 
 $calibRoot=Join-Path $caseRoot 'calibration';$null=[IO.Directory]::CreateDirectory($calibRoot)
 function FixtureCalibration {
-    $r=[ordered]@{schema=3;measurement_id='rs2-wrapper-own-deferred-v2';protocol_id='rs2-deferred-v2-fixed6000-1024';
+    $r=[ordered]@{schema=3;measurement_id='rs2-wrapper-own-deferred-v2';protocol_id='rs2-native-log-v3-writefile-fixed6000-1024-350ms';
         companion_sha256=$artifact;fixture_sha256=('B'*64);source_inventory_sha256=('C'*64);floor_ledger_sha256=('D'*64);
         compiler='MSVC-owned-fixture';configuration='Release-AMD64';qpc_frequency=1000000;coverage_pass=$true;
         pump_sample_count=7024;main_pump_sample_count=6000;main_management_sample_count=150;
@@ -545,7 +769,7 @@ foreach($case in @('listed','unlisted','changed')){
     if($case -cne 'unlisted'){$hash=if($case -ceq 'changed'){'F'*64}else{(Get-FileHash -LiteralPath $p).Hash};$manifest+=$hash+'  performance-assessment.json'}
     Save-ReportText (Join-Path $dir 'SHA256SUMS') (($manifest -join "`r`n")+"`r`n")
     $held=New-Object 'Collections.Generic.List[IO.FileStream]'
-    try {if($case -ceq 'listed'){$v=Read-ReportPackage $dir $held;Check ($v.Files.Count -eq 13) 'Optional model was made required or rejected.'}
+    try {if($case -ceq 'listed'){$v=Read-ReportPackage $dir $held;Check ($v.Files.Count -eq 17) 'Optional model was made required or rejected.'}
         else{Reject {Read-ReportPackage $dir $held} "Unsafe optional manifest $case accepted."}}
     finally{foreach($s in $held){$s.Dispose()}}
 }
@@ -645,14 +869,18 @@ $TargetRoot=Join-Path $caseRoot 'finalization-server';$ReportRoot=Join-Path $cas
 $null=[IO.Directory]::CreateDirectory($TargetRoot);$null=[IO.Directory]::CreateDirectory($ReportRoot)
 $inertExe=Join-Path $TargetRoot 'VNGame.exe';Save-ReportText $inertExe 'inert text fixture - never executed'
 Save-ReportText (Join-Path $TargetRoot 'RS2SteamObserve.ini') "enabled=1`r`nmax_log_mib=16`r`n"
-Save-ReportText (Join-Path $TargetRoot 'RS2SteamReport.ini') "schema=2`r`nmode=observe`r`n"
+Save-ReportText (Join-Path $TargetRoot 'RS2SteamReport.ini') "schema=3`r`nmode=observe`r`ndiagnostics=normal`r`n"
 $ReportingRunDirectory=Join-Path $TargetRoot ('RS2SteamReport\fixture-PID123-'+$runId)
 $null=[IO.Directory]::CreateDirectory($ReportingRunDirectory);$MarkerPath=$null
+$LaunchLogPath=Join-Path $ReportingRunDirectory 'Launch.log';Save-ReportText $LaunchLogPath ''
+$nativeHandle=[RS2ReportCollection.Files]::OpenNative($LaunchLogPath)
+try{$nativeId=[RS2ReportCollection.Files]::NativeInfo($nativeHandle,$LaunchLogPath)}finally{$nativeHandle.Dispose()}
 $fixtureFrequency=[uint64][Diagnostics.Stopwatch]::Frequency
 $fixtureStart=$fixtureFrequency;$fixtureEnd=301*$fixtureFrequency;$fixtureFinal=302*$fixtureFrequency
 $finalizeStartup=[ordered]@{}
 foreach($key in $observeStartup.Keys){$finalizeStartup[$key]=$observeStartup[$key]}
-$finalizeStartup.qpc_frequency=$fixtureFrequency;$finalizeStartup.directory=$ReportingRunDirectory
+$finalizeStartup.qpc_frequency=$fixtureFrequency;$finalizeStartup.log_path=$LaunchLogPath
+$finalizeStartup.volume_serial=$nativeId.Volume;$finalizeStartup.file_id=$nativeId.FileId
 $finalizeRecords=New-Object 'Collections.Generic.List[object]';$finalizeRecords.Add($finalizeStartup)
 $baseline=ScheduleState;$baseline.qpc=$fixtureStart-1;$baseline.mode=2;$baseline.phase=5;$finalizeRecords.Add($baseline)
 for($i=0;$i -lt 4;++$i){
@@ -676,26 +904,39 @@ for($i=0;$i -lt 4;++$i){
         $finalizeRecords.Add($anchor)
     }
 }
-$eventText=@($finalizeRecords.ToArray()|ForEach-Object{$_|ConvertTo-Json -Depth 8 -Compress}) -join "`n"
-Save-ReportText (Join-Path $ReportingRunDirectory 'events.jsonl') ($eventText+"`n")
+$selectedFixture=LogFile 'finalized-selected-fixture.jsonl' $finalizeRecords.ToArray()
+$eventText=@([RS2ReportCollection.Files]::CompleteLines($selectedFixture)|ForEach-Object{'Log: [RS2ServerFix:event] '+$_.TrimEnd("`r")+"`r`n"}) -join ''
+[IO.File]::WriteAllText($LaunchLogPath,$eventText,(New-Object Text.UTF8Encoding($false)))
 $script:FinalizeFiles=@{'dlls/RS2ServerFix.dll'=$artifact;
     'config/RS2SteamObserve.ini'=(Get-FileHash -LiteralPath (Join-Path $TargetRoot 'RS2SteamObserve.ini')).Hash;
     'config/RS2SteamReport.ini'=(Get-FileHash -LiteralPath (Join-Path $TargetRoot 'RS2SteamReport.ini')).Hash}
 $script:FinalizeInputs=@()
-foreach($point in @(@($fixtureStart,0,1),@($fixtureEnd,3,8),@($fixtureFinal,4,11))){
+foreach($point in @(@($fixtureStart,0,1),@($fixtureEnd,3,9),@($fixtureFinal,4,13))){
     $sample=Snapshot $point[0] $point[1]
     foreach($key in @('fullSelected','selectedTrue','requestSequence','witnessSequence','distinctSelectedWitnesses')){$sample.fields['reporting.'+$key]='0'}
     $sample.fields['reporting.reportSequence']=[string]$point[2]
+    $sample.fields['reporting.worker.observedSequence']=[string]$point[2]
     $fields=@{pid='123';process_creation_filetime=[string]$created;process_image_path=$inertExe;
         host_sha256=$script:ReportHostHash;sdk_sha256=$script:ReportSdkHash;steamclient_sha256=$script:ReportClientHash;
         observed_bootstrap_sha256=('B'*64);bootstrap_sha256=('B'*64);observed_companion_sha256=$artifact;companion_sha256=$artifact;
         'reporting.mode'='2';'reporting.qpc_frequency'=[string]$fixtureFrequency;'reporting.ownerThreadId'='4';
-        'reporting.schema'='2';'reporting.bytes'='1288';'reporting.artifact_version'='262656';'reporting.header_validity'='31';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';'reporting.header_validity'='31';
         'reporting.pid'='123';'reporting.process_creation'=[string]$created;
         'reporting.lastOwnerQpc'=[string]$point[0];'reporting.observed_qpc'=[string]$point[0];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
         recon_sha256='F402D3262D39EC73E9B33E14CC4F74B06EC981ECDE94D59ADF67D905CC1DA2D5';
         constant_match='true';finding_count='0';result='pass';recon_artifact_result='pass'}
+    foreach($pair in @(@('volumeSerial','volume_serial'),@('file_id','file_id'),@('initialEOF','initial_eof'),
+        @('initialAtLineBoundary','initial_at_line_boundary'),@('prefixMode','prefix_mode'),@('utcFiletime','utc_calibration_filetime'),
+        @('calibrationQpcBefore','calibration_qpc_before'),@('calibrationQpcAfter','calibration_qpc_after'))) {
+        $fields['reporting.log.'+$pair[0]]=[string]$finalizeStartup[$pair[1]]
+    }
+    $fields['reporting.log.path']=$LaunchLogPath;$fields['reporting.log_identity_available']='true'
+    $fields['reporting.log.transportKind']='1';$fields['reporting.log.durability']='0'
+    $fields['reporting.transport.state']='1';$fields['reporting.transport.reason']='0'
+    $fields['reporting.transport.startupSubmitted']='1';$fields['reporting.transport.actualRepairAdmitted']='0'
+    $fields['reporting.worker.startupObserved']='1';$fields['reporting.worker_pause_reason']='0'
+    $fields['reporting.worker_pause_changed']='false';$fields['reporting.fatal_transport_reason']='0';$fields['reporting.phase']='5'
     foreach($key in $fields.Keys){$sample.fields[$key]=$fields[$key]}
     foreach($key in @('current_ready','captured','header_valid','owner_valid','identity_complete')){$sample.fields['reporting.'+$key]='true'}
     $sample.command_start_qpc=[uint64]($point[0]-13);$sample.command_end_qpc=[uint64]($point[0]+17)
@@ -739,7 +980,7 @@ try {
     Check ($result.local_safety -ceq 'PASS' -and $result.local_coverage -ceq 'PASS' -and $result.local_performance -ceq 'INCONCLUSIVE') 'Finalization changed observe coverage or invented absent calibration.'
     Check ($result.trial_assessment.verdict -ceq 'INCONCLUSIVE') 'Missing model gained support during finalization.'
     Check ($result.start_qpc -ceq [string]$fixtureStart -and $result.end_qpc -ceq [string]$fixtureEnd -and $result.attempts_min -ceq '3' -and $result.attempts_max -ceq '3') 'Final safety sample replaced a measurement boundary or entered the denominator.'
-    Check ($result.required_log_sequence -ceq '8' -and $result.copied_last_sequence -ceq '11' -and $result.observe_qualifying_pairs -eq 3) 'Final safety evidence/log watermark was dropped or scored as another attempt.'
+    Check ($result.required_log_sequence -ceq '13' -and $result.copied_last_sequence -ceq '13' -and $result.observe_qualifying_pairs -eq 3) 'Final safety evidence/log watermark was dropped or scored as another attempt.'
     Check ($result.samples.Count -eq 3 -and $result.samples[2].file -ceq 'inventory-final.txt') 'Final independent safety sample is missing.'
     Check ($result.final_safety -ceq 'AVAILABLE' -and !$result.samples[2].measurement -and $result.samples[1].measurement) 'Final safety read was not explicitly excluded from scoring.'
     for($i=0;$i -lt 3;++$i){
@@ -752,8 +993,8 @@ try {
     Check ($result.status_scope -ceq 'independent-DATA-not-last-log-anchor' -and !$result.private_keys_collected -and
         $result.operator_smoke -ceq 'UNVERIFIED' -and $result.backend_client_effect -ceq 'UNVERIFIED') 'Finalization promoted local evidence or changed collection scope.'
     Check ($result.configurations.'RS2SteamReport.ini'.sha256 -ceq $result.configurations.'RS2SteamReport.ini'.after_sha256 -and
-        (Test-Path -LiteralPath (Join-Path $folders[0].FullName 'events-before.jsonl')) -and
-        (Test-Path -LiteralPath (Join-Path $folders[0].FullName 'events-after.jsonl'))) 'Finalization did not retain configuration custody and both raw log prefixes.'
+        (Test-Path -LiteralPath (Join-Path $folders[0].FullName 'Launch-prefix.log')) -and
+        (Test-Path -LiteralPath (Join-Path $folders[0].FullName 'events-selected.jsonl'))) 'Finalization did not retain configuration custody and raw prefix and selected event stream.'
 
     # Route metadata reads to owned files (not the real checkout's package).
     # Preserve the actual readers, finalization order and verdict calculation.
@@ -776,6 +1017,11 @@ try {
     function Invoke-ReportInventory($Package,$Files,$ServerRoot,$SelectedId,$Report) {
         $sample=& $successfulInventory $Package $Files $ServerRoot $SelectedId $Report
         if([IO.Path]::GetFileName($Report) -ceq 'inventory-final.txt') {
+            if($script:ModelFinalizeCase -ceq 'final-pending') {
+                $sample=@{}+$sample;$sample.fields=@{}+$sample.fields;$sample.fields['reporting.reportSequence']='14'
+                Save-ReportText ($Report+'.pending-note') 'Owned fixture: generated14, observed13; unreceipted post-window tail.'
+                [IO.File]::WriteAllText($Report,((@($sample.fields.Keys|Sort-Object|ForEach-Object{$_+'='+$sample.fields[$_]}) -join "`r`n")+"`r`n"))
+            }
             if($script:ModelFinalizeCase -ceq 'final-sticky') {
                 $sample=@{}+$sample;$sample.fields=@{}+$sample.fields;$sample.fields['reporting.loss_reasons']='1'
                 # The synthetic DATA and its preserved raw file describe the same fault.
@@ -783,11 +1029,11 @@ try {
             }
         }
         if($script:ModelFinalizeCase -ceq 'prefix-partial' -and [IO.Path]::GetFileName($Report) -ceq 'inventory-0001.txt') {
-            [IO.File]::AppendAllText((Join-Path $ReportingRunDirectory 'events.jsonl'),'{')
+            [IO.File]::AppendAllText($LaunchLogPath,('Log: [RS2ServerFix:event] {"schema":3,"type":"state","run_id":"'+$runId+'","pid":123'))
         }
         return $sample
     }
-    foreach($case in @('valid','invalid-model','final-sticky','prefix-partial','config-final')) {
+    foreach($case in @('valid','final-pending','invalid-model','final-sticky','prefix-partial','config-final')) {
         $script:ModelFinalizeCase=$case;$script:FinalizeInventoryCalls=0;$script:FinalizeSleeps=0
         $ReportRoot=Join-Path $caseRoot ('model-finalization-'+$case);$null=[IO.Directory]::CreateDirectory($ReportRoot)
         if($case -in 'invalid-model','config-final') {
@@ -797,15 +1043,16 @@ try {
             Check ($saved.trial_assessment.verdict -ceq 'INCONCLUSIVE' -and $saved.local_performance -ceq 'INCONCLUSIVE' -and
                 !$saved.overall_qualified -and $saved.samples.Count -eq 3 -and
                 !(Test-Path -LiteralPath (Join-Path $folder.FullName 'collection.json')) -and
-                (Test-Path -LiteralPath (Join-Path $folder.FullName 'events-after.jsonl'))) "Finalization $case retained support or discarded evidence."
+                (Test-Path -LiteralPath (Join-Path $folder.FullName 'events-selected.jsonl'))) "Finalization $case retained support or discarded evidence."
         } else {
             Invoke-SteamReportCollection
             $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
             $saved=Get-Content -LiteralPath (Join-Path $folder.FullName 'collection.json') -Raw|ConvertFrom-Json
-            $want=switch($case){'valid'{'SUPPORTED_OBSERVE_ONLY'} 'final-sticky'{'NOT_SUPPORTED'} default{'INCONCLUSIVE'}}
+            $want=switch($case){'valid'{'SUPPORTED_OBSERVE_ONLY'} 'final-pending'{'SUPPORTED_OBSERVE_ONLY'} 'final-sticky'{'NOT_SUPPORTED'} default{'INCONCLUSIVE'}}
             Check ($saved.trial_assessment.verdict -ceq $want -and !$saved.trial_assessment.pilot_start_authorized) "Incorrect final $case trial verdict."
+            if($case -ceq 'final-pending'){Check ($saved.required_log_sequence -ceq '13' -and $saved.final_generated_log_sequence -ceq '14' -and $saved.final_unreceipted_records -ceq '1') 'Post-window pending tail became a missing required measurement record.'}
         }
-        if($case -ceq 'prefix-partial'){[IO.File]::WriteAllText((Join-Path $ReportingRunDirectory 'events.jsonl'),($eventText+"`n"),(New-Object Text.UTF8Encoding($false)))}
+        if($case -ceq 'prefix-partial'){[IO.File]::WriteAllText($LaunchLogPath,$eventText,(New-Object Text.UTF8Encoding($false)))}
     }
     $script:ModelFinalizeCase='valid'
 
@@ -870,6 +1117,146 @@ try {
             !(Test-Path -LiteralPath (Join-Path $folder.FullName 'inventory-final.txt'))) "Termination $stopCase invoked final helper or qualified missing safety."
         if($stopCase -ceq 'observed') { Check ($stopped.local_performance -ceq 'INCONCLUSIVE') 'Stalled accounting cutoff passed performance at expiry.' }
     }
+
+    # Caps must preserve the partial prefix and take final DATA immediately,
+    # without waiting for a measurement interval or inventing a recent baseline.
+    $script:CollectionStopCase='';$script:ModelFinalizeCase='valid'
+    $realCapture=${function:New-NativeReportCapture}
+    function Invoke-ReportInventory($Package,$Files,$ServerRoot,$SelectedId,$Report) {
+        $point=if([IO.Path]::GetFileName($Report) -ceq 'inventory-final.txt'){2}else{0}
+        ++$script:FinalizeInventoryCalls
+        $sample=@{}+$script:FinalizeInputs[$point];$sample.fields=@{}+$sample.fields;$sample.path=$Report
+        Save-ReportText $Report ((@($sample.fields.Keys|Sort-Object|ForEach-Object{$_+'='+$sample.fields[$_]}) -join "`r`n")+"`r`n")
+        return $sample
+    }
+    function New-NativeReportCapture($Native,$Identity,[string]$Directory) {
+        $bytes=if($script:NativeCapCase -ceq 'history-byte-limit'){64}else{536870912}
+        $frames=if($script:NativeCapCase -ceq 'frame-limit'){1}else{2000000}
+        return [RS2ReportCollection.NativeCapture]::new($Native.path,(Join-Path $Directory 'Launch-prefix.log'),
+            (Join-Path $Directory 'events-selected.jsonl'),[uint64]$Identity['reporting.log.volumeSerial'],$Identity['reporting.log.file_id'],
+            [long]$Identity['reporting.log.initialEOF'],$true,0,$Identity['reporting.run_id'],$bytes,$frames)
+    }
+    try {
+        foreach($capCase in @('history-byte-limit','frame-limit')) {
+            $script:NativeCapCase=$capCase;$script:FinalizeInventoryCalls=0;$script:FinalizeSleeps=0
+            $ReportRoot=Join-Path $caseRoot ('cap-finalization-'+$capCase);$null=[IO.Directory]::CreateDirectory($ReportRoot)
+            Invoke-SteamReportCollection
+            $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
+            $saved=Get-Content -Raw -LiteralPath (Join-Path $folder.FullName 'collection.json')|ConvertFrom-Json
+            Check ($script:FinalizeInventoryCalls -eq 2 -and $script:FinalizeSleeps -eq 0 -and $saved.reason -ceq $capCase) 'Cap waited, omitted final DATA, or lost its reason.'
+            Check ($saved.local_safety -ceq 'UNVERIFIED' -and $saved.local_coverage -ceq 'INCONCLUSIVE' -and
+                $saved.local_performance -ceq 'INCONCLUSIVE' -and !$saved.overall_qualified) 'Incomplete history was promoted.'
+            Check ((Test-Path -LiteralPath (Join-Path $folder.FullName 'Launch-prefix.log')) -and
+                (Test-Path -LiteralPath (Join-Path $folder.FullName 'inventory-final.txt')) -and $saved.native_prefix.prefix_sha256.Length -eq 64) 'Cap discarded raw prefix/hash/final DATA.'
+        }
+    } finally {Set-Item Function:New-NativeReportCapture $realCapture}
+
+    # Drive the existing live collection route through READY -> the coherent
+    # retired-builder NOTREADY window -> terminal failure, without any scoring.
+    $trainingSamples=New-Object 'Collections.Generic.List[object]'
+    for($point=0;$point -lt 3;++$point) {
+        $sample=@{}+$script:FinalizeInputs[0];$sample.fields=@{}+$sample.fields
+        $qpc=[uint64]($fixtureStart+$point*$fixtureFrequency)
+        $sample.command_start_qpc=$qpc-13;$sample.command_end_qpc=$qpc+17
+        $sample.fields['reporting.lastOwnerQpc']=[string]$qpc;$sample.fields['reporting.observed_qpc']=[string]$qpc
+        foreach($key in $inventoryRecovery.Keys){if($key.StartsWith('recovery.')){$sample.fields[$key]=$inventoryRecovery[$key]}}
+        $sample.fields['recovery.phase']=if($point -eq 0){'1'}elseif($point -eq 1){'6'}else{'9'}
+        $sample.fields['recovery.qpc']=[string]$qpc;$sample.fields['recovery.source_epoch']='1';$sample.fields['reporting.sourceEpoch']='1'
+        $sample.fields['recovery.owner_thread_id']='4';$sample.fields['recovery.flags']=if($point -lt 2){'1'}else{'517'}
+        $sample.fields['recovery.operation_sequence']=if($point){'1'}else{'0'}
+        $sample.fields['recovery.reason']=if($point -lt 2){'0'}else{'18'}
+        $sample.fields['recovery.outcome']=if($point -lt 2){'0'}else{'4'}
+        $sample.fields['recovery.owner_sequence']=[string](2+2*$point)
+        if($point) {
+            $sample.fields['reporting.state']='not-ready';$sample.fields['reporting.current_ready']='false'
+            $sample.fields['reporting.phase']='3';$sample.fields['reporting.reason']='0';$sample.fields['reporting.builderBound']='0'
+            $sample.fields['reporting.transport.actualRepairAdmitted']='0'
+        }
+        $trainingSamples.Add($sample)
+    }
+    Check (Test-ReportRecoveryActive $trainingSamples[1]) 'Matching active recovery NOTREADY window was not recognised.'
+    foreach($badKey in @('reporting.loss_reasons','reporting.reason','reporting.fatal_transport_reason')) {
+        $bad=@{}+$trainingSamples[1];$bad.fields=@{}+$bad.fields;$bad.fields[$badKey]='1'
+        Check (!(Test-ReportRecoveryActive $bad)) 'Unrelated normal fault gained recovery readiness waiver.'
+    }
+    $bad=@{}+$trainingSamples[1];$bad.fields=@{}+$bad.fields;$bad.fields['recovery.run_id']='f'*32
+    Reject {Test-ReportRecoveryActive $bad} 'Wrong-run recovery gained readiness waiver.'
+    $bad=@{}+$trainingSamples[1];$bad.fields=@{}+$bad.fields
+    foreach($key in @($bad.fields.Keys|Where-Object{$_.StartsWith('recovery.')})){$bad.fields.Remove($key)}
+    $bad.fields['recovery.snapshot_result']='Unavailable'
+    Check (!(Test-ReportRecoveryActive $bad)) 'Unavailable recovery gained readiness waiver.'
+    $trainingRecord=RecoveryFixture 1 ([uint64]($fixtureStart+2*$fixtureFrequency))
+    $trainingRecord.recovery_qpc=$fixtureStart;$trainingRecord.recovery_outcome=4
+    $trainingRecord.utc_derived_filetime=FixtureUtc $trainingRecord.qpc $finalizeStartup
+    $trainingStartup=[ordered]@{};foreach($key in $finalizeStartup.Keys){$trainingStartup[$key]=$finalizeStartup[$key]}
+    $trainingStartup.utc_derived_filetime=FixtureUtc $trainingStartup.qpc $finalizeStartup
+    $trainingText='Log: [RS2ServerFix:event] '+(FixtureJson $trainingStartup)+"`r`n"+
+        'Log: [RS2ServerFix:event] '+(FixtureJson $trainingRecord)+"`r`n"
+    [IO.File]::WriteAllText($LaunchLogPath,$trainingText,(New-Object Text.UTF8Encoding($false)))
+    $script:TrainingInputs=$trainingSamples.ToArray();$script:TrainingIndex=0
+    function Invoke-ReportInventory($Package,$Files,$ServerRoot,$SelectedId,$Report) {
+        if($script:TrainingIndex -ge $script:TrainingInputs.Count){throw 'Training capture invoked an extra helper.'}
+        $sample=@{}+$script:TrainingInputs[$script:TrainingIndex];$sample.fields=@{}+$sample.fields;$sample.path=$Report
+        ++$script:TrainingIndex
+        Save-ReportText $Report ((@($sample.fields.Keys|Sort-Object|ForEach-Object{$_+'='+$sample.fields[$_]}) -join "`r`n")+"`r`n")
+        return $sample
+    }
+    $TrainingRecovery=$true;$script:FinalizeSleeps=0
+    try {
+        $ReportRoot=Join-Path $caseRoot 'training-recovery-live';$null=[IO.Directory]::CreateDirectory($ReportRoot)
+        Invoke-SteamReportCollection
+        $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
+        $saved=Get-Content -LiteralPath (Join-Path $folder.FullName 'collection.json') -Raw|ConvertFrom-Json
+        Check ($script:TrainingIndex -eq 3 -and $saved.reason -ceq 'training-recovery-failed' -and
+            $saved.local_safety -ceq 'FAIL' -and $saved.local_performance -ceq 'INCONCLUSIVE' -and !$saved.overall_qualified) 'Training mode stopped in expected window or scored terminal failure.'
+        Check ((Test-Path -LiteralPath (Join-Path $folder.FullName 'Launch-prefix.log')) -and $saved.recovery_records.Count -eq 1) 'Training terminal raw evidence was discarded.'
+    } finally {$TrainingRecovery=$false}
+    $script:TrainingIndex=0
+    $ReportRoot=Join-Path $caseRoot 'recovery-normal-live';$null=[IO.Directory]::CreateDirectory($ReportRoot)
+    Reject {Invoke-SteamReportCollection} 'Normal live route accepted recovery.'
+    $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
+    $saved=Get-Content -LiteralPath (Join-Path $folder.FullName 'collection-incomplete.json') -Raw|ConvertFrom-Json
+    Check ($saved.reason -ceq 'recovery-collection-mode-required' -and !$saved.overall_qualified -and
+        (Test-Path -LiteralPath (Join-Path $folder.FullName 'Launch-prefix.log'))) 'Normal live recovery mode error did not preserve raw evidence.'
+    [IO.File]::WriteAllText($LaunchLogPath,$eventText,(New-Object Text.UTF8Encoding($false)))
+
+    # Explicit post-exit archive on the SAME file identity. Never invoke a live
+    # helper, silently substitute a copied file, or claim current readiness.
+    $ArchivedStatusPath=Join-Path $caseRoot 'archive-inventory.txt'
+    $savedFields=@{}+$script:FinalizeInputs[2].fields
+    $savedFields.schema='1';$savedFields.mode='runtime-inventory';$savedFields.companion_kind='companion-reporting'
+    Save-ReportText $ArchivedStatusPath ((@($savedFields.Keys|Sort-Object|ForEach-Object{$_+'='+$savedFields[$_]}) -join "`r`n")+"`r`n")
+    $originalLaunch=$LaunchLogPath;$LaunchLogPath=Join-Path $ReportingRunDirectory 'Archived-Launch.log'
+    [IO.File]::Move($originalLaunch,$LaunchLogPath)
+    function Invoke-ReportInventory {throw 'Archive attempted a live process observation.'}
+    try {
+        $ReportRoot=Join-Path $caseRoot 'archive-finalization';$null=[IO.Directory]::CreateDirectory($ReportRoot)
+        Invoke-SteamReportCollection
+        $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
+        $saved=Get-Content -Raw -LiteralPath (Join-Path $folder.FullName 'collection.json')|ConvertFrom-Json
+        Check ($saved.mode -ceq 'archive' -and !$saved.current_process_observed -and !$saved.overall_qualified -and
+            $saved.final_safety -ceq 'UNAVAILABLE' -and $saved.native_prefix.final_file_id -ceq $nativeId.FileId) 'Archive fabricated readiness or lost file identity.'
+        Check ($saved.original_log_path -ceq $originalLaunch -and $saved.archive_log_path -ceq $LaunchLogPath) 'Archive hid original or explicit new path.'
+        Reject {Resolve-NativeReportLog $savedFields $TargetRoot $valid $TargetRoot -Archive} 'Outside-root archive accepted without permission.'
+        $archiveRecovery=RecoveryFixture 14 ([uint64]($fixtureFinal+1))
+        $archiveRecovery.utc_derived_filetime=FixtureUtc $archiveRecovery.qpc $finalizeStartup
+        [IO.File]::AppendAllText($LaunchLogPath,('Log: [RS2ServerFix:event] '+(FixtureJson $archiveRecovery)+"`r`n"))
+        $ReportRoot=Join-Path $caseRoot 'recovery-normal-archive';$null=[IO.Directory]::CreateDirectory($ReportRoot)
+        Reject {Invoke-SteamReportCollection} 'Normal archive route accepted recovery.'
+        $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
+        $saved=Get-Content -LiteralPath (Join-Path $folder.FullName 'collection-incomplete.json') -Raw|ConvertFrom-Json
+        Check ($saved.reason -ceq 'recovery-collection-mode-required' -and !$saved.overall_qualified -and
+            (Test-Path -LiteralPath (Join-Path $folder.FullName 'Launch-prefix.log'))) 'Normal archive recovery mode error did not preserve raw evidence.'
+        $TrainingRecovery=$true
+        try {
+            $ReportRoot=Join-Path $caseRoot 'training-recovery-archive';$null=[IO.Directory]::CreateDirectory($ReportRoot)
+            Invoke-SteamReportCollection
+            $folder=@(Get-ChildItem -LiteralPath $ReportRoot -Directory)[0]
+            $saved=Get-Content -LiteralPath (Join-Path $folder.FullName 'collection.json') -Raw|ConvertFrom-Json
+            Check ($saved.collection_mode -ceq 'TrainingRecovery' -and !$saved.overall_qualified -and
+                $saved.local_performance -ceq 'INCONCLUSIVE' -and $saved.recovery_records.Count -eq 1) 'Training archive invented qualification or omitted recovery evidence.'
+        } finally {$TrainingRecovery=$false}
+    } finally {$ArchivedStatusPath=$null;[IO.File]::Move($LaunchLogPath,$originalLaunch);$LaunchLogPath=$originalLaunch}
 } finally {
     Set-Item Function:Read-ReportTimingCalibration $realCalibration;Set-Item Function:Read-ReportPerformanceAssessment $realAssessment
     Set-Item Function:Get-ReportHash $realHash

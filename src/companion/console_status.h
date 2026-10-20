@@ -39,6 +39,7 @@ struct ReporterStartResult {
 
 bool FormatConsoleStatus(const MarkerData& data, const MarkerWriteResult& marker,
     ConsoleReportContext* output) noexcept;
+bool ValidConsoleReport(const ConsoleReportContext& report) noexcept;
 ConsoleReportResult RunConsoleReporter(const ConsoleReportContext& report,
     const ConsoleStatusOps& ops) noexcept;
 

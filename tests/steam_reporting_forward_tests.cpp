@@ -90,9 +90,15 @@ ClientQualification InertQualification() noexcept {
     result.referenceAcquired = true; result.referenceReleased = true;
     return result;
 }
+bool ReadUnrevokedOwner(const StatusWireV3& wire,StatusHeader* header,StatusPayload* payload) noexcept {
+    *header={}; *payload={}; OwnerSnapshotV3 copy{};
+    if (StatusRevoked(wire) || !ReadOwnerV3(wire,&copy) || StatusRevoked(wire)) return false;
+    *header=wire.header; *payload=copy.owner;
+    return true; // Counter fixture, not a reporting-ready or receipt verdict.
+}
 struct Fixture {
-    StatusWire status{};
-    ReportRing ring{};
+    StatusWireV3 status{};
+    ReportRingV3 ring{};
     obs::DispatchState dispatch{};
     Runtime runtime{};
     Outcome outcome{Outcome::True};
@@ -104,6 +110,9 @@ struct Fixture {
     std::uint64_t nestedPrivateCutoff{}, nestedPublishedCutoff{};
     void* holder{reinterpret_cast<void*>(1)}; // Intentionally unreadable and opaque.
     volatile LONG pumpCalls{}, builderCalls{}, argumentErrors{}, queries{}, reads{}, notices{};
+    unsigned logSnapshots{};
+    std::uint64_t logEpoch{};
+    bool poisonTransportRefresh{};
 
     Fixture() {
         ResetPublishedRuntimeForTest();
@@ -119,7 +128,7 @@ struct Fixture {
         header.configuredMode = static_cast<std::uint32_t>(Mode::Observe);
         header.qpcFrequency = static_cast<std::uint64_t>(frequency.QuadPart);
         header.pid = GetCurrentProcessId(); header.runId[0] = 1;
-        RS2_CHECK(InitializeStatus(status, header, {}));
+        RS2_CHECK(InitializeStatusV3(status, header, {}));
         RS2_CHECK(InitializeReportRing(ring, status, GetCurrentThreadId()));
         obs::InitializeDispatch(dispatch, {}, {});
         InterlockedExchange(&dispatch.gate, static_cast<LONG>(obs::Gate::Armed));
@@ -140,6 +149,12 @@ struct Fixture {
         config.noticeContext = this; config.notice = Notice; config.qualifyClient = InertQualification;
         const bool initialized = InitializeRuntime(runtime, config, frequency.QuadPart) == Reason::None;
         RS2_CHECK(initialized);
+        // Counter/forwarding-only seam, not physical log/readiness evidence.
+        runtime.transport.state=static_cast<std::uint64_t>(TransportState::Running);
+        runtime.transport.reason=0; runtime.transport.startupSubmitted=1;
+        runtime.transport.qualifiedSinkEpoch=1;
+        StoreStatusWord(status.logIdentityReady,1);
+        StoreStatusWord(status.worker.startupObserved,1);
         const bool captured = initialized && PrepareRuntimeCapture(runtime, self);
         RS2_CHECK(captured);
         live = captured && PublishRuntime(runtime);
@@ -171,6 +186,31 @@ struct Fixture {
         return (ReadStatusWord(status.revokeReasons) & (1ULL << static_cast<unsigned>(reason))) != 0;
     }
     void ClearProbes() noexcept { InterlockedExchange(&queries, 0); InterlockedExchange(&reads, 0); }
+    static TransportReason LogSnapshot(void* ptr,NativeLogSnapshot* out) noexcept {
+        auto& f=*static_cast<Fixture*>(ptr); ++f.logSnapshots;
+        *out={}; out->redirector=1; out->file=2; out->archive=3;
+        if (f.poisonTransportRefresh) {
+            f.runtime.lastClock=(std::numeric_limits<std::int64_t>::max)();
+            f.runtime.haveClock=true;
+        }
+        return TransportReason::None;
+    }
+    static bool LogRequest(void* ptr,std::uint64_t epoch,const NativeLogSnapshot&) noexcept {
+        static_cast<Fixture*>(ptr)->logEpoch=epoch; return true;
+    }
+    static std::uint64_t LogQualified(void* ptr) noexcept { return static_cast<Fixture*>(ptr)->logEpoch; }
+    static const NativeReadyFrame* NoLogFrame(void*,std::uint64_t) noexcept { return nullptr; }
+    static bool NoLogReturn(void*,std::uint64_t) noexcept { return false; }
+    static bool LogClock(void*,std::uint64_t* out) noexcept {
+        LARGE_INTEGER now{}; if (!QueryPerformanceCounter(&now)) return false;
+        *out=static_cast<std::uint64_t>(now.QuadPart); return true;
+    }
+    static void NeverLog(void*,const wchar_t*) { RS2_CHECK(false); }
+    void EnableTransportSchedule() {
+        const NativeLogServiceOps ops{this,LogSnapshot,LogRequest,LogQualified,NoLogFrame,NoLogReturn,LogClock};
+        RS2_CHECK(InitializeNativeLogServiceForTest(runtime.nativeLog,status,runtime.transport,
+            GetCurrentThreadId(),ops,NeverLog));
+    }
 };
 
 void Incoming(Fixture& f, void* holder, bool builder) noexcept {
@@ -351,7 +391,7 @@ void OnePublicationLagAndFinalFailures() {
             const auto outgoing = GetLastError();
             StatusHeader header{}; StatusPayload published{};
             RS2_CHECK(result && outgoing == kOutgoing && f.argumentErrors == 0);
-            RS2_CHECK(ReadLocalStatus(f.status, &header, &published));
+            RS2_CHECK(ReadUnrevokedOwner(f.status, &header, &published));
             RS2_CHECK(published.durations[kind].calls == invocation - 1);
             RS2_CHECK(std::memcmp(&published.durations[kind], &expected, sizeof(expected)) == 0);
             RS2_CHECK(f.runtime.counters.durations[kind].calls == invocation-1);
@@ -360,7 +400,7 @@ void OnePublicationLagAndFinalFailures() {
             RS2_CHECK(ReadStatusWord(f.status.ownerSequence) == sequence + 2);
             // Another read is not an accessor that flushes private timing state.
             StatusHeader againHeader{}; StatusPayload again{};
-            RS2_CHECK(ReadLocalStatus(f.status, &againHeader, &again));
+            RS2_CHECK(ReadUnrevokedOwner(f.status, &againHeader, &again));
             RS2_CHECK(std::memcmp(&published, &again, sizeof(again)) == 0);
             RS2_CHECK(f.runtime.pumpDepth == 0 && f.runtime.builderDepth == 0 && f.queries == 0 && f.reads == 0);
         }
@@ -395,7 +435,7 @@ void OnePublicationLagAndFinalFailures() {
         RS2_CHECK(std::memcmp(&f.runtime.counters.durations[kind], &prior, sizeof(prior)) == 0);
         RS2_CHECK(ReadStatusWord(f.status.owner.durations[kind].calls) == prior.calls);
         StatusHeader header{}; StatusPayload published{};
-        RS2_CHECK(!ReadLocalStatus(f.status, &header, &published));
+        RS2_CHECK(!ReadUnrevokedOwner(f.status, &header, &published));
         RS2_CHECK((builder ? f.builderCalls : f.pumpCalls) == 1 && f.runtime.pumpDepth == 0 && f.runtime.builderDepth == 0);
     }
 }
@@ -455,6 +495,50 @@ void AdaptiveManagementCadence() {
       f.runtime.producer.pending.active=true; elapsedQuarters(f,0); pump(f);
       RS2_CHECK(f.pumpCalls==1 && f.queries==0 && f.runtime.counters.managementCalls==0); }
 }
+
+void IndependentTransportSchedule() {
+    const auto prepare=[](Fixture& f) {
+        PumpEngine(PumpOracle);
+        auto& a=f.runtime.config.ancestry;
+        a.callbackReturn=g_pumpReturns[0]; a.worldReturns[0]=a.worldReturns[1]=g_pumpReturns[1];
+        a.engineReturn=g_pumpReturns[2];
+        f.Ready(); f.runtime.sourceReady=true; f.runtime.producer.epochReady=true;
+        InterlockedExchange(&f.runtime.task.phase,static_cast<LONG>(TaskPhase::Armed));
+        LARGE_INTEGER now{}; RS2_CHECK(QueryPerformanceCounter(&now));
+        f.runtime.haveManagement=true;
+        f.runtime.lastManagement=now.QuadPart-f.runtime.producer.frequency*3/4;
+        f.runtime.config.diagnostics=Diagnostics::Detailed;
+        f.EnableTransportSchedule(); f.ClearProbes();
+    };
+    {
+        Fixture f; if (!f.live) return; prepare(f);
+        SetLastError(kIncoming); PumpEngine(PumpEntry);
+        RS2_CHECK(GetLastError()==kOutgoing && f.argumentErrors==0);
+        RS2_CHECK(f.logSnapshots>0 && f.queries==0 && f.reads==0);
+        RS2_CHECK(f.runtime.counters.managementCalls==0 && f.runtime.pendingDuration.kind==DurationClass::PumpManagement);
+        const auto before=f.logSnapshots;
+        // Another due250ms service opportunity while stable management remains
+        // inside its2s floor. Scheduling seam changes time bookkeeping only.
+        f.runtime.nativeLog.lastService-=static_cast<std::uint64_t>(f.runtime.producer.frequency/4+1);
+        SetLastError(kIncoming); PumpEngine(PumpEntry);
+        RS2_CHECK(f.logSnapshots>before && f.runtime.counters.managementCalls==0 && f.queries==0);
+    }
+    {
+        Fixture f; if (!f.live) return; prepare(f);
+        SetLastError(kIncoming); PumpEntry(); // Not the qualified PumpEngine chain.
+        RS2_CHECK(f.logSnapshots==0 && !f.Revoked(Reason::UnknownAncestry) && !f.Revoked(Reason::TruncatedStack));
+        RS2_CHECK(f.runtime.counters.managementCalls==0 && f.queries==0);
+    }
+    {
+        Fixture f; if (!f.live) return; prepare(f); f.poisonTransportRefresh=true;
+        const auto management=f.runtime.lastManagement;
+        SetLastError(kIncoming); PumpEngine(PumpEntry);
+        RS2_CHECK(f.logSnapshots>0 && f.Revoked(Reason::ClockFailed));
+        RS2_CHECK(f.runtime.lastManagement==management && f.runtime.counters.managementCalls==0);
+        RS2_CHECK(f.queries==0 && f.reads==0 && !f.runtime.transport.reservedCredits);
+    }
+}
+
 void NestedIntervalsAccountOnceWithLag() {
     for (const bool builder : {false, true}) {
         Fixture f; if (!f.live) continue;
@@ -600,6 +684,7 @@ void ReportingForwardTests() {
     ActualNormalCapture();
     OnePublicationLagAndFinalFailures();
     AdaptiveManagementCadence();
+    IndependentTransportSchedule();
     NestedIntervalsAccountOnceWithLag();
     CompletedRootCutoff();
     PendingAccountingFailuresAndLifecycle();

@@ -1,6 +1,6 @@
 #include "companion/steam_observer_log.h"
 #include "companion/console_status.h"
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
 #include "companion/steam_reporting_log.h"
 #include "companion/steam_reporting_profile.h"
 #include "shared/selected_reporting_profile.h"
@@ -41,7 +41,7 @@ struct PrivateSecurity {
     SECURITY_ATTRIBUTES attributes;
 };
 ReporterStorage g_disabledReporter{};
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
 // Reporting must not contend for the legacy observer's already-used slots.
 ReporterStorage g_reportReadyReporter{};
 ReporterStorage g_reportDisabledReporter{};
@@ -286,7 +286,7 @@ struct Writer {
     bool manual;
     bool noticedBound;
     bool noticedCalls;
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     reporting::StatusWire* reportStatus;
     reporting::ReportRing* reportRing;
     reporting::StatusHeader reportHeader;
@@ -412,7 +412,7 @@ WriterStatus Status(Writer& writer) noexcept {
     return static_cast<WriterStatus>(InterlockedCompareExchange(&writer.status, 0, 0));
 }
 void Fail(Writer& writer, WriterStatus status, DWORD error) noexcept {
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     if (writer.reportStatus) {
         // An actual admitted output failure stays sticky even across a later
         // normal stop. Console/log delivery cannot be required for this latch.
@@ -594,9 +594,9 @@ void Terminal(Writer& writer) noexcept {
         Status(writer) == WriterStatus::Truncated ? Reason::LogLimit : Reason::WriterFailed);
     CloseResources(writer);
 }
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
 void ReportNotice(const reporting::StatusHeader* header, bool ready,
-    reporting::Reason reason) noexcept {
+    reporting::Reason reason,const char* version="0.4.2.0") noexcept {
     auto* storage=ready ? &g_reportReadyReporter : &g_reportDisabledReporter;
     if (InterlockedCompareExchange(&storage->claimed,0,0)) return;
     ConsoleReportContext report{};
@@ -606,8 +606,8 @@ void ReportNotice(const reporting::StatusHeader* header, bool ready,
     if (identified) Hex(header->runId, sizeof(header->runId), runId);
     const auto mode = header ? static_cast<reporting::Mode>(header->configuredMode) : reporting::Mode::Invalid;
     const int count = std::snprintf(report.line, sizeof(report.line),
-        "[RS2SteamReport] v0.4.2.0; status=%s; mode=%s; reason=%s; run_id=%s; pid=%lu\r\n",
-        ready ? "ready" : "disabled", reporting::ModeName(mode), reporting::ReasonName(reason),
+        "[RS2SteamReport] v%s; status=%s; mode=%s; reason=%s; run_id=%s; pid=%lu\r\n",
+        version, ready ? "ready" : "disabled", reporting::ModeName(mode), reporting::ReasonName(reason),
         identified ? runId : "unavailable", header ? static_cast<DWORD>(header->pid) : 0UL);
     if (count > 0 && static_cast<std::size_t>(count) < sizeof(report.line)) {
         report.bytes = static_cast<DWORD>(count);
@@ -819,7 +819,7 @@ void PumpReporting(Writer& writer) noexcept {
 }
 #endif
 void Pump(Writer& writer) noexcept {
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     if (writer.reportStatus) { PumpReporting(writer); return; }
 #endif
     if (writer.closed || !InterlockedCompareExchange(&writer.armed, 0, 0)) return;
@@ -874,7 +874,7 @@ DWORD WINAPI WriterThread(void* context) noexcept {
     auto& writer = *static_cast<Writer*>(context);
     for (;;) {
         if (InterlockedCompareExchange(&writer.stop, 0, 0)) {
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
             if (writer.reportStatus && InterlockedCompareExchange(&writer.armed,0,0)) {
                 PumpReporting(writer); // Drain already committed records in <=32-record batches.
                 if (!writer.closed) continue;
@@ -889,7 +889,7 @@ DWORD WINAPI WriterThread(void* context) noexcept {
         if (InterlockedCompareExchange(&writer.armed, 0, 0)) {
             Pump(writer);
             if (writer.closed) return static_cast<DWORD>(InterlockedCompareExchange(&writer.error, 0, 0));
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
             if (writer.reportRing && reporting::ReadStatusWord(writer.reportRing->reportWriteSequence) !=
                 reporting::ReadStatusWord(writer.reportRing->reportReadSequence)) { Sleep(0); continue; }
 #endif
@@ -904,7 +904,7 @@ DWORD WINAPI WriterThread(void* context) noexcept {
 Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
     DispatchState* dispatch, bool manual, const FileOps& ops, std::uint64_t testLimit,
     Reason* reason, DWORD* outputError
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     , reporting::StatusWire* reportStatus = nullptr, reporting::ReportRing* reportRing = nullptr
 #endif
     ) noexcept {
@@ -914,7 +914,7 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
     auto writer = static_cast<Writer*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(Writer)));
     if (!writer) { if (outputError) *outputError = ERROR_NOT_ENOUGH_MEMORY; return nullptr; }
     writer->dispatch = dispatch;
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     writer->reportStatus=reportStatus; writer->reportRing=reportRing;
     if (reportStatus) writer->reportHeader=reportStatus->header;
 #endif
@@ -942,7 +942,7 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
     if (!ok) error = ERROR_INVALID_DATA;
     writer->processStart = FiletimeValue(creation);
     writer->frequency = frequency.QuadPart;
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     if (ok && reportStatus) {
         const auto& header=writer->reportHeader;
         // Bind to the single existing startup identity, not merely a supplied
@@ -961,13 +961,13 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
     }
     if (ok) {
         failureReason = Reason::KeyStoreFailed;
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         if (reportStatus) failureReason=Reason::OutputPathFailed;
 #endif
         ok = MakePrivateSecurity(security, error);
     }
     if (ok
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         && !reportStatus
 #endif
         ) {
@@ -980,7 +980,7 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
     }
     if (ok) {
         failureReason = Reason::OutputPathFailed;
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         if (!reportStatus)
 #endif
             Hex(random, sizeof(random), writer->runId);
@@ -989,13 +989,13 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
         _snwprintf_s(leaf, _countof(leaf), _TRUNCATE, L"%04u%02u%02uT%02u%02u%02uZ-PID%lu-%S",
             utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond, writer->pid, writer->runId);
         const wchar_t* resultsName=L"RS2SteamObserve";
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         if (reportStatus) resultsName=L"RS2SteamReport";
 #endif
         ok = JoinPath(results, canonical, resultsName) &&
             JoinPath(writer->directory, results, leaf) &&
             JoinPath(eventsPath, writer->directory, L"events.jsonl");
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         if (!reportStatus)
 #endif
         {
@@ -1009,7 +1009,7 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
         ok = HoldDirectory(*writer, results, true, false, &security, error);
     }
     if (ok
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         && !reportStatus
 #endif
         ) {
@@ -1021,7 +1021,7 @@ Writer* Prepare(const wchar_t* executableDirectory, std::uint32_t maxLogMiB,
         ok = HoldDirectory(*writer, writer->directory, true, true, &security, error);
     }
     if (ok
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
         && !reportStatus
 #endif
         ) {
@@ -1078,7 +1078,7 @@ Writer* PrepareWriter(const wchar_t* directory, std::uint32_t maxMiB,
         0, reason, error);
 }
 EventSink GetWriterSink(Writer* writer) noexcept {
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     if (writer && writer->reportStatus) return {}; // Never expose a legacy identity-carrying sink.
 #endif
     return writer ? EventSink{writer, Publish} : EventSink{};
@@ -1099,7 +1099,7 @@ const wchar_t* GetWriterDirectory(const Writer* writer) noexcept {
 WriterSnapshot SnapshotWriter(Writer* writer) noexcept {
     if (!writer) return {};
     auto depth=static_cast<std::uint32_t>(InterlockedCompareExchange(&writer->queueDepth,0,0));
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     if (writer->reportRing) {
         const auto read=reporting::ReadStatusWord(writer->reportRing->reportReadSequence);
         const auto written=reporting::ReadStatusWord(writer->reportRing->reportWriteSequence);
@@ -1131,7 +1131,7 @@ Writer* PrepareWriterForTest(const wchar_t* directory, DispatchState* dispatch,
 void PumpWriterForTest(Writer* writer) noexcept { if (writer && writer->manual) Pump(*writer); }
 void FinishWriterForTest(Writer* writer) noexcept {
     if (!writer || !writer->manual) return;
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
     if (writer->reportStatus) {
         if (!writer->closed) {
             reporting::StopReportingWriter(writer);
@@ -1166,7 +1166,7 @@ bool HmacSteamIdForTest(const unsigned char key[32], std::uint64_t id, char toke
 }
 #endif
 } // namespace rs2fix::observer
-#if defined(RS2_STEAM_REPORTING)
+#if defined(RS2_REPORTING_LEGACY_WRITER)
 namespace rs2fix::reporting {
 namespace {
 bool ReportingWriterIdentity(const StatusWire& status, const ReportRing& ring) noexcept {

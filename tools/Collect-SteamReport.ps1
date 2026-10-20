@@ -1,9 +1,12 @@
 param(
     [uint32]$ProcessId = 0,
     [string]$TargetRoot,
-    [string]$ReportingRunDirectory,
+    [string]$AllowedLogRoot,
+    [string]$LaunchLogPath,
+    [string]$ArchivedStatusPath,
     [string]$ReportRoot,
-    [string]$MarkerPath
+    [string]$MarkerPath,
+    [switch]$TrainingRecovery
 )
 
 Set-StrictMode -Version Latest
@@ -12,11 +15,18 @@ Add-Type -AssemblyName System.Numerics
 $script:ReportHostHash = '0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393'
 $script:ReportSdkHash = 'A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9'
 $script:ReportClientHash = '8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE'
+$script:RecoveryPayloadNames=@('phase','event','reason','outcome','flags','operation_sequence','transition_sequence','qpc',
+    'source_epoch','sdk_epoch','owner_thread_id','resource_phase','native_stage','exception_code','request_id','callback_id',
+    'callback_result','api_returned_id','old_sdk_fingerprint','new_sdk_fingerprint','old_cache_fingerprint','new_cache_fingerprint',
+    'finish_deadline_qpc','overall_deadline_qpc','record_sequence','callback_own_ticks')
+$script:RecoveryFingerprints=@('old_sdk_fingerprint','new_sdk_fingerprint','old_cache_fingerprint','new_cache_fingerprint')
 $script:ReportPackageFiles = @(
-    'dlls/X3DAudio1_7.dll','dlls/RS2ServerFix.dll','config/RS2SteamObserve.ini','config/RS2SteamReport.ini',
+    'dlls/X3DAudio1_7.dll','dlls/RS2ServerFix.dll','config/RS2SteamReport.ini',
     'config/qualified_x3audio_genuine.manifest','tools/rs2_runtime_inventory.exe',
     'tools/rs2_deployment_preflight.exe','tools/rs2_pe_contract.exe',
-    'tools/Collect-SteamReport.ps1','tools/Run-SteamReport.cmd','README.md','LICENSE')
+    'tools/Collect-SteamReport.ps1','tools/Run-SteamReport.cmd','README.md','LICENSE',
+    'config/RS2LeechRecovery.ini','tools/Request-LeechRecovery.ps1',
+    'tools/Collect-RS2CountProbe.ps1','tools/RS2CountProbe.cs','tools/Run-RS2CountProbe.cmd')
 
 # File/path/handle custody helpers are mechanically reused from the existing
 # observer collector. This sibling is self-contained; it never loads that script
@@ -89,13 +99,29 @@ public static class Files {
     }
     static long Length(Info info) { return ((long)info.SizeHigh << 32) | info.SizeLow; }
     static string Identity(Info info) { return info.Volume + ":" + info.IndexHigh + ":" + info.IndexLow; }
-    public static FileStream Open(string path, bool growing) {
-        // OPEN_REPARSE_POINT plus final-handle validation closes the path-check/open gap.
-        var handle = CreateFileW(path, 0x80000000, growing ? 3U : 1U, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+    public static FileStream Open(string path, bool growing) { return OpenShared(path, growing ? 3U : 1U); }
+    public static FileStream OpenNative(string path) { return OpenShared(path, 7U); }
+    static FileStream OpenShared(string path, uint sharing) {
+        // Sharing does not prevent engine archival. A rename ends this live
+        // capture via the path check; explicit archive capture opens it separately.
+        // Historical private-file helpers retain their old sharing rules.
+        var handle = CreateFileW(path, 0x80000000, sharing, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
         if (handle.IsInvalid) { handle.Dispose(); throw new IOException("Cannot open evidence input: " + Marshal.GetLastWin32Error()); }
         FileStream stream = null;
         try { stream = new FileStream(handle, FileAccess.Read); CheckedInfo(stream, path); return stream; }
         catch { if (stream != null) stream.Dispose(); else handle.Dispose(); throw; }
+    }
+    [StructLayout(LayoutKind.Sequential)] struct IdInfo { public ulong Volume, Low, High; }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out IdInfo info, uint bytes);
+    public static NativeIdentity NativeInfo(FileStream stream, string path) {
+        var basic = CheckedInfo(stream, path);
+        IdInfo id;
+        if (!GetFileInformationByHandleEx(stream.SafeFileHandle, 18, out id, 24))
+            throw new IOException("Full 128-bit file identity unavailable.");
+        return new NativeIdentity { Length=Length(basic), Volume=id.Volume,
+            FileId=(BitConverter.ToString(BitConverter.GetBytes(id.Low))+
+                BitConverter.ToString(BitConverter.GetBytes(id.High))).Replace("-","").ToLowerInvariant() };
     }
     public static Prefix CopyPrefix(FileStream source, string sourcePath, string destination) {
         Info first = CheckedInfo(source, sourcePath);
@@ -149,6 +175,163 @@ public static class Files {
                     if (a[i] != b[i]) throw new IOException("Earlier log prefix was rewritten.");
             }
         }
+    }
+}
+
+public sealed class NativeIdentity {
+    public long Length;
+    public ulong Volume;
+    public string FileId;
+}
+public sealed class NativeCapture : IDisposable {
+    public const long ByteLimit = 512L * 1024 * 1024;
+    public const long FrameLimit = 2000000;
+    const int MessageLimit=8192, PrefixLimit=128, LineLimit=MessageLimit+PrefixLimit+2;
+    static readonly byte[] Marker=Encoding.ASCII.GetBytes("[RS2ServerFix:event] ");
+    static readonly byte[] Lead=Encoding.ASCII.GetBytes("{\"schema\":3,\"type\":\"");
+    static readonly byte[] RunLead=Encoding.ASCII.GetBytes("\",\"run_id\":\"");
+    readonly FileStream input, raw;
+    readonly StreamWriter selected;
+    readonly System.Security.Cryptography.SHA256 hash=System.Security.Cryptography.SHA256.Create();
+    readonly byte[] buffer=new byte[65536], line=new byte[LineLimit], run;
+    readonly string path, expectedId;
+    readonly ulong expectedVolume;
+    readonly int prefixMode;
+    readonly long byteLimit, frameLimit;
+    int kept;
+    long lineBytes;
+    bool skipInitial, finalized;
+    public readonly long InitialOffset;
+    public long RequiredEnd, CapturedEnd, ReadBytes, CompleteSelectedFrames;
+    public bool RawPartialTail, SelectedPartialTail;
+    public string StopReason, PrefixSha256;
+    public NativeIdentity FinalIdentity;
+    // Smaller test limits exercise the same policy path on owned inert files.
+    // Production always calls the overload with the fixed public policy limits.
+    public NativeCapture(string path, string rawPath, string selectedPath, ulong volume,
+        string fileId, long initialOffset, bool atLineBoundary, int prefixMode, string runId)
+        : this(path,rawPath,selectedPath,volume,fileId,initialOffset,atLineBoundary,prefixMode,runId,ByteLimit,FrameLimit) {}
+    public NativeCapture(string path, string rawPath, string selectedPath, ulong volume,
+        string fileId, long initialOffset, bool atLineBoundary, int prefixMode, string runId,
+        long byteLimit, long frameLimit) {
+        if (initialOffset<0 || prefixMode<0 || prefixMode>1 || byteLimit<1 || byteLimit>ByteLimit ||
+            frameLimit<1 || frameLimit>FrameLimit ||
+            !System.Text.RegularExpressions.Regex.IsMatch(runId??"", "\\A[0-9a-f]{32}\\z") ||
+            !System.Text.RegularExpressions.Regex.IsMatch(fileId??"", "\\A[0-9a-f]{32}\\z"))
+            throw new ArgumentException("Invalid native capture identity or bounds.");
+        this.path=path; expectedVolume=volume; expectedId=fileId; this.prefixMode=prefixMode;
+        this.byteLimit=byteLimit; this.frameLimit=frameLimit;
+        InitialOffset=CapturedEnd=initialOffset; skipInitial=!atLineBoundary; run=Encoding.ASCII.GetBytes(runId);
+        try {
+            input=Files.OpenNative(path);
+            CheckIdentity();
+            if(RequiredEnd<initialOffset) throw new IOException("Native log is shorter than recorded initial EOF.");
+            input.Position=initialOffset;
+            raw=new FileStream(rawPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);
+            selected=new StreamWriter(new FileStream(selectedPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read),
+                new ASCIIEncoding(),65536);
+            selected.NewLine="\n"; // Extracted JSONL only; raw evidence retains native CRLF.
+        } catch { Dispose(); throw; }
+    }
+    void CheckIdentity() {
+        var identity=Files.NativeInfo(input,path);
+        if(identity.Volume!=expectedVolume || identity.FileId!=expectedId)
+            throw new IOException("Native log file identity changed.");
+        if(identity.Length<RequiredEnd || identity.Length<CapturedEnd)
+            throw new IOException("Native log truncated during collection.");
+        FinalIdentity=identity; RequiredEnd=identity.Length;
+    }
+    bool Literal(byte[] value, ref int at) {
+        if(at>kept-value.Length) return false;
+        for(int i=0;i<value.Length;i++) if(line[at+i]!=value[i]) return false;
+        at+=value.Length; return true;
+    }
+    bool Literal(string value, ref int at) {
+        if(at>kept-value.Length) return false;
+        for(int i=0;i<value.Length;i++) if(line[at+i]!=(byte)value[i]) return false;
+        at+=value.Length; return true;
+    }
+    bool Digit(int at) { return at<kept && line[at]>='0' && line[at]<='9'; }
+    bool Selected(out int messageAt, out int jsonAt) {
+        int at=0; messageAt=jsonAt=0;
+        if(prefixMode==0) { if(!Literal("Log: ",ref at)) return false; }
+        else {
+            if(!Literal("[",ref at)) return false;
+            bool negative=at<kept && line[at]=='-'; if(negative) at++;
+            int first=at;
+            while(Digit(at)) { if(at>=PrefixLimit-10) return false; at++; }
+            int minimum=negative ? 3 : 4, digits=at-first;
+            if(digits<minimum || (digits>minimum && line[first]=='0') || !Literal(".",ref at)) return false;
+            for(int i=0;i<2;i++) { if(!Digit(at)) return false; at++; }
+            if(!Literal("] Log: ",ref at)) return false;
+        }
+        if(at>PrefixLimit) return false;
+        messageAt=at;
+        if(!Literal(Marker,ref at)) return false;
+        jsonAt=at;
+        if(!Literal(Lead,ref at)) return false;
+        int typeAt=at;
+        while(at<kept && at-typeAt<32 && ((line[at]>='a' && line[at]<='z') || line[at]=='-')) at++;
+        if(at==typeAt || !Literal(RunLead,ref at) || !Literal(run,ref at)) return false;
+        return at<kept && line[at]=='"';
+    }
+    void Consume(byte value) {
+        if(skipInitial) { if(value==10) skipInitial=false; RawPartialTail=value!=10; return; }
+        if(kept<line.Length) line[kept++]=value;
+        lineBytes++; RawPartialTail=value!=10;
+        if(value!=10) return;
+        int messageAt,jsonAt;
+        if(Selected(out messageAt,out jsonAt)) {
+            if(lineBytes>LineLimit || lineBytes-messageAt>MessageLimit+2 || kept<2 || line[kept-2]!=13) {
+                StopReason="selected-frame-malformed"; return;
+            }
+            for(int i=messageAt;i<kept-2;i++) if(line[i]<32 || line[i]>126) {
+                StopReason="selected-frame-malformed"; return;
+            }
+            if(CompleteSelectedFrames==frameLimit) { StopReason="frame-limit"; return; }
+            selected.WriteLine(Encoding.ASCII.GetString(line,jsonAt,kept-jsonAt-2));
+            CompleteSelectedFrames++;
+        }
+        kept=0; lineBytes=0;
+    }
+    public void CopyAvailable() {
+        if(finalized) throw new InvalidOperationException("Capture already finalized.");
+        CheckIdentity();
+        if(StopReason!=null) return;
+        long target=RequiredEnd;
+        while(CapturedEnd<target && ReadBytes<byteLimit && StopReason==null) {
+            int count=(int)Math.Min(buffer.Length,Math.Min(target-CapturedEnd,byteLimit-ReadBytes));
+            int got=input.Read(buffer,0,count);
+            if(got==0) throw new IOException("Short native log read.");
+            // Every source byte is copied/hashed once. A limit discovered in this
+            // chunk still retains its raw bytes; no silent re-baseline/reread.
+            raw.Write(buffer,0,got); hash.TransformBlock(buffer,0,got,buffer,0);
+            ReadBytes+=got; CapturedEnd+=got;
+            for(int i=0;i<got && StopReason==null;i++) Consume(buffer[i]);
+        }
+        if(CapturedEnd<target && ReadBytes==byteLimit && StopReason==null) StopReason="history-byte-limit";
+        int ignored,jsonAt;
+        SelectedPartialTail=RawPartialTail && !skipInitial && Selected(out ignored,out jsonAt);
+        raw.Flush(); selected.Flush();
+        CheckIdentity();
+        if(CapturedEnd<RequiredEnd && ReadBytes==byteLimit && StopReason==null) StopReason="history-byte-limit";
+    }
+    public void Finish() {
+        if(finalized) return;
+        try { CheckIdentity(); }
+        finally {
+            hash.TransformFinalBlock(new byte[0],0,0);
+            PrefixSha256=BitConverter.ToString(hash.Hash).Replace("-","").ToLowerInvariant();
+            if(raw!=null) { raw.Flush(true); raw.Dispose(); }
+            if(selected!=null) { selected.Flush(); selected.Dispose(); }
+            finalized=true;
+        }
+    }
+    public void Dispose() {
+        if(selected!=null) selected.Dispose();
+        if(raw!=null) raw.Dispose();
+        if(input!=null) input.Dispose();
+        hash.Dispose();
     }
 }
 }
@@ -233,18 +416,27 @@ function Get-ReportScalar($Fields, [string]$Key) {
     return Get-ReportUInt $Fields[$Key]
 }
 
-function Read-ReportJson([string]$Line) {
+function Read-ReportJson([string]$Line,[int]$Depth=0) {
     # The pinned writer emits flat canonical scalar objects, with exactly one
     # optional four-object durations array. Preserve decimal lexemes: PS5 JSON
     # numeric conversion must not round u64 counters, and duplicate keys reject.
-    if ($Line.Length -gt 131072 -or !$Line.StartsWith('{') -or !$Line.EndsWith('}')) { throw 'Invalid reporting JSON object.' }
+    if ($Line.Length -gt 8192 -or $Line -match '[^\x20-\x7e]' -or !$Line.StartsWith('{') -or !$Line.EndsWith('}')) { throw 'Invalid reporting JSON object.' }
+    $startup = $null; $objectNeedle=',"startup":{'; $objectAt=$Line.IndexOf($objectNeedle,[StringComparison]::Ordinal)
+    if ($objectAt -ge 0) {
+        if($Depth -ne 0){throw 'Nested startup result is unsupported.'}
+        if (!$Line.EndsWith('}}')) { throw 'Malformed startup-result tail.' }
+        $body=$Line.Substring($objectAt+$objectNeedle.Length-1,$Line.Length-$objectAt-$objectNeedle.Length)
+        $startup=Read-ReportJson $body ($Depth+1)
+        $Line=$Line.Substring(0,$objectAt)+'}'
+    }
     $durations = $null; $needle = ',"durations":['; $arrayAt = $Line.IndexOf($needle, [StringComparison]::Ordinal)
     if ($arrayAt -ge 0) {
+        if($Depth -ne 0){throw 'Nested durations are unsupported.'}
         if (!$Line.EndsWith(']}')) { throw 'Malformed durations tail.' }
         $body = $Line.Substring($arrayAt + $needle.Length, $Line.Length - $arrayAt - $needle.Length - 2)
         $objects = [regex]::Matches($body, '\{[^{}]*\}')
         if ($objects.Count -ne 4 -or (($objects | ForEach-Object { $_.Value }) -join ',') -cne $body) { throw 'Invalid duration object set.' }
-        $durations = @($objects | ForEach-Object { Read-ReportJson $_.Value })
+        $durations = @($objects | ForEach-Object { Read-ReportJson $_.Value ($Depth+1) })
         $Line = $Line.Substring(0, $arrayAt) + '}'
     }
     $result = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
@@ -260,7 +452,8 @@ function Read-ReportJson([string]$Line) {
         if ($token.StartsWith('"')) { $value = $token | ConvertFrom-Json }
         elseif ($token -ceq 'true') { $value = $true }
         elseif ($token -ceq 'false') { $value = $false }
-        else { $value = Get-ReportUInt $token -RawBits:($key -cin @('native_schedule_anchor_bits','native_interval_units','native_interval_override_bits','native_retry_override_bits')) }
+        else { $value = Get-ReportUInt $token -RawBits:($key -cin @('volume_serial','native_schedule_anchor_bits','native_interval_units','native_interval_override_bits','native_retry_override_bits',
+            'recovery_old_sdk_fingerprint','recovery_new_sdk_fingerprint','recovery_old_cache_fingerprint','recovery_new_cache_fingerprint')) }
         $result.Add($key, $value); $position += $match.Length
         if ($match.Groups['end'].Value.Trim() -ceq '}') {
             if ($position -ne $Line.Length) { throw 'Trailing JSON bytes.' }; break
@@ -268,12 +461,102 @@ function Read-ReportJson([string]$Line) {
     }
     if ($position -ne $Line.Length -or !$result.Count) { throw 'Incomplete reporting JSON.' }
     if ($null -ne $durations) { if ($result.ContainsKey('durations')) { throw 'Duplicate durations.' }; $result.Add('durations', $durations) }
+    if ($null -ne $startup) { if ($result.ContainsKey('startup') -or $null -ne $durations) { throw 'Unexpected nested result.' }; $result.Add('startup',$startup) }
     return ,$result
 }
 
 function Assert-ReportShape($Record, [string[]]$Keys) {
     if ($Record.Count -ne $Keys.Count) { throw 'Unexpected reporting record fields.' }
     foreach ($key in $Keys) { if (!$Record.ContainsKey($key)) { throw "Missing record field: $key." } }
+}
+
+function Read-ReportRecoveryPayload($Fields,[string]$Prefix) {
+    $p=@{}
+    foreach($name in $script:RecoveryPayloadNames) {
+        $key=$Prefix+$name
+        if(!$Fields.ContainsKey($key)){throw "Missing recovery field: $key."}
+        $p[$name]=Get-ReportUInt $Fields[$key] -RawBits:($name -cin $script:RecoveryFingerprints)
+    }
+    foreach($domain in @(@('phase',11),@('event',4),@('reason',64),@('outcome',10),@('resource_phase',5),@('native_stage',17),@('callback_result',6))) {
+        if($p[$domain[0]] -ge $domain[1]){throw 'Invalid recovery domain.'}
+    }
+    $flags=$p.flags
+    if(($flags -band 0x7fff) -ne $flags -or
+        (($flags -band 16384) -and !($flags -band 2048)) -or
+        (!($flags -band 16384) -and $p.callback_own_ticks) -or
+        (($flags -band 8192) -and !($flags -band 4096)) -or
+        (($flags -band 4096) -and !($flags -band 2048))){throw 'Invalid recovery flags/timing.'}
+    foreach($name in @('owner_thread_id','exception_code','request_id','callback_id','api_returned_id')) {
+        if($p[$name] -gt [uint32]::MaxValue){throw 'Invalid recovery scalar width.'}
+    }
+    foreach($name in @('qpc','finish_deadline_qpc','overall_deadline_qpc','callback_own_ticks')) {
+        if($p[$name] -gt [int64]::MaxValue){throw 'Invalid recovery clock scalar.'}
+    }
+    return $p
+}
+
+function Assert-ReportRecoveryFields($Fields) {
+    $keys=@($Fields.Keys|Where-Object{([string]$_).StartsWith('recovery.',[StringComparison]::Ordinal)})
+    if(!$Fields.ContainsKey('recovery.snapshot_result')){throw 'Missing recovery.snapshot_result.'}
+    $result=[string]$Fields['recovery.snapshot_result']
+    $allowed=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach($token in @('Coherent','Busy','Unavailable','Invalid','ReadFailure')){$null=$allowed.Add($token)}
+    if(!$allowed.Contains($result)){throw 'Invalid recovery snapshot_result spelling.'}
+    $coherent=[string]::Equals($result,'Coherent',[StringComparison]::Ordinal)
+    $expected=@('recovery.snapshot_result')
+    if($coherent) {
+        $expected+=@('recovery.schema','recovery.bytes','recovery.artifact_version','recovery.pid','recovery.run_id',
+            'recovery.header_ready','recovery.owner_sequence')+@($script:RecoveryPayloadNames|ForEach-Object{'recovery.'+$_})
+    }
+    if($keys.Count -ne $expected.Count){throw 'Unexpected recovery inventory key set.'}
+    foreach($key in $expected){if(!$Fields.ContainsKey($key)){throw "Missing recovery inventory key: $key."}}
+    if(!$coherent){return $null}
+    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='393728';
+        'recovery.header_ready'='1';'recovery.pid'=$Fields['pid'];'recovery.run_id'=$Fields['reporting.run_id'];
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';'reporting.header_valid'='true';
+        'reporting.identity_complete'='true';'reporting.header_validity'='31';'reporting.pid'=$Fields['pid']}
+    if($Fields['recovery.run_id'] -cnotmatch '^[0-9a-f]{32}$' -or $Fields['recovery.run_id'] -ceq ('0'*32)) {throw 'Invalid recovery run identity.'}
+    $ownerSequence=Get-ReportScalar $Fields 'recovery.owner_sequence'
+    if(!$ownerSequence -or ($ownerSequence -band 1)){throw 'Invalid recovery owner sequence.'}
+    foreach($key in @('recovery.schema','recovery.bytes','recovery.artifact_version','recovery.pid','recovery.header_ready')){$null=Get-ReportScalar $Fields $key}
+    $frequency=Get-ReportScalar $Fields 'reporting.qpc_frequency'
+    if(!$frequency -or $frequency -gt [int64]::MaxValue/45){throw 'Invalid recovery identity clock.'}
+    return Read-ReportRecoveryPayload $Fields 'recovery.'
+}
+
+function Test-ReportRecoveryActive($Snapshot) {
+    $f=$Snapshot.fields;$p=Assert-ReportRecoveryFields $f
+    if($null -eq $p -or $p.phase -notin 2,3,4,5,6,7 -or !$p.operation_sequence -or $p.reason -or $p.outcome -or
+        !($p.flags -band 1) -or ($p.flags -band (512+4+256))){return $false}
+    $expected=@{'reporting.state'='not-ready';'reporting.current_ready'='false';'reporting.captured'='true';
+        'reporting.owner_valid'='true';'reporting.phase'='3';'reporting.reason'='0';'reporting.builderBound'='0';
+        'reporting.transport.actualRepairAdmitted'='0';'reporting.transport.state'='1';'reporting.transport.reason'='0';
+        'reporting.transport.startupSubmitted'='1';'reporting.worker.startupObserved'='1';'reporting.log_identity_available'='true';
+        'reporting.revoke_reasons'='0';'reporting.loss_reasons'='0';'reporting.stopping'='0';
+        'reporting.worker_pause_reason'='0';'reporting.worker_pause_changed'='false';'reporting.fatal_transport_reason'='0';
+        recon_artifact_result='pass';result='pass';host_sha256=$script:ReportHostHash;sdk_sha256=$script:ReportSdkHash;
+        steamclient_sha256=$script:ReportClientHash}
+    foreach($key in $expected.Keys){if(!$f.ContainsKey($key) -or $f[$key] -cne $expected[$key]){return $false}}
+    return $Snapshot.exit_code -eq 0 -and $p.owner_thread_id -eq (Get-ReportScalar $f 'reporting.ownerThreadId') -and
+        $p.source_epoch -eq (Get-ReportScalar $f 'reporting.sourceEpoch') -and
+        $p.qpc -le (Get-ReportScalar $f 'reporting.observed_qpc')
+}
+
+function Add-ReportRecoveryTiming($Measurements,$Payload,[string]$RunId,[uint64]$Frequency) {
+    if(!($Payload.flags -band 16384)){return}
+    if(!$Payload.operation_sequence -or !$Payload.request_id -or $Payload.phase -lt 6 -or !($Payload.flags -band 16)) {
+        throw 'Finalised recovery timing lacks attributed Create identity.'
+    }
+    $key=$RunId+':'+[string]$Payload.operation_sequence+':'+[string]$Payload.request_id
+    $ticks=[string]$Payload.callback_own_ticks
+    if($Measurements.ContainsKey($key)) {
+        if($Measurements[$key].ticks -cne $ticks){throw 'Conflicting finalised recovery callback timing.'}
+        return
+    }
+    $Measurements[$key]=@{run_id=$RunId;operation_sequence=[string]$Payload.operation_sequence;create_id=[string]$Payload.request_id;
+        ticks=$ticks;qpc_frequency=[string]$Frequency;elapsed_milliseconds=([decimal]$Payload.callback_own_ticks*1000/[decimal]$Frequency);
+        scope='primary-Create-callback-DLL-own-elapsed-lower-bound';
+        limitation='Excludes pre-claim owner/attribution prologue and native work; not sustained CPU or complete recovery overhead.'}
 }
 
 function Read-ReportConfiguration([string]$Text, [bool]$Reporting) {
@@ -289,9 +572,10 @@ function Read-ReportConfiguration([string]$Text, [bool]$Reporting) {
         $values.Add($Matches[1], $Matches[2])
     }
     if ($Reporting) {
-        Assert-ReportFields $values @{ schema='2' }
-        if ($values.Count -ne 2 -or !$values.ContainsKey('mode') -or $values['mode'] -cnotin @('disabled','observe','repair')) { throw 'Unsupported reporting configuration.' }
-        return @{ mode=$values['mode']; quota_mib=0 }
+        Assert-ReportFields $values @{ schema='3' }
+        if ($values.Count -ne 3 -or !$values.ContainsKey('mode') -or $values['mode'] -cnotin @('disabled','observe','repair') -or
+            !$values.ContainsKey('diagnostics') -or $values['diagnostics'] -cnotin @('normal','detailed')) { throw 'Unsupported reporting configuration.' }
+        return @{ mode=$values['mode']; diagnostics=$values['diagnostics'] }
     }
     Assert-ReportFields $values @{ enabled='1' }
     if ($values.Count -gt 2 -or ($values.Count -eq 2 -and !$values.ContainsKey('max_log_mib'))) { throw 'Unknown observer prerequisite key.' }
@@ -318,11 +602,20 @@ function Invoke-ReportInventory([string]$Package, $Files, [string]$ServerRoot, [
         companion_kind='companion-reporting'; bootstrap_sha256=$Files['dlls/X3DAudio1_7.dll'];
         companion_sha256=$Files['dlls/RS2ServerFix.dll']; tool_sha256=$Files['tools/rs2_runtime_inventory.exe'];
         manifest_sha256=$Files['config/qualified_x3audio_genuine.manifest'] }
+    $null=Assert-ReportRecoveryFields $fields
     return @{ fields=$fields; command_start_qpc=[uint64]$begin; command_end_qpc=[uint64]$end; exit_code=$code; path=$Report }
 }
 
 function Test-ReportReady($Snapshot) {
     $f = $Snapshot.fields
+    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';
+        'reporting.log_identity_available'='true';'reporting.transport.state'='1';'reporting.transport.reason'='0';
+        'reporting.transport.startupSubmitted'='1';'reporting.worker.startupObserved'='1';'reporting.worker_pause_reason'='0';
+        'reporting.worker_pause_changed'='false';'reporting.fatal_transport_reason'='0'}
+    foreach($key in $native.Keys){if(!$f.ContainsKey($key) -or $f[$key] -cne $native[$key]){return $false}}
+    if(!$f.ContainsKey('reporting.mode') -or $f['reporting.mode'] -cnotin @('2','3')){return $false}
+    if(!$f.ContainsKey('reporting.transport.actualRepairAdmitted') -or
+        $f['reporting.transport.actualRepairAdmitted'] -cne $(if($f['reporting.mode'] -ceq '3'){'1'}else{'0'})){return $false}
     return $Snapshot.exit_code -eq 0 -and $f.ContainsKey('reporting.current_ready') -and
         $f['reporting.current_ready'] -ceq 'true' -and $f['reporting.captured'] -ceq 'true' -and
         $f['reporting.header_valid'] -ceq 'true' -and $f['reporting.owner_valid'] -ceq 'true' -and
@@ -332,12 +625,15 @@ function Test-ReportReady($Snapshot) {
 function Assert-ReportSnapshot($Snapshot, $First) {
     $f = $Snapshot.fields; $initial = $First.fields
     foreach ($key in @('process_creation_filetime','process_image_path','host_sha256','sdk_sha256','steamclient_sha256',
-        'observed_bootstrap_sha256','observed_companion_sha256','reporting.run_id','reporting.mode','reporting.qpc_frequency')) {
+        'observed_bootstrap_sha256','observed_companion_sha256','reporting.run_id','reporting.mode','reporting.qpc_frequency',
+        'reporting.log.volumeSerial','reporting.log.file_id','reporting.log.initialEOF','reporting.log.path',
+        'reporting.log.prefixMode','reporting.log.initialAtLineBoundary','reporting.log.utcFiletime',
+        'reporting.log.calibrationQpcBefore','reporting.log.calibrationQpcAfter')) {
         if (!$f.ContainsKey($key) -or !$initial.ContainsKey($key) -or $f[$key] -cne $initial[$key]) { throw "Current process/run identity changed: $key." }
     }
     Assert-ReportFields $f @{ host_sha256=$script:ReportHostHash; sdk_sha256=$script:ReportSdkHash;
-        steamclient_sha256=$script:ReportClientHash; 'reporting.schema'='2'; 'reporting.bytes'='1288';
-        'reporting.artifact_version'='262656'; 'reporting.header_validity'='31';
+        steamclient_sha256=$script:ReportClientHash; 'reporting.schema'='3'; 'reporting.bytes'='3896';
+        'reporting.artifact_version'='393728'; 'reporting.header_validity'='31';
         'reporting.pid'=$f['pid'];'reporting.process_creation'=$f['process_creation_filetime'];
         observed_bootstrap_sha256=$f['bootstrap_sha256'];observed_companion_sha256=$f['companion_sha256'];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -390,8 +686,65 @@ function Read-ReportNativeSchedule($Record) {
     return $out
 }
 
-function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64]$QuotaBytes, [uint64]$StartQpc, [uint64]$EndQpc, $Snapshots=@()) {
-    $common = @('type','schema','run_id','pid','sequence','qpc','source_epoch','binding_epoch','kind','reason','flags','thread_id')
+function Assert-NativeDerivedUtc($Record,$Startup) {
+    $frequency=[System.Numerics.BigInteger](Get-ReportScalar $Startup 'qpc_frequency')
+    $before=[System.Numerics.BigInteger](Get-ReportScalar $Startup 'calibration_qpc_before')
+    $after=[System.Numerics.BigInteger](Get-ReportScalar $Startup 'calibration_qpc_after')
+    if (!$frequency -or !$before -or $after -lt $before) { throw 'Invalid native UTC calibration.' }
+    $mid=$before+[System.Numerics.BigInteger]::Divide(($after-$before),2)
+    $delta=[System.Numerics.BigInteger](Get-ReportScalar $Record 'qpc')-$mid
+    $ticks=[System.Numerics.BigInteger]::Divide(([System.Numerics.BigInteger]::Abs($delta)*10000000),$frequency)
+    $expected=[System.Numerics.BigInteger](Get-ReportScalar $Startup 'utc_calibration_filetime')
+    if($delta -lt 0){$expected-=$ticks}else{$expected+=$ticks}
+    if($expected -le 0 -or $expected -ge [uint64]::MaxValue -or
+        $expected -ne (Get-ReportScalar $Record 'utc_derived_filetime')) { throw 'Derived UTC contradicts source QPC/calibration.' }
+}
+function Assert-NativeReportStartup($Record,$Identity) {
+    $strings=@('type','artifact','version','run_id','mode','diagnostics','host_sha256','qualified_steam_api_sha256',
+        'qualified_steamclient_sha256','transport','durability','utc_kind','file_id','log_path')
+    $numbers=@('schema','artifact_version','pid','sequence','qpc','utc_derived_filetime','process_start_filetime','qpc_frequency',
+        'configured_mode','header_validity','anchor_interval_seconds','utc_calibration_filetime','calibration_qpc_before',
+        'calibration_qpc_after','volume_serial','initial_eof','initial_at_line_boundary','prefix_mode','record_bytes',
+        'ring_capacity','batch_limit','ledger_capacity','ready_capacity','message_limit','native_service_hz',
+        'native_frames_per_opportunity','native_frames_per_second','request_floor_seconds')
+    $booleans=@('authentication_changed','native_counting_preserved','termination_may_lose_tail')
+    Assert-ReportShape $Record ($strings+$numbers+$booleans+@('startup'))
+    foreach($key in $strings){if($Record[$key] -isnot [string]){throw 'Startup string field has wrong type.'}}
+    foreach($key in $numbers){if($Record[$key] -isnot [uint64]){throw 'Startup scalar field has wrong type.'}}
+    foreach($key in $booleans){if($Record[$key] -isnot [bool]){throw 'Startup boolean field has wrong type.'}}
+    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.6.2.0';artifact_version='393728';
+        sequence='0';run_id=$Identity['reporting.run_id'];pid=$Identity['pid'];process_start_filetime=$Identity['process_creation_filetime'];
+        qpc_frequency=$Identity['reporting.qpc_frequency'];configured_mode=$Identity['reporting.mode'];header_validity='31';
+        transport='native';durability='unknown';utc_kind='derived';record_bytes='256';ring_capacity='256';batch_limit='32';
+        ledger_capacity='256';ready_capacity='8';message_limit='8192';native_service_hz='4';native_frames_per_opportunity='2';
+        native_frames_per_second='8';request_floor_seconds='20'}
+    foreach($entry in @(@('volume_serial','volumeSerial'),@('file_id','file_id'),@('initial_eof','initialEOF'),
+        @('initial_at_line_boundary','initialAtLineBoundary'),@('prefix_mode','prefixMode'),@('utc_calibration_filetime','utcFiletime'),
+        @('calibration_qpc_before','calibrationQpcBefore'),@('calibration_qpc_after','calibrationQpcAfter'))) {
+        $field='reporting.log.'+$entry[1]
+        if(!$Identity.ContainsKey($field) -or [string]$Record[$entry[0]] -cne $Identity[$field]) { throw 'Bootstrap/log identity differs from DATA.' }
+    }
+    $expectedPath=[Uri]::UnescapeDataString($Identity['reporting.log.path']).Replace('/','\')
+    if (!$Record['log_path'].Equals($expectedPath,[StringComparison]::OrdinalIgnoreCase) -or
+        $Record['file_id'] -cnotmatch '^[0-9a-f]{32}$' -or $Record['prefix_mode'] -gt 1 -or $Record['initial_at_line_boundary'] -gt 1 -or
+        $Record['authentication_changed'] -or !$Record['native_counting_preserved'] -or !$Record['termination_may_lose_tail'] -or
+        ([string]$Record['host_sha256']).ToUpperInvariant() -cne $script:ReportHostHash -or
+        ([string]$Record['qualified_steam_api_sha256']).ToUpperInvariant() -cne $script:ReportSdkHash -or
+        ([string]$Record['qualified_steamclient_sha256']).ToUpperInvariant() -cne $script:ReportClientHash) { throw 'Native bootstrap identity/semantics mismatch.' }
+    $mode=if($Identity['reporting.mode'] -ceq '2'){'observe'}else{'repair'}
+    if($Record['mode'] -cne $mode -or $Record['diagnostics'] -cnotin @('normal','detailed') -or
+        $Record['anchor_interval_seconds'] -ne $(if($Record['diagnostics'] -ceq 'normal'){10}else{1})) { throw 'Native mode/cadence mismatch.' }
+    $startup=$Record['startup']; $keys=@('build_identity','recon_mode','recon_outcome','recon_reason','recon_qualified',
+        'initialize_result','marker_complete','marker_error','startup_accepted')
+    Assert-ReportShape $startup $keys
+    foreach($key in $keys){if($startup[$key] -isnot [uint64]){throw 'Invalid startup-result scalar.'}}
+    foreach($key in @('recon_qualified','marker_complete','startup_accepted')){if($startup[$key] -gt 1){throw 'Invalid startup-result boolean.'}}
+    Assert-NativeDerivedUtc $Record $Record
+}
+
+function Read-ReportLog([string]$Path, $Identity, [string]$NativeLogPath, [uint64]$RawByteLimit, [uint64]$StartQpc, [uint64]$EndQpc, $Snapshots=@(),[switch]$TrainingRecoveryMode) {
+    if (!$Identity.ContainsKey('reporting.log.path') -or !([Uri]::UnescapeDataString($Identity['reporting.log.path']).Replace('/','\')).Equals($NativeLogPath,[StringComparison]::OrdinalIgnoreCase)) { throw 'Native log path differs from DATA.' }
+    $common = @('type','schema','run_id','pid','sequence','qpc','utc_derived_filetime','source_epoch','binding_epoch','kind','reason','flags','thread_id')
     $stateKeys = @('phase','request_sequence','witness_sequence','build_sequence','pending_since_qpc','fresh_since_qpc',
         'qualification_flags','native_task_state','client_qualification_ms','mode','classification','pi','bots','maximum','pending','fresh','bound',
         'native_schedule_valid','native_schedule_anchor_bits','native_errors_bits','native_throttles_bits','native_expedite',
@@ -402,11 +755,18 @@ function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64
         'original_elapsed_ticks','entry_qpc','return_qpc','pi','bots','maximum','classification','selected','result','pending','fresh')
     $anchorKeys = @('normal_attempts','full_selected','selected_true','normal_returns','false_returns','native_unwinds',
         'request_sequence','witness_sequence','build_sequence','distinct_selected_witnesses','durations')
-    $startupKeys = @('type','schema','artifact','version','artifact_version','run_id','pid','process_start_filetime','qpc_frequency',
-        'utc_filetime','qpc','mode','configured_mode','header_validity','host_sha256','qualified_steam_api_sha256',
-        'qualified_steamclient_sha256','max_log_bytes','record_bytes','ring_capacity','batch_limit','authentication_changed',
-        'verbose_observer_trace','termination_may_lose_tail','directory')
-    $types = @('','state','request','witness','builder-enter','builder-return','builder-unwind','anchor')
+    $summaryKeys=@('anchor_sequence','native_submit_calls','native_submit_elapsed_ticks','native_submit_maximum_ticks',
+        'native_submit_over_five_milliseconds','forwarded_pump_without_capture','forwarded_builder_without_capture',
+        'transport_state','transport_reason','pause_epoch','pause_boundary_sequence','submitted_sequence','observed_sequence',
+        'timing_accounted_through_qpc','generated_sequence')
+    $controlKeys=@('event','transport_state','transport_reason','pause_epoch','pause_boundary_sequence','abandoned_pending_request',
+        'abandoned_witness','last_request_qpc','generated_before','submitted_before','observed_before',
+        'forwarded_pump_without_capture','forwarded_builder_without_capture','timing_accounted_through_qpc')
+    $recoveryKeys=@($script:RecoveryPayloadNames|ForEach-Object{'recovery_'+$_})
+    $types = @('','state','request','witness','builder-enter','builder-return','builder-unwind','anchor','transport-summary','control','recovery')
+    $recoveries=New-Object 'Collections.Generic.List[object]';$callbackMeasurements=@{}
+    $lastKind=0; $lastSummary=$null; $paused=$false; $pauseEpoch=[uint64]0; $pauseBoundary=[uint64]0
+    $pauseCoverage=$false; $pauseStarted=[uint64]0
     $startup = $null; $anchor = $null; [uint64]$sequence = 0; [uint64]$lastQpc = 0; [uint64]$lastBuild = 0
     $openBuild = $null; $pairs = New-Object 'Collections.Generic.List[object]'; $requests = @{}; $witnesses = @{}
     $schedulerSamples=New-Object 'Collections.Generic.List[object]'
@@ -421,6 +781,12 @@ function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64
     [uint64]$lastSelectedWitness=0; $populationSamples=0; $humanObserved=$false; $watermarks=@{}
     foreach ($snapshot in $Snapshots) {
         $f=$snapshot.fields
+        if($f.ContainsKey('recovery.snapshot_result')) {
+            $recoveryPayload=Assert-ReportRecoveryFields $f
+            if($null -ne $recoveryPayload) {
+                Add-ReportRecoveryTiming $callbackMeasurements $recoveryPayload $f['recovery.run_id'] (Get-ReportScalar $f 'reporting.qpc_frequency')
+            }
+        }
         if ($f.ContainsKey('reporting.owner_valid') -and $f['reporting.owner_valid'] -ceq 'true' -and
             $f['reporting.run_id'] -ceq $Identity['reporting.run_id']) {
             $mark=[string](Get-ReportScalar $f 'reporting.reportSequence')
@@ -432,38 +798,34 @@ function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64
         if (++$count -gt 2000000) { throw 'Reporting log record bound exceeded.' }
         $r = Read-ReportJson $line
         if ($r['type'] -ceq 'startup') {
-            Assert-ReportShape $r $startupKeys
-            foreach ($key in @('schema','artifact_version','pid','process_start_filetime','qpc_frequency','utc_filetime','qpc',
-                'configured_mode','header_validity','max_log_bytes','record_bytes','ring_capacity','batch_limit')) {
-                if ($r[$key] -isnot [uint64]) { throw 'Startup numeric field has wrong JSON type.' }
-            }
             if ($null -ne $startup -or $count -ne 1) { throw 'Duplicate/misplaced reporting startup.' }
-            Assert-ReportFields $r @{ schema='2'; artifact='RS2ServerFix-steam-reporting'; version='0.4.2.0'; artifact_version='262656';
-                run_id=$Identity['reporting.run_id']; pid=$Identity['pid']; process_start_filetime=$Identity['process_creation_filetime'];
-                qpc_frequency=$Identity['reporting.qpc_frequency']; configured_mode=$Identity['reporting.mode']; header_validity='31';
-                record_bytes='256'; ring_capacity='256'; batch_limit='32'; max_log_bytes=[string]$QuotaBytes }
-            if ($r['authentication_changed'] -isnot [bool] -or $r['authentication_changed'] -or
-                $r['verbose_observer_trace'] -isnot [bool] -or $r['verbose_observer_trace'] -or
-                $r['termination_may_lose_tail'] -isnot [bool] -or !$r['termination_may_lose_tail'] -or
-                !([string]$r['directory']).Equals($RunDirectory,[StringComparison]::OrdinalIgnoreCase) -or
-                !([IO.Path]::GetFileName($RunDirectory)).EndsWith('-PID' + $Identity['pid'] + '-' + $r['run_id'],[StringComparison]::Ordinal) -or
-                ([string]$r['host_sha256']).ToUpperInvariant() -cne $script:ReportHostHash -or
-                ([string]$r['qualified_steam_api_sha256']).ToUpperInvariant() -cne $script:ReportSdkHash -or
-                ([string]$r['qualified_steamclient_sha256']).ToUpperInvariant() -cne $script:ReportClientHash -or
-                $r['utc_filetime'] -lt (Get-ReportScalar $Identity 'process_creation_filetime') -or
-                $r['utc_filetime'] -gt [uint64][DateTime]::UtcNow.ToFileTimeUtc()) { throw 'Reporting startup identity mismatch.' }
-            $expectedMode = if ($Identity['reporting.mode'] -ceq '2') { 'observe' } else { 'repair' }
-            if ($r['mode'] -cne $expectedMode) { throw 'Startup mode mismatch.' }
+            Assert-NativeReportStartup $r $Identity
             $startup = $r; continue
         }
         if ($null -eq $startup) { throw 'Missing reporting startup.' }
         $kind = Get-ReportScalar $r 'kind'
-        if ($kind -lt 1 -or $kind -gt 7 -or $r['type'] -cne $types[$kind]) { throw 'Unknown reporting record kind.' }
-        $extra = switch ($kind) { 1 { $stateKeys }; { $_ -in 2,3 } { $requestKeys }; { $_ -in 4,5,6 } { $buildKeys }; 7 { $anchorKeys } }
+        if($kind -eq 10 -and !$TrainingRecoveryMode){throw 'recovery-collection-mode-required'}
+        if ($kind -lt 1 -or $kind -gt 10 -or $r['type'] -cne $types[$kind]) { throw 'Unknown reporting record kind.' }
+        $extra = switch ($kind) { 1 { $stateKeys }; { $_ -in 2,3 } { $requestKeys }; { $_ -in 4,5,6 } { $buildKeys }; 7 { $anchorKeys }; 8 { $summaryKeys }; 9 { $controlKeys }; 10 { $recoveryKeys } }
         Assert-ReportShape $r ($common + $extra)
-        Assert-ReportFields $r @{ schema='2'; run_id=$Identity['reporting.run_id']; pid=$Identity['pid'];thread_id=$Identity['reporting.ownerThreadId'];flags='0' }
+        Assert-ReportFields $r @{ schema='3'; run_id=$Identity['reporting.run_id']; pid=$Identity['pid'];thread_id=$Identity['reporting.ownerThreadId'];flags='0' }
         foreach ($key in $r.Keys) { if ($key -cnotin @('type','run_id','durations') -and $r[$key] -isnot [uint64]) { throw 'Record numeric field has wrong JSON type.' } }
         if ([System.Numerics.BigInteger]$r['sequence'] -ne ([System.Numerics.BigInteger]$sequence + 1) -or $r['qpc'] -lt $lastQpc -or $r['reason'] -ge 59 -or !$r['thread_id']) { throw 'Reporting sequence/time/reason invalid.' }
+        Assert-NativeDerivedUtc $r $startup
+        if ($lastKind -eq 7 -and $kind -ne 8) { throw 'Anchor missing adjacent transport summary.' }
+        if ($paused -and $kind -notin 5,6,9,10) { throw 'Unreserved capture appeared inside a pause.' }
+        if($kind -eq 10) {
+            if($r['reason'] -ne 0){throw 'Recovery header reason must be None.'}
+            $recoveryPayload=Read-ReportRecoveryPayload $r 'recovery_'
+            if($recoveryPayload.qpc -gt $r['qpc']){throw 'Recovery observation is newer than its emission clock.'}
+            if($recoveryPayload.record_sequence -ne 0){throw 'Emitted recovery payload sequence must be zero.'}
+            if($paused -and ($recoveryPayload.phase -ne 9 -or $recoveryPayload.event -notin 1,2 -or
+                !($recoveryPayload.flags -band 4) -or !($recoveryPayload.flags -band 512) -or !$recoveryPayload.reason)) {
+                throw 'Unreserved/nonterminal recovery capture appeared inside a pause.'
+            }
+            Add-ReportRecoveryTiming $callbackMeasurements $recoveryPayload $Identity['reporting.run_id'] (Get-ReportScalar $Identity 'reporting.qpc_frequency')
+            $recoveries.Add($r)
+        }
         $sequence = $r['sequence']; $lastQpc = $r['qpc']
         foreach ($boolean in @('selected','result','pending','fresh','bound')) {
             if ($r.ContainsKey($boolean) -and $r[$boolean] -gt 1) { throw 'Invalid boolean scalar.' }
@@ -543,7 +905,50 @@ function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64
                 } }
             }
             $anchor = $r
+        } elseif ($kind -eq 8) {
+            if ($lastKind -ne 7 -or $null -eq $anchor -or $r['anchor_sequence'] -ne $anchor['sequence'] -or
+                $r['qpc'] -ne $anchor['qpc'] -or $r['source_epoch'] -ne $anchor['source_epoch'] -or
+                $r['binding_epoch'] -ne $anchor['binding_epoch']) { throw 'Unpaired transport summary.' }
+            if ($r['transport_state'] -gt 4 -or $r['transport_reason'] -ge 18 -or
+                $r['observed_sequence'] -gt $r['submitted_sequence'] -or $r['submitted_sequence'] -gt $r['generated_sequence'] -or
+                $r['native_submit_maximum_ticks'] -gt $r['native_submit_elapsed_ticks'] -or
+                $r['native_submit_over_five_milliseconds'] -gt $r['native_submit_calls']) { throw 'Invalid transport summary.' }
+            if ($null -ne $lastSummary) {
+                foreach($key in @('native_submit_calls','native_submit_elapsed_ticks','native_submit_maximum_ticks',
+                    'native_submit_over_five_milliseconds','forwarded_pump_without_capture','forwarded_builder_without_capture',
+                    'pause_epoch','pause_boundary_sequence','submitted_sequence','observed_sequence','generated_sequence','timing_accounted_through_qpc')) {
+                    if($r[$key] -lt $lastSummary[$key]) { throw 'Transport summary counter decreased.' }
+                }
+            }
+            # These are pre-submission snapshots, NOT receipts for this pair.
+            if($inWindow -and ($r['transport_state'] -ne 1 -or $r['transport_reason'])) { $pauseCoverage=$true }
+            $lastSummary=$r
+        } elseif ($kind -eq 9) {
+            if ($r['reason'] -ne 0 -or $r['event'] -notin 1,2 -or $r['transport_reason'] -gt 11 -or
+                $r['abandoned_pending_request'] -gt $totals.request_sequence -or $r['abandoned_witness'] -gt $totals.witness_sequence -or
+                $r['last_request_qpc'] -gt $r['qpc'] -or
+                $r['observed_before'] -gt $r['submitted_before'] -or $r['submitted_before'] -gt $r['generated_before']) {
+                throw 'Invalid transport control.'
+            }
+            if ($r['event'] -eq 1) {
+                if ($paused -or $r['transport_state'] -ne 2 -or !$r['transport_reason'] -or
+                    [System.Numerics.BigInteger]$r['pause_epoch'] -ne [System.Numerics.BigInteger]$pauseEpoch+1) {
+                    throw 'Invalid pause boundary.'
+                }
+                if($r['pause_boundary_sequence'] -ne $sequence) { throw 'Pause boundary sequence mismatch.' }
+                $paused=$true; $pauseEpoch=$r['pause_epoch']; $pauseBoundary=$r['pause_boundary_sequence']; $pauseStarted=$r['qpc']
+            } else {
+                if (!$paused -or $r['transport_state'] -ne 1 -or $r['transport_reason'] -ne 0 -or
+                    $r['pause_epoch'] -ne $pauseEpoch -or $r['pause_boundary_sequence'] -ne $pauseBoundary) {
+                    throw 'Resume without matching pause.'
+                }
+                if($pauseStarted -lt $EndQpc -and $r['qpc'] -ge $StartQpc){$pauseCoverage=$true}
+                $paused=$false
+            }
+            if($inWindow) { $pauseCoverage=$true }
         }
+        if ($paused -and $inWindow) { $pauseCoverage=$true }
+        $lastKind=$kind
         if ($inWindow -and $kind -in 2,3) { ++$populationSamples; if ($r['human_players'] -gt 0) { $humanObserved=$true } }
         if ($watermarks.ContainsKey([string]$sequence)) {
             foreach ($snapshot in $watermarks[[string]$sequence]) {
@@ -554,11 +959,14 @@ function Read-ReportLog([string]$Path, $Identity, [string]$RunDirectory, [uint64
         }
     }
     if ($null -eq $startup) { throw 'Empty/no-startup reporting log.' }
+    if($paused -and $pauseStarted -lt $EndQpc){$pauseCoverage=$true}
     return @{ startup=$startup; last_sequence=$sequence; last_qpc=$lastQpc; latest_anchor=$anchor;
         pairs=@($pairs.ToArray()); open_builder=$openBuild; source_changes=$sourceChanges; window_requests=$windowRequests; window_selections=$windowSelections;
         epoch_baseline_available=($null -ne $epochBaseline); epoch_baseline=$epochBaseline;
         population_samples=$populationSamples; human_observed=$humanObserved; counters=$totals;
-        scheduler_samples=@($schedulerSamples.ToArray()) }
+        scheduler_samples=@($schedulerSamples.ToArray()); transport_paused=$pauseCoverage; pending_summary=($lastKind -eq 7); latest_summary=$lastSummary;
+        recovery_records=@($recoveries.ToArray());recovery_callback_measurements=@($callbackMeasurements.Values);
+        recovery_timing_scope='primary-callback-diagnostic-only-no-sustained-CPU-or-performance-PASS' }
 }
 
 function Find-ReportBoundary($Snapshots, [uint64]$Target, [ValidateSet('coverage','timing')][string]$Family='coverage') {
@@ -617,7 +1025,7 @@ function Read-ReportTimingCalibration($Files, [string]$Package) {
         if ($r[$key] -isnot [uint64]) { throw 'Calibration numeric field has wrong type.' }
     }
     Assert-ReportFields $r @{schema='3';companion_sha256=$Files['dlls/RS2ServerFix.dll'];
-        measurement_id='rs2-wrapper-own-deferred-v2';protocol_id='rs2-deferred-v2-fixed6000-1024';configuration='Release-AMD64';
+        measurement_id='rs2-wrapper-own-deferred-v2';protocol_id='rs2-native-log-v3-writefile-fixed6000-1024-350ms';configuration='Release-AMD64';
         scope='outer-wrapper-minus-recorded-own-minus-inner-original';limitation='fixture-measured-not-hard-real-time'}
     foreach($key in @('fixture_sha256','source_inventory_sha256','floor_ledger_sha256')) {
         if ($r[$key] -isnot [string] -or $r[$key] -cnotmatch '^[0-9A-F]{64}$') { throw 'Invalid calibration custody digest.' }
@@ -683,7 +1091,7 @@ function Read-ReportPerformanceAssessment($Files, [string]$Package, $Calibration
         if($record[$key] -isnot [string] -or $record[$key] -cnotmatch '^[0-9A-F]{64}$'){throw 'Invalid assessment custody digest.'}
     }
     Assert-ReportFields $record @{schema='1';assessment_id=$policy;measurement_id='rs2-wrapper-own-deferred-v2';
-        protocol_id='rs2-deferred-v2-fixed6000-1024';scope='post-capture-isolated-observe-only';
+        protocol_id='rs2-native-log-v3-writefile-fixed6000-1024-350ms';scope='post-capture-isolated-observe-only';
         mean_rule='max-all-run-phase-means-ceil';reference_frequency='10000000';companion_sha256=$Files['dlls/RS2ServerFix.dll'];
         timing_calibration_sha256=$Calibration.calibration_sha256;floor_ledger_sha256=$Calibration.floor_ledger_sha256;
         source_inventory_sha256=$Calibration.source_inventory_sha256}
@@ -958,6 +1366,14 @@ function Measure-ReportWindow($Snapshots, $Log, [uint64]$StartQpc, [uint64]$Freq
         warmup_seconds=$(if ($Mode -ceq 'repair') {120}else{0}); score_seconds=$(if ($Mode -ceq 'repair') {180}else{300});
         reason='boundary-brackets-missing'; boundaries=@{coverage=@();timing=@()}; no_automatic_promotion=$true }
     $result.native_scheduler=@{scope='scored-window';observations=@();next_eligibility='unknown';backoff_coverage_exemption=$false}
+    $result.native_submission=@{available=$false;non_additive=$true;scope='latest-log-summary-not-window-total'}
+    if($Log.ContainsKey('latest_summary') -and $null -ne $Log.latest_summary) {
+        $result.native_submission.available=$true
+        foreach($key in @('native_submit_calls','native_submit_elapsed_ticks','native_submit_maximum_ticks',
+            'native_submit_over_five_milliseconds','forwarded_pump_without_capture','forwarded_builder_without_capture')) {
+            $result.native_submission[$key]=[string]$Log.latest_summary[$key]
+        }
+    }
     if($Log.ContainsKey('scheduler_samples')) { $result.native_scheduler.observations=@($Log.scheduler_samples) }
     foreach ($boundary in @($a,$b,$timingA,$timingB)) {
         $rangeKey=$boundary.family+'_range'
@@ -991,6 +1407,10 @@ function Measure-ReportWindow($Snapshots, $Log, [uint64]$StartQpc, [uint64]$Freq
         if ((Get-ReportScalar $f 'reporting.stopping') -ne 0) { $result.reason='planned-or-observed-stop'; return $result }
     }
     if (!$a.complete -or !$b.complete) { return $result }
+    if (($Log.ContainsKey('transport_paused') -and $Log.transport_paused) -or
+        ($Log.ContainsKey('pending_summary') -and $Log.pending_summary)) {
+        $result.reason='transport-pause-or-incomplete-anchor-pair'; return $result
+    }
     if ($Log.source_changes) { $result.reason='source-or-binding-epoch-change'; return $result }
     if (!$Log.ContainsKey('epoch_baseline_available') -or !$Log.epoch_baseline_available) {
         $result.reason='pre-window-epoch-baseline-unavailable'; return $result
@@ -1097,7 +1517,7 @@ function Read-ReportMarker([string]$Path, [string]$Executable, [uint32]$Selected
     if (![IO.Path]::GetFileName($plain).Equals("RS2ServerFix.loader.$SelectedId.log",[StringComparison]::OrdinalIgnoreCase)) { throw 'Loader marker PID filename mismatch.' }
     $stream=[RS2ReportCollection.Files]::Open($plain,$false); $Locks.Add($stream)
     $text=Read-ReportText $stream 8192; $fields=Read-ReportFields $text
-    $required=@{schema='3';version='0.4.2.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
+    $required=@{schema='3';version='0.6.2.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
         executable_size=[string](Get-Item -LiteralPath $Executable).Length;sha256=$script:ReportHostHash;build_identity='current-full-dump';
         bootstrap='X3DAudio1_7.dll';bootstrap_beside_executable='true';companion='RS2ServerFix.dll';companion_beside_executable='true';
         genuine_module='system32';genuine_initialize_present='true';genuine_calculate_present='true';trigger='exe-crt-initialize';
@@ -1114,6 +1534,42 @@ function Read-ReportMarker([string]$Path, [string]$Executable, [uint32]$Selected
 }
 
 function Get-ReportCollectorQpc { return [uint64][Diagnostics.Stopwatch]::GetTimestamp() }
+
+function Get-NativeCaptureMetadata($Capture) {
+    return @{initial_offset=[string]$Capture.InitialOffset;required_end=[string]$Capture.RequiredEnd;
+        captured_end=[string]$Capture.CapturedEnd;required_span=[string]($Capture.RequiredEnd-$Capture.InitialOffset);
+        captured_span=[string]($Capture.CapturedEnd-$Capture.InitialOffset);raw_bytes_read=[string]$Capture.ReadBytes;
+        byte_limit=[string][RS2ReportCollection.NativeCapture]::ByteLimit;frame_limit=[string][RS2ReportCollection.NativeCapture]::FrameLimit;
+        complete_selected_frames=[string]$Capture.CompleteSelectedFrames;raw_partial_tail=$Capture.RawPartialTail;
+        selected_partial_tail=$Capture.SelectedPartialTail;stop_reason=$Capture.StopReason;prefix_sha256=$Capture.PrefixSha256;
+        final_volume_serial=[string]$Capture.FinalIdentity.Volume;final_file_id=$Capture.FinalIdentity.FileId;
+        raw_file='Launch-prefix.log';selected_file='events-selected.jsonl'}
+}
+function New-NativeReportCapture($Native,$Identity,[string]$Directory) {
+    return [RS2ReportCollection.NativeCapture]::new($Native.path,(Join-Path $Directory 'Launch-prefix.log'),
+        (Join-Path $Directory 'events-selected.jsonl'),(Get-ReportUInt $Identity['reporting.log.volumeSerial'] -RawBits),
+        $Identity['reporting.log.file_id'],[long](Get-ReportScalar $Identity 'reporting.log.initialEOF'),
+        ((Get-ReportScalar $Identity 'reporting.log.initialAtLineBoundary') -eq 1),
+        [int](Get-ReportScalar $Identity 'reporting.log.prefixMode'),$Identity['reporting.run_id'])
+}
+function Resolve-NativeReportLog($Fields,[string]$Server,[string]$ExplicitPath,[string]$PermittedRoot,[switch]$Archive) {
+    Assert-ReportFields $Fields @{'reporting.log_identity_available'='true';'reporting.log.transportKind'='1';'reporting.log.durability'='0'}
+    $expected=[Uri]::UnescapeDataString($Fields['reporting.log.path']).Replace('/','\')
+    if($ExplicitPath -and !$Archive -and !$ExplicitPath.Equals($expected,[StringComparison]::OrdinalIgnoreCase)) { throw 'A live capture cannot substitute another log path.' }
+    $candidate=if($ExplicitPath){$ExplicitPath}else{$expected}
+    if(!(Test-ReportWithin $Server $candidate)) {
+        if(!$PermittedRoot){$PermittedRoot=Read-Host "Log is outside server root ($candidate). Full directory explicitly permitted for this capture"}
+        $root=Resolve-ReportPlain $PermittedRoot $true
+        if(!(Test-ReportWithin $root $candidate)){throw 'Log is outside the permitted log root.'}
+    }else{$root=$Server}
+    $path=Resolve-ReportPlain $candidate $false
+    if(([IO.DriveInfo]::new([IO.Path]::GetPathRoot($path))).DriveType -ne [IO.DriveType]::Fixed){throw 'Native capture requires a fixed local drive.'}
+    if($Fields['reporting.log.file_id'] -cnotmatch '^[0-9a-f]{32}$' -or
+        (Get-ReportScalar $Fields 'reporting.log.initialEOF') -gt [long]::MaxValue -or
+        (Get-ReportScalar $Fields 'reporting.log.prefixMode') -gt 1 -or
+        (Get-ReportScalar $Fields 'reporting.log.initialAtLineBoundary') -gt 1) {throw 'Invalid native log DATA identity.'}
+    return @{path=$path;original_path=$expected;permitted_root=$root}
+}
 
 function Get-ReportPollingStop($Budget, [uint64]$ObservedQpc, [int]$Attempts) {
     if ($Attempts -ge 72) { return 'measurement-attempt-limit' }
@@ -1134,10 +1590,10 @@ function Test-ReportOperatorAbort {
 function Invoke-SteamReportCollection {
     Initialize-ReportFileReader
     if (![Environment]::Is64BitProcess) { throw 'Use 64-bit Windows PowerShell.' }
-    $locks=New-Object 'Collections.Generic.List[IO.FileStream]'; $resultDirectory=$null; $eventStream=$null
+    $locks=New-Object 'Collections.Generic.List[IO.FileStream]'; $resultDirectory=$null; $capture=$null
     $first=$null;$final=$null;$snapshots=$null
     try {
-        if (!$ProcessId) { $entered=Read-Host 'PID of the already running reporting-enabled server';
+        if (!$ProcessId -and !$ArchivedStatusPath) { $entered=Read-Host 'PID of the already running reporting-enabled server';
             if ($entered -cnotmatch '^[1-9][0-9]{0,9}$' -or ![uint32]::TryParse($entered,[ref]$ProcessId)) { throw 'Invalid selected PID.' } }
         if (!$TargetRoot) { $TargetRoot=Read-Host 'Full server root directory' }
         $server=Resolve-ReportPlain $TargetRoot $true
@@ -1157,8 +1613,46 @@ function Invoke-SteamReportCollection {
         $resultDirectory=Join-Path $reportBase ('SteamReport-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')+'-'+[Guid]::NewGuid().ToString('N'))
         if (Test-Path -LiteralPath $resultDirectory) { throw 'Evidence output collision.' }
         $null=[IO.Directory]::CreateDirectory($resultDirectory); Write-Host "Evidence folder: $resultDirectory"
+        if($ArchivedStatusPath) {
+            # Explicit offline route: no process handle or claim of current/final
+            # readiness. The saved DATA names the original file ID and baseline.
+            if(!$LaunchLogPath){throw 'Archive capture requires an explicit LaunchLogPath and saved V3 inventory.'}
+            $savedPath=Resolve-ReportPlain $ArchivedStatusPath $false
+            $savedStream=[RS2ReportCollection.Files]::Open($savedPath,$false);$locks.Add($savedStream)
+            $savedText=Read-ReportText $savedStream 8MB;$fields=Read-ReportFields $savedText
+            Assert-ReportFields $fields @{schema='1';mode='runtime-inventory';companion_kind='companion-reporting';
+                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';
+                'reporting.captured'='true';'reporting.header_valid'='true';'reporting.log_identity_available'='true'}
+            $null=Assert-ReportRecoveryFields $fields
+            if($ProcessId -and [string]$ProcessId -cne $fields['pid']){throw 'Archived inventory PID differs from selected PID.'}
+            $ProcessId=[uint32](Get-ReportScalar $fields 'pid')
+            Save-ReportText (Join-Path $resultDirectory 'inventory-archived.txt') $savedText
+            $first=@{fields=$fields;path=(Join-Path $resultDirectory 'inventory-archived.txt');exit_code=$null}
+            $native=Resolve-NativeReportLog $fields $server $LaunchLogPath $AllowedLogRoot -Archive
+            $capture=New-NativeReportCapture $native $fields $resultDirectory
+            $capture.CopyAvailable();$capture.Finish();$metadata=Get-NativeCaptureMetadata $capture
+            Save-ReportText (Join-Path $resultDirectory 'native-prefix.json') (($metadata|ConvertTo-Json -Depth 5)+"`r`n")
+            $lastSequence=$null
+            if(!$capture.StopReason){
+                $parsed=Read-ReportLog (Join-Path $resultDirectory 'events-selected.jsonl') $fields $native.original_path 512MB 0 ([uint64]::MaxValue) @($first) -TrainingRecoveryMode:$TrainingRecovery
+                $lastSequence=[string]$parsed.last_sequence
+            }
+            $summary=@{mode='archive';reason=$(if($capture.StopReason){$capture.StopReason}else{'archived-evidence-no-current-data'});
+                local_safety='UNVERIFIED';local_coverage='INCONCLUSIVE';local_performance='INCONCLUSIVE';overall_qualified=$false;
+                final_safety='UNAVAILABLE';current_process_observed=$false;copied_last_sequence=$lastSequence;
+                native_prefix=$metadata;original_log_path=$native.original_path;archive_log_path=$native.path;
+                permitted_log_root=$native.permitted_root;archived_inventory_sha256=(Get-ReportHash $savedStream);
+                package_manifest_sha256=$verified.ManifestHash;trial_assessment=(New-ReportTrialAssessment)}
+            if($TrainingRecovery -and !$capture.StopReason) {
+                $summary.collection_mode='TrainingRecovery';$summary.recovery_records=$parsed.recovery_records
+                $summary.primary_callback_diagnostics=$parsed.recovery_callback_measurements
+                $summary.recovery_timing_scope=$parsed.recovery_timing_scope
+            }
+            Save-ReportText (Join-Path $resultDirectory 'collection.json') (($summary|ConvertTo-Json -Depth 10)+"`r`n")
+            Write-Host 'Archived native-log evidence retained. No current readiness or trial qualification claimed.';return
+        }
         $first=Invoke-ReportInventory $package $verified.Files $server $ProcessId (Join-Path $resultDirectory 'inventory-0000.txt')
-        if (!(Test-ReportReady $first)) {
+        if (!(Test-ReportReady $first) -and !($TrainingRecovery -and (Test-ReportRecoveryActive $first))) {
             $diagnostic=@{ status_file='inventory-0000.txt'; status_first=$true; log_requested=$false;
                 local_safety='UNVERIFIED';local_coverage='INCONCLUSIVE';local_performance='INCONCLUSIVE';
                 trial_assessment=(New-ReportTrialAssessment);
@@ -1185,7 +1679,7 @@ function Invoke-SteamReportCollection {
         $score=[uint64]([System.Numerics.BigInteger]$start+$(if($mode -ceq 'repair'){120*[System.Numerics.BigInteger]$frequency}else{0}))
         $executable=Resolve-ReportPlain ([Uri]::UnescapeDataString($first.fields['process_image_path']).Replace('/','\')) $false
         $exeDirectory=[IO.Path]::GetDirectoryName($executable); $configuration=@{}
-        foreach ($name in @('RS2SteamObserve.ini','RS2SteamReport.ini')) {
+        foreach ($name in @('RS2SteamReport.ini')) {
             $path=Resolve-ReportPlain (Join-Path $exeDirectory $name) $false
             $stream=[RS2ReportCollection.Files]::Open($path,$false); $locks.Add($stream)
             $text=Read-ReportText $stream 4096; $parsed=Read-ReportConfiguration $text ($name -ceq 'RS2SteamReport.ini')
@@ -1194,37 +1688,33 @@ function Invoke-SteamReportCollection {
             Save-ReportText (Join-Path $resultDirectory $name) $text
         }
         if ($configuration['RS2SteamReport.ini'].parsed.mode -cne $mode) { throw 'Installed configuration mode differs from immutable status.' }
-        $quotaBytes=[uint64]$configuration['RS2SteamObserve.ini'].parsed.quota_mib*1MB
-        $reportParent=Resolve-ReportPlain (Join-Path $exeDirectory 'RS2SteamReport') $true
-        if (!$ReportingRunDirectory) {
-            # One known reporting directory, not a recursive server scan. Never
-            # enumerate the separate legacy observer/key tree.
-            $children=@(Get-ChildItem -LiteralPath $reportParent -Directory -Force | Select-Object -First 1025)
-            if ($children.Count -gt 1024) { throw 'Reporting run directory bound exceeded; supply the exact path.' }
-            $suffix='-PID'+$ProcessId+'-'+$first.fields['reporting.run_id']
-            $matches=@($children|Where-Object { $_.Name.EndsWith($suffix,[StringComparison]::Ordinal) })
-            if ($matches.Count -ne 1) { throw 'Cannot uniquely locate the DATA-bound reporting run; supply its exact directory.' }
-            $ReportingRunDirectory=$matches[0].FullName
-        }
-        $run=Resolve-ReportPlain $ReportingRunDirectory $true
-        if (![IO.Path]::GetDirectoryName($run).Equals($reportParent,[StringComparison]::OrdinalIgnoreCase)) { throw 'Reporting run is not beside this EXE.' }
+        $native=Resolve-NativeReportLog $first.fields $server $LaunchLogPath $AllowedLogRoot
         if (!$MarkerPath) { $MarkerPath=Join-Path $exeDirectory "RS2ServerFix.loader.$ProcessId.log" }
         $marker=Read-ReportMarker $MarkerPath $executable $ProcessId (Get-ReportScalar $first.fields 'process_creation_filetime') $locks
         Save-ReportText (Join-Path $resultDirectory 'startup-marker.log') $marker
-        $events=Resolve-ReportPlain (Join-Path $run 'events.jsonl') $false
-        $eventStream=[RS2ReportCollection.Files]::Open($events,$true)
-        $prefixBefore=[RS2ReportCollection.Files]::CopyPrefix($eventStream,$events,(Join-Path $resultDirectory 'events-before.jsonl'))
+        $capture=New-NativeReportCapture $native $first.fields $resultDirectory
+        $capture.CopyAvailable()
+        $prefixBefore=Get-NativeCaptureMetadata $capture
         $snapshots=New-Object 'Collections.Generic.List[object]'; $snapshots.Add($first)
         $previous=$first; $interruption=$null; $index=0; $completed=$false; $observed=$start
         Write-Host "Collecting fixed $mode window: 300 seconds plus at most 30 seconds boundary catch-up; Q stops without qualification."
         while ($true) {
+            if($capture.StopReason){$interruption=$capture.StopReason;break}
             $interruption=Get-ReportPollingStop $budget $observed $index
             if ($null -ne $interruption) { break }
             if (Test-ReportOperatorAbort) { $interruption='operator-aborted';break }
             ++$index
             $next=Invoke-ReportInventory $package $verified.Files $server $ProcessId (Join-Path $resultDirectory ('inventory-{0:D4}.txt' -f $index))
             $snapshots.Add($next)
-            if (!(Test-ReportReady $next)) { $interruption='current-readiness-lost'; break }
+            $capture.CopyAvailable()
+            if($capture.StopReason){$interruption=$capture.StopReason;break}
+            if($TrainingRecovery) {
+                $recoveryPayload=Assert-ReportRecoveryFields $next.fields
+                if($null -ne $recoveryPayload -and $recoveryPayload.phase -in 8,9,10 -and ($recoveryPayload.flags -band 512)) {
+                    $interruption='training-recovery-terminal';break
+                }
+            }
+            if (!(Test-ReportReady $next) -and !($TrainingRecovery -and (Test-ReportRecoveryActive $next))) { $interruption='current-readiness-lost'; break }
             $ranges=Assert-ReportSnapshot $next $first
             $next.coverage_range=$ranges.coverage_range;$next.timing_range=$ranges.timing_range
             Assert-ReportCounterProgress $previous $next
@@ -1249,8 +1739,6 @@ function Invoke-SteamReportCollection {
         if ($completed -and $null -eq (Get-ReportPollingStop $budget $observed $index)) {
             Start-Sleep -Seconds 1 # Ordinary writer progress only.
         }
-        $prefixAfter=[RS2ReportCollection.Files]::CopyPrefix($eventStream,$events,(Join-Path $resultDirectory 'events-after.jsonl'))
-        Assert-ReportPrefix (Join-Path $resultDirectory 'events-before.jsonl') (Join-Path $resultDirectory 'events-after.jsonl')
         $final=$null; $finalSafety='UNAVAILABLE'
         if ($completed) {
             $interruption=Get-ReportPollingStop $budget $observed $index
@@ -1266,11 +1754,62 @@ function Invoke-SteamReportCollection {
                 } else { $interruption='final-current-readiness-lost';$finalSafety='INCOMPLETE' }
             }
         }
+        # A cap must not start/finish a five-minute wait. Take one independent DATA
+        # observation, retaining partial raw bytes; it is never a scoring boundary.
+        if($null -eq $final -and $capture.StopReason -in @('history-byte-limit','frame-limit','selected-frame-malformed')) {
+            $final=Invoke-ReportInventory $package $verified.Files $server $ProcessId (Join-Path $resultDirectory 'inventory-final.txt')
+            $finalSafety=if(Test-ReportReady $final){'AVAILABLE'}else{'INCOMPLETE'}
+            if($finalSafety -ceq 'AVAILABLE'){$null=Assert-ReportSnapshot $final $first}
+        }
+        $capture.CopyAvailable();$capture.Finish()
+        $prefixAfter=Get-NativeCaptureMetadata $capture
+        Save-ReportText (Join-Path $resultDirectory 'native-prefix.json') (($prefixAfter|ConvertTo-Json -Depth 5)+"`r`n")
+        if($capture.StopReason){$interruption=$capture.StopReason}
         # Final read is safety verification, NOT a replacement measurement boundary.
         # Windows PowerShell 5.1 cannot reliably array-wrap Generic.List[object].
         $all=$snapshots.ToArray()
         if ($null -ne $final) { $all+=@($final) }
-        $log=Read-ReportLog (Join-Path $resultDirectory 'events-after.jsonl') $first.fields $run $quotaBytes $score $finish $all
+        if($capture.StopReason) {
+            $summary=@{local_safety='UNVERIFIED';local_coverage='INCONCLUSIVE';local_performance='INCONCLUSIVE';
+                final_safety=$finalSafety;overall_qualified=$false;reason=$capture.StopReason;
+                native_prefix=$prefixAfter;run_id=$first.fields['reporting.run_id'];pid=$ProcessId;
+                operator_smoke='UNVERIFIED';backend_client_effect='UNVERIFIED';outage_recovery='UNVERIFIED';
+                package_manifest_sha256=$verified.ManifestHash;trial_assessment=(New-ReportTrialAssessment $mode);
+                samples=@($all|ForEach-Object{@{file=[IO.Path]::GetFileName($_.path);exit_code=$_.exit_code}})}
+            foreach($sample in $all) {
+                if($sample.fields.ContainsKey('reporting.loss_reasons') -and
+                    ((Get-ReportScalar $sample.fields 'reporting.loss_reasons') -ne 0 -or
+                     (Get-ReportScalar $sample.fields 'reporting.revoke_reasons') -ne 0)) {$summary.local_safety='FAIL'}
+            }
+            Save-ReportText (Join-Path $resultDirectory 'collection.json') (($summary|ConvertTo-Json -Depth 10)+"`r`n")
+            Write-Host ('Partial native-log evidence preserved: '+$capture.StopReason+'. Coverage/performance INCONCLUSIVE.')
+            return
+        }
+        $log=Read-ReportLog (Join-Path $resultDirectory 'events-selected.jsonl') $first.fields $native.original_path 512MB $score $finish $all -TrainingRecoveryMode:$TrainingRecovery
+        if($TrainingRecovery) {
+            $summary=@{collection_mode='TrainingRecovery';overall_qualified=$false;local_safety='UNVERIFIED';local_coverage='INCONCLUSIVE';
+                local_performance='INCONCLUSIVE';final_safety=$finalSafety;reason=$(if($interruption){$interruption}else{'training-recovery-diagnostic-only'});
+                recovery_records=$log.recovery_records;primary_callback_diagnostics=$log.recovery_callback_measurements;
+                recovery_timing_scope=$log.recovery_timing_scope;native_prefix=$prefixAfter;run_id=$first.fields['reporting.run_id'];pid=$ProcessId;
+                operator_smoke='UNVERIFIED';backend_client_effect='UNVERIFIED';outage_recovery='UNVERIFIED';
+                package_manifest_sha256=$verified.ManifestHash;trial_assessment=(New-ReportTrialAssessment $mode);
+                samples=@($all|ForEach-Object{@{file=[IO.Path]::GetFileName($_.path);exit_code=$_.exit_code}})}
+            foreach($sample in $all) {
+                $payload=Assert-ReportRecoveryFields $sample.fields
+                if($null -ne $payload -and $payload.phase -eq 9){$summary.local_safety='FAIL';$summary.reason='training-recovery-failed'}
+                if((Get-ReportScalar $sample.fields 'reporting.loss_reasons') -ne 0 -or
+                    (Get-ReportScalar $sample.fields 'reporting.revoke_reasons') -ne 0){$summary.local_safety='FAIL'}
+            }
+            foreach($name in $configuration.Keys) {
+                $configuration[$name].after_sha256=Get-ReportHash $configuration[$name].stream
+                if($configuration[$name].after_sha256 -cne $configuration[$name].sha256){throw 'Held configuration changed.'}
+                $configuration[$name].Remove('stream')
+            }
+            $summary.configurations=$configuration
+            Save-ReportText (Join-Path $resultDirectory 'collection.json') (($summary|ConvertTo-Json -Depth 12)+"`r`n")
+            Write-Host 'Training recovery raw evidence and callback diagnostics retained. Performance/browser repair remain unqualified.'
+            return
+        }
         $calibration=Read-ReportTimingCalibration $verified.Files $package
         $assessment=Read-ReportPerformanceAssessment $verified.Files $package $calibration
         $summary=Measure-ReportWindow ($snapshots.ToArray()) $log $start $frequency $mode $calibration $verified.Files['dlls/RS2ServerFix.dll']
@@ -1286,9 +1825,20 @@ function Invoke-SteamReportCollection {
         $summary.collection_limits=@{measurement_attempts=72;catch_up_seconds=30;
             collector_start_qpc=[string]$collectorStart;collector_deadline_qpc=[string]$budget.collector_deadline;
             observed_deadline_qpc=[string]$budget.observed_deadline;in_flight_helper_timeout=$false}
+        # The full generated measurement prefix remains required. Newer final
+        # DATA may include normal unsubmitted tail records outside that window;
+        # extend the requirement only through its independently observed receipt.
         $requiredWatermark=Get-ReportScalar $previous.fields 'reporting.reportSequence'
-        if ($log.last_sequence -lt $requiredWatermark -or $prefixAfter.PartialTail -or $null -eq $log.latest_anchor) {
-            $summary.local_coverage='INCONCLUSIVE'
+        $finalGenerated=$null;$finalObserved=$null
+        if($null -ne $final -and $final.fields.ContainsKey('reporting.owner_valid') -and
+            $final.fields['reporting.owner_valid'] -ceq 'true' -and $final.fields['reporting.run_id'] -ceq $first.fields['reporting.run_id']) {
+            $finalGenerated=Get-ReportScalar $final.fields 'reporting.reportSequence'
+            $finalObserved=Get-ReportScalar $final.fields 'reporting.worker.observedSequence'
+            if($finalObserved -gt $finalGenerated){throw 'Final receipt watermark exceeds generated records.'}
+            if($finalObserved -gt $requiredWatermark){$requiredWatermark=$finalObserved}
+        }
+        if ($log.last_sequence -lt $requiredWatermark -or $prefixAfter.selected_partial_tail -or $log.pending_summary -or $null -eq $log.latest_anchor) {
+            $summary.local_coverage='INCONCLUSIVE'; $summary.local_performance='INCONCLUSIVE'
             if ($summary.local_safety -cne 'FAIL') { $summary.reason='incomplete-required-log-prefix' }
         }
         if ($null -ne $interruption -and $summary.local_safety -cne 'FAIL') { $summary.local_coverage='INCONCLUSIVE'; $summary.reason=$interruption }
@@ -1302,7 +1852,11 @@ function Invoke-SteamReportCollection {
         $summary.configurations=$configuration; $summary.package_manifest_sha256=$verified.ManifestHash
         $summary.run_id=$first.fields['reporting.run_id']; $summary.pid=$ProcessId
         $summary.process_creation=$first.fields['process_creation_filetime']; $summary.prefix_before=$prefixBefore; $summary.prefix_after=$prefixAfter
+        $summary.native_prefix=$prefixAfter; $summary.permitted_log_root=$native.permitted_root
         $summary.required_log_sequence=[string]$requiredWatermark; $summary.copied_last_sequence=[string]$log.last_sequence
+        $summary.final_generated_log_sequence=$(if($null -ne $finalGenerated){[string]$finalGenerated}else{$null})
+        $summary.final_observed_log_sequence=$(if($null -ne $finalObserved){[string]$finalObserved}else{$null})
+        $summary.final_unreceipted_records=$(if($null -ne $finalGenerated){[string]([System.Numerics.BigInteger]$finalGenerated-$finalObserved)}else{$null})
         $summary.unpaired_final_builder=$(if($null -ne $log.open_builder){[string]$log.open_builder['build_sequence']}else{$null})
         $summary.timing_calibration=$calibration
         $summary.private_keys_collected=$false; $summary.status_scope='independent-DATA-not-last-log-anchor'
@@ -1322,6 +1876,10 @@ function Invoke-SteamReportCollection {
     } catch {
         if ($resultDirectory) {
             $failure=$_.Exception.Message
+            if($null -ne $capture) {
+                try{$capture.Finish()}catch{}
+                try{Save-ReportText (Join-Path $resultDirectory 'native-prefix-incomplete.json') ((Get-NativeCaptureMetadata $capture|ConvertTo-Json -Depth 5)+"`r`n")}catch{}
+            }
             try {
                 Save-ReportText (Join-Path $resultDirectory 'collection-failure.txt') ('Incomplete/unqualified collection: '+$failure+"`r`nFinal safety unavailable/incomplete; overall qualification forbidden.`r`n")
                 $retained=@()
@@ -1344,7 +1902,7 @@ function Invoke-SteamReportCollection {
             Write-Host "Preserve incomplete evidence: $resultDirectory"
         }
         throw
-    } finally { if ($null -ne $eventStream) { $eventStream.Dispose() }; foreach ($stream in $locks) { $stream.Dispose() } }
+    } finally { if ($null -ne $capture) { $capture.Dispose() }; foreach ($stream in $locks) { $stream.Dispose() } }
 }
 
 # Inert tests dot-source helpers only. No process inventory or launch on import.

@@ -226,9 +226,16 @@ DWORD RunCompanionInitialization(const BootstrapContextV3& context,
 #else
     const auto& reportingObserverProfile=observer::ProductionObserverProfile();
 #endif
+    const reporting::NativeStartupSummary reportingStartup{
+        static_cast<std::uint32_t>(marker.buildIdentity),static_cast<std::uint32_t>(marker.mode),
+        static_cast<std::uint32_t>(marker.recon.outcome),static_cast<std::uint32_t>(marker.recon.reason),
+        marker.recon.qualified ? 1U : 0U,result,marker.complete ? 1U : 0U,
+        work->markerWrite.finalError ? work->markerWrite.finalError : work->markerWrite.cleanupError,
+        MarkerStateAccepted(marker) && result==kInitOk ? 1U : 0U};
     reporting::StartReporting(context,kSelectedStartupProfile,reportingObserverProfile,
         marker.digest,lease,work->hostDirectory,
-        marker.recon.outcome==ReconOutcome::Active && marker.recon.reason==FixReason::None && result==kInitOk);
+        marker.recon.outcome==ReconOutcome::Active && marker.recon.reason==FixReason::None && result==kInitOk,
+        reportingStartup);
 #else
     if (marker.recon.outcome != ReconOutcome::Active || marker.recon.reason != FixReason::None) {
         observer::ObserverUnavailable(observer::Reason::ReconIneligible);

@@ -1,4 +1,6 @@
 #include "companion/steam_reporting_records.h"
+#include "companion/steam_reporting_records_v3.h"
+#include "companion/steam_reporting_status_v3.h"
 #include "test_framework.h"
 #include <Windows.h>
 #include <atomic>
@@ -296,9 +298,59 @@ void ConcurrentSpscOrdering() {
     RS2_CHECK(ReadStatusWord(status.lossReasons)==0 && ReadStatusWord(status.revokeReasons)==0);
     RS2_CHECK(AllZero(ring.slots));
 }
+void V3CanonicalControlsAndDrain() {
+    StatusWireV3 status{};
+    ReportRingV3 ring{};
+    RS2_CHECK(InitializeReportRing(ring, status, GetCurrentThreadId()));
+    ReportRecordV3 input{};
+    input.header.kind = static_cast<std::uint32_t>(RecordKindV3::TransportSummary);
+    input.header.qpc = 123;
+    input.payload.transport.anchorSequence = 9;
+    input.payload.transport.nativeSubmitElapsedTicks = UINT64_MAX;
+    input.payload.transport.transportReason = static_cast<std::uint64_t>(TransportReason::ReaderBehind);
+    input.payload.transport.observedSequence = 2;
+    input.payload.transport.submittedSequence = 4;
+    input.payload.transport.generatedSequence = 8;
+    for (auto& word : input.payload.transport.reserved) word = UINT64_MAX;
+    std::uint64_t sequence{};
+    auto sink = ReportRingSink(ring);
+    RS2_CHECK(sink.publish(sink.context, input, &sequence) && sequence == 1);
+    ReportRecordV3 output{};
+    RS2_CHECK(DequeueReport(ring, &output) == ReportReadResult::Record);
+    RS2_CHECK(output.payload.transport.nativeSubmitElapsedTicks == UINT64_MAX);
+    RS2_CHECK(output.payload.transport.transportReason == static_cast<std::uint64_t>(TransportReason::ReaderBehind));
+    RS2_CHECK(output.payload.transport.observedSequence == 2 && output.payload.transport.generatedSequence == 8);
+    RS2_CHECK(AllZero(output.payload.transport.reserved));
+    input = {}; input.header.kind = static_cast<std::uint32_t>(RecordKindV3::Control);
+    input.payload.control.event = 1;
+    input.payload.control.transportState = static_cast<std::uint64_t>(TransportState::Paused);
+    input.payload.control.transportReason = static_cast<std::uint64_t>(TransportReason::CreditPressure);
+    input.payload.control.pauseEpoch = 2; input.payload.control.lastRequestQpc = 456;
+    for (auto& word : input.payload.control.reserved) word = UINT64_MAX;
+    StoreStatusWord(status.workerPauseReason, static_cast<std::uint64_t>(TransportReason::CreditPressure));
+    RS2_CHECK(EnqueueReport(ring, input, &sequence) == ReportWriteResult::Accepted);
+    RS2_CHECK(!StatusRevoked(status)); // Pause does not drop already-reserved pairs or controls.
+    StopStatus(status, 500);
+    RS2_CHECK(DequeueReport(ring, &output) == ReportReadResult::Record);
+    RS2_CHECK(output.payload.control.event == 1 && output.payload.control.pauseEpoch == 2);
+    RS2_CHECK(output.payload.control.lastRequestQpc == 456 && AllZero(output.payload.control.reserved));
+    RS2_CHECK(EnqueueReport(ring, input, &sequence) == ReportWriteResult::Stopping);
+    RS2_CHECK(ReadStatusWord(status.lossReasons) == 0 && AllZero(ring.slots));
+
+    StatusWireV3 fullStatus{};
+    ReportRingV3 fullRing{};
+    RS2_CHECK(InitializeReportRing(fullRing, fullStatus, GetCurrentThreadId()));
+    for (std::size_t i = 0; i < kReportRecordCapacity; ++i)
+        RS2_CHECK(EnqueueReport(fullRing, input, &sequence) == ReportWriteResult::Accepted);
+    RS2_CHECK(EnqueueReport(fullRing, input, &sequence) == ReportWriteResult::Lost);
+    RS2_CHECK(ReadStatusWord(fullStatus.lossReasons) & (1ULL << static_cast<unsigned>(Reason::RecordLoss)));
+    // Capacity is controlled before admission by the future reservation layer;
+    // this primitive must never reinterpret a real admitted loss as a pause.
+}
 } // namespace
 void ReportingRecordTests() {
     CanonicalVariantsAndSink(); CapacityLossAndDrain(); ScrubBeforeReuse();
     OverflowAndInvalidSequence(); ForeignAndNormalStop(); ConcurrentSpscOrdering();
+    V3CanonicalControlsAndDrain();
 }
 } // namespace rs2fix::testcases

@@ -1,4 +1,5 @@
 #include "companion/steam_reporting_forward.h"
+#include "companion/leech_recovery.h"
 #include <intrin.h>
 #include <limits>
 
@@ -6,10 +7,12 @@ namespace rs2fix::reporting {
 namespace {
 PVOID volatile g_runtime{};
 struct CallFrame {
+    CaptureReservation credit;
     std::int64_t start;
     std::int64_t nativeStart;
     std::int64_t nativeEnd;
     DWORD incoming;
+    DWORD outgoing;
     bool owner;
     bool depthOwned;
     bool topLevel;
@@ -45,8 +48,12 @@ std::uint64_t NativeTicks(Runtime& state, const CallFrame& frame) noexcept {
     }
     return static_cast<std::uint64_t>(frame.nativeEnd-frame.nativeStart);
 }
-void End(Runtime& state, CallFrame& frame, std::uint32_t& depth, DurationClass kind) noexcept {
+void End(Runtime& state, CallFrame& frame, std::uint32_t& depth, DurationClass kind,CaptureReservation& credit) noexcept {
     if (!frame.owner) return;
+    struct Release {
+        Runtime& state; CaptureReservation& credit;
+        ~Release() { ReleaseCapture(state,credit); }
+    } release{state,credit};
     if (frame.depthOwned) {
         if (!depth || !state.timingDepth) FailRuntimeTiming(state,Reason::Reentry);
         else { --depth; --state.timingDepth; }
@@ -58,7 +65,7 @@ void End(Runtime& state, CallFrame& frame, std::uint32_t& depth, DurationClass k
     // complete at this publication's lastOwnerQpc. Only a previously completed
     // top-level invocation may advance timingAccountedThroughQpc. A nested child
     // publication must not imply that its unfinished parent is already counted.
-    PublishRuntimeStatus(state,now,true);
+    PublishRuntimeStatus(state,now,true,&credit);
     std::int64_t end{};
     if (!RuntimeClock(state,&end)) return;
     const auto native=NativeTicks(state,frame);
@@ -70,38 +77,53 @@ void End(Runtime& state, CallFrame& frame, std::uint32_t& depth, DurationClass k
     // Only checked single-slot staging/return work remains outside the measured
     // interval. The exact-path fixture retains every paired class residual.
 }
-__declspec(noinline) void AfterPump(Runtime& state, CallFrame& frame) noexcept {
-    if (!frame.owner || state.pumpDepth!=1) return;
-    const bool cleanup=RuntimeCleanupAdmission(state);
-    if (!cleanup && !RuntimeAdmission(state)) return;
+__declspec(noinline) void AfterPump(Runtime& state, CallFrame& frame) {
+    if (!frame.owner || !frame.returned || !frame.topLevel || state.pumpDepth!=1) return;
     std::int64_t now{};
-    const bool clock=RuntimeClock(state,&now);
-    if (!clock && !cleanup) return;
+    if (!RuntimeClock(state,&now)) { RecoveryOwnerClockFault(state); return; }
+    const bool recoveryDue=RecoveryServiceDue(state);
+    bool cleanup=RuntimeCleanupAdmission(state);
+    const bool safe=RuntimeAdmission(state);
+    const bool transportDue=safe && NativeLogServiceDue(state.nativeLog,static_cast<std::uint64_t>(now));
     const auto frequency=state.producer.frequency;
-    // Stable idle state needs fewer full observations. First binding, source/
-    // epoch loss, pending producer consumption and owned cleanup retain the
-    // fast lane. This changes only OUR management opportunities, not native
-    // callbacks/backoff; each builder still performs its own full live checks.
     const bool idle=!cleanup && state.sourceReady && state.producer.epochReady &&
         ReadTaskPhase(state.task)==TaskPhase::Armed && !state.producer.pending.active;
-    // Producer frequency is bounded by INT64_MAX/45 at initialization, so the
-    // idle multiplication is safe. A delayed pump may run later than two seconds.
-    // Ceiling preserves the at-most-four-Hz fast lane for unusual frequencies.
-    const auto interval=idle ? frequency*2 :
-        frequency/kManagementHz+(frequency%kManagementHz!=0 ? 1 : 0);
-    if (clock && state.haveManagement && now-state.lastManagement<interval) return;
-    if (cleanup && clock) { state.haveManagement=true; state.lastManagement=now; }
-    frame.managed=true;
+    const auto interval=idle ? frequency*2 : frequency/kManagementHz+(frequency%kManagementHz!=0);
+    const bool managementDue=(cleanup || RuntimeCaptureAdmission(state)) &&
+        (!state.haveManagement || now-state.lastManagement>=interval);
+    if (!transportDue && !managementDue && !recoveryDue) return;
+    frame.managed=true; // Includes transport-only classification/qualification cost.
     std::uint32_t callers[kCaptureFrames]{};
     std::size_t count{}; bool truncated{};
+    // Must stay DIRECTLY in this noinline frame: CaptureHostCallers,AfterPump,PumpEntry.
     const bool captured=CaptureHostCallers(state.config.pumpCapture,callers,&count,&truncated);
     const auto classification=captured ? ClassifyPumpFrames(state.config.ancestry,callers,count,truncated) : CallerClass::Unknown;
-    if (cleanup) CleanupRevokedRuntime(state,classification);
-    else ManagePump(state,classification,now);
+    if (transportDue && classification==CallerClass::NormalPump) {
+        const auto service=ServiceNativeLog(state.nativeLog,classification,frame.topLevel,
+            static_cast<std::uint64_t>(now),frame.outgoing);
+        // Never stamp cleanup/management with the pre-log sample after blocking
+        // native I/O, or an untouched zero after a failed refresh.
+        if (!RuntimeClock(state,&now)) { RecoveryOwnerClockFault(state); return; }
+        RefreshRuntimeTransport(state,service,now);
+    } else if (transportDue) {
+        // Transport-only unknown/spin/drain ancestry skips servicing. It is not
+        // an excuse to invoke the management revocation/retirement path.
+        if (!managementDue && !recoveryDue) return;
+    }
+    // Recovery does not require its cancelled heartbeat to remain Armed. It
+    // still receives ONLY this invocation's exact capture and fresh logger gate.
+    if (recoveryDue && ServiceLeechRecovery(state,classification,count,truncated,now)) return;
+    cleanup=RuntimeCleanupAdmission(state);
+    if ((!cleanup && !RuntimeCaptureAdmission(state)) ||
+        (state.haveManagement && now-state.lastManagement<interval)) return;
+    if (cleanup) {
+        state.haveManagement=true; state.lastManagement=now;
+        CleanupRevokedRuntime(state,classification);
+    } else ManagePump(state,classification,now,frame.credit);
 }
 __declspec(noinline) void BeforeBuilder(Runtime& state, void* holder, CallFrame& frame,
     BuilderDecision& decision) noexcept {
-    if (!frame.owner || state.builderDepth!=1 || !RuntimeAdmission(state) ||
+    if (!frame.owner || state.builderDepth!=1 || !RuntimeCaptureAdmission(state) ||
         ReadTaskPhase(state.task)!=TaskPhase::Armed) return;
     std::int64_t start{};
     if (!RuntimeClock(state,&start)) return;
@@ -115,14 +137,14 @@ __declspec(noinline) void BeforeBuilder(Runtime& state, void* holder, CallFrame&
     PrepareBuilder(state,classification,holder,start,static_cast<std::uint64_t>(classified-start),&decision);
 }
 bool FinalSelection(Runtime& state, const BuilderDecision& decision) noexcept {
-    if (!decision.eligible || !decision.dirtyAddress || !RuntimeAdmission(state) ||
+    if (!decision.eligible || !decision.dirtyAddress || !RuntimeCaptureAdmission(state) ||
         !state.sourceReady || ReadTaskPhase(state.task)!=TaskPhase::Armed ||
         state.task.epoch.source!=state.counters.sourceEpoch ||
         state.task.epoch.binding!=state.counters.bindingEpoch) return false;
     std::int64_t now{}; FreshTuple fresh{};
     if (!RuntimeClock(state,&now)) return false;
     return ReadFreshTuple(state.producer,now,state.source.outer,state.source.bots,&fresh)==Reason::None &&
-        fresh.witness==decision.event.payload.builder.witnessSequence && RuntimeAdmission(state);
+        fresh.witness==decision.event.payload.builder.witnessSequence && RuntimeCaptureAdmission(state);
 }
 // This helper's exception region contains ONLY our store. Original executes
 // outside it, so a genuine C++/SEH exception can never be caught as a write fault.
@@ -177,9 +199,13 @@ __declspec(noinline) void PumpEntry() {
         SetLastError(frame.incoming);
         state.config.pumpOriginal();
         const DWORD outgoing=GetLastError();
+        frame.outgoing=outgoing;
         if (!Clock(&frame.nativeEnd)) FailRuntimeTiming(state,Reason::ClockFailed);
         frame.returned=true;
         AfterPump(state,frame);
+        if (frame.owner && !frame.credit.active &&
+            !IncrementCounter(state.transport.forwardedPumpWithoutCapture))
+            RevokeRuntime(state,Reason::CounterOverflow);
         SetLastError(outgoing);
     } __finally {
         const DWORD outgoing=GetLastError();
@@ -188,7 +214,7 @@ __declspec(noinline) void PumpEntry() {
             RevokeRuntime(state,Reason::NativeUnwind);
         }
         if (frame.owner) End(state,frame,state.pumpDepth,
-            frame.managed ? DurationClass::PumpManagement : DurationClass::PumpForward);
+            frame.managed ? DurationClass::PumpManagement : DurationClass::PumpForward,frame.credit);
         SetLastError(outgoing);
     }
 }
@@ -206,6 +232,9 @@ __declspec(noinline) bool BuilderEntry(void* holder) {
     __try {
         if (frame.owner) ConsumeRuntimeDuration(state);
         BeforeBuilder(state,holder,frame,decision);
+        if (frame.owner && !decision.attempted &&
+            !IncrementCounter(state.transport.forwardedBuilderWithoutCapture))
+            RevokeRuntime(state,Reason::CounterOverflow);
         selected=FinalSelection(state,decision);
         if (!Clock(&frame.nativeStart)) {
             FailRuntimeTiming(state,Reason::ClockFailed);
@@ -224,7 +253,7 @@ __declspec(noinline) bool BuilderEntry(void* holder) {
             FinishBuilder(state,decision,frame.returned,result,selected,frame.nativeEnd,NativeTicks(state,frame));
             if (!frame.returned) RevokeRuntime(state,Reason::NativeUnwind);
             End(state,frame,state.builderDepth,
-                frame.managed ? DurationClass::BuilderProbe : DurationClass::BuilderForward);
+                frame.managed ? DurationClass::BuilderProbe : DurationClass::BuilderForward,decision.credit);
         }
         SetLastError(outgoing);
     }

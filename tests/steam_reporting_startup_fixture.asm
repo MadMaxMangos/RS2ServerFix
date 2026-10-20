@@ -17,9 +17,20 @@ EXTERN FixtureReportPumpAfter:QWORD
 EXTERN FixtureReportBuilderBefore:QWORD
 EXTERN FixtureReportBuilderAfter:QWORD
 EXTERN FixtureReportTimingClockErrors:DWORD
+EXTERN FixtureNativeLog:PROC
 
 .const
 ALIGN 8
+PUBLIC FixtureNativeRedirectorVtable, FixtureNativeFileVtable, FixtureNativeArchiveVtable, FixtureNativeManagerVtable
+PUBLIC FixtureNativeConsoleVtable, FixtureNativeInheritedVtable, FixtureNativeDebugVtable, FixtureNativeEventVtable
+FixtureNativeRedirectorVtable QWORD FixtureNativeLog
+FixtureNativeFileVtable QWORD FixtureNativeLog
+FixtureNativeArchiveVtable QWORD FixtureNativeLog
+FixtureNativeManagerVtable QWORD FixtureNativeLog
+FixtureNativeConsoleVtable QWORD FixtureNativeLog
+FixtureNativeInheritedVtable QWORD FixtureNativeLog
+FixtureNativeDebugVtable QWORD FixtureNativeLog
+FixtureNativeEventVtable QWORD FixtureNativeLog
 PUBLIC FixtureReportObjectVtable, FixtureReportMetadataVtable
 FixtureReportObjectVtable QWORD FixtureReportObjectNoop
 ; Own inert metadata, not a copied engine vtable. Only required typed slots

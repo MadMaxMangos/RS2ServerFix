@@ -1,5 +1,6 @@
 #include "shared/path_identity.h"
 #include <cwchar>
+#include <cstring>
 #include <iterator>
 #include <limits>
 
@@ -179,5 +180,29 @@ bool QueryFileIdentity(const wchar_t* path, FileIdentity* identity, DWORD* error
 bool SameFileIdentity(const FileIdentity& left, const FileIdentity& right) noexcept {
     return left.valid && right.valid && left.volumeSerial == right.volumeSerial &&
         left.fileIndexHigh == right.fileIndexHigh && left.fileIndexLow == right.fileIndexLow;
+}
+
+bool QueryFileIdentity128(HANDLE file, FileIdentity128* identity, DWORD* error) noexcept {
+    if (identity != nullptr) *identity = {};
+    if (file == nullptr || file == INVALID_HANDLE_VALUE || identity == nullptr) {
+        StoreError(error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    FILE_ID_INFO information{};
+    if (!GetFileInformationByHandleEx(file, FileIdInfo, &information, sizeof(information))) {
+        StoreError(error, GetLastError());
+        return false;
+    }
+    static_assert(sizeof(information.FileId.Identifier) == sizeof(identity->fileId));
+    identity->volumeSerial = information.VolumeSerialNumber;
+    std::memcpy(identity->fileId, information.FileId.Identifier, sizeof(identity->fileId));
+    identity->valid = true;
+    StoreError(error, ERROR_SUCCESS);
+    return true;
+}
+
+bool SameFileIdentity128(const FileIdentity128& left, const FileIdentity128& right) noexcept {
+    return left.valid && right.valid && left.volumeSerial == right.volumeSerial &&
+        std::memcmp(left.fileId, right.fileId, sizeof(left.fileId)) == 0;
 }
 } // namespace rs2fix

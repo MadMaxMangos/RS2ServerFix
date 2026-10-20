@@ -11,7 +11,8 @@
 #include <limits>
 #include "steam_api_fixture.h"
 #include "companion/steam_observer_dispatch.h"
-#include "shared/steam_reporting_status.h"
+#include "shared/steam_reporting_snapshot_v3.h"
+#include "steam_reporting_native_log_fixture.h"
 
 #if !defined(RS2_REPORTING_FIXTURE) || !defined(RS2_OBSERVER_FIXTURE)
 #error Reporting startup host requires both explicit own-fixture definitions.
@@ -187,28 +188,27 @@ bool ReadExact(const void* address, void* output, std::size_t size) noexcept {
     SIZE_T got{};
     return ReadProcessMemory(GetCurrentProcess(), address, output, size, &got) && got == size;
 }
-bool ReadStatus(reporting::StatusWire* output) noexcept {
+bool ReadStatus(reporting::StatusWireV3* output, reporting::StatusSnapshotV3* captured = nullptr) noexcept {
     *output = {};
     // GetProcAddress addresses ONLY the already loaded own-code companion. No
     // function is called through its DATA export and no game module is opened.
     const auto companion = GetModuleHandleW(L"RS2ServerFix.dll");
-    const auto* wire = reinterpret_cast<const reporting::StatusWire*>(
-        companion ? GetProcAddress(companion, "RS2SteamReport_StatusV2") : nullptr);
+    const auto* wire = reinterpret_cast<const reporting::StatusWireV3*>(
+        companion ? GetProcAddress(companion, "RS2SteamReport_StatusV3") : nullptr);
     MEMORY_BASIC_INFORMATION region{};
     if (!wire || VirtualQuery(wire, &region, sizeof(region)) != sizeof(region) ||
         region.State != MEM_COMMIT || region.Type != MEM_IMAGE || region.AllocationBase != companion ||
         region.Protect != PAGE_READWRITE) return false;
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
-        std::uint64_t before{}, after{};
-        if (!ReadExact(&wire->ownerSequence, &before, sizeof(before)) || (before & 1) ||
-            !ReadExact(wire, output, sizeof(*output)) ||
-            !ReadExact(&wire->ownerSequence, &after, sizeof(after))) return false;
-        if (before != after || output->ownerSequence != before || (after & 1)) continue;
-        return output->headerReady == 1 && output->header.magic == reporting::kStatusMagic &&
-            output->header.schema == reporting::kStatusSchema && output->header.bytes == sizeof(*output) &&
-            output->header.artifactVersion == reporting::kReportingArtifactVersion;
-    }
-    *output = {}; return false;
+    const auto read=[](void* context,std::size_t at,void* target,std::size_t bytes) noexcept {
+        if(at>sizeof(reporting::StatusWireV3) || bytes>sizeof(reporting::StatusWireV3)-at) return false;
+        return ReadExact(static_cast<const unsigned char*>(context)+at,target,bytes);
+    };
+    reporting::StatusSnapshotV3 snapshot{};
+    if(reporting::ReadStatusSnapshotV3({const_cast<reporting::StatusWireV3*>(wire),read},&snapshot)!=
+        reporting::SnapshotResultV3::Coherent) return false;
+    *output=snapshot.wire;
+    if(captured) *captured=snapshot;
+    return true;
 }
 
 enum class TimingRole { Warmup, Main, Bridge, Support, Selected };
@@ -263,7 +263,7 @@ bool AddCounter(std::uint64_t& total, std::uint64_t value) noexcept {
     total += value;
     return true;
 }
-bool Counters(const reporting::StatusWire& wire, TimingCounters* output) noexcept {
+bool Counters(const reporting::StatusWireV3& wire, TimingCounters* output) noexcept {
     *output = {};
     static_assert(reporting::kStatusDurationClasses == 4);
     for (std::size_t i = 0; i < reporting::kStatusDurationClasses; ++i) {
@@ -274,11 +274,12 @@ bool Counters(const reporting::StatusWire& wire, TimingCounters* output) noexcep
     }
     return true;
 }
-bool HealthyTimingStatus(const reporting::StatusWire& wire, std::uint64_t frequency) noexcept {
-    return wire.header.validity == reporting::CompleteHeaderIdentity && wire.header.pid == GetCurrentProcessId() &&
-        wire.header.configuredMode == 3 && wire.header.qpcFrequency == frequency &&
-        wire.owner.phase == static_cast<std::uint64_t>(reporting::ReportPhase::Repairing) &&
-        !wire.revokeReasons && !wire.lossReasons && !wire.stopping && wire.owner.fresh == 1;
+bool ReadTimingStatus(reporting::StatusWireV3* wire, std::uint64_t frequency) noexcept {
+    reporting::StatusSnapshotV3 snapshot{};
+    LARGE_INTEGER now{};
+    return ReadStatus(wire, &snapshot) && QueryPerformanceCounter(&now) && now.QuadPart > 0 &&
+        reporting::SnapshotCurrentlyReadyV3(snapshot, static_cast<std::uint64_t>(now.QuadPart), frequency) &&
+        wire->header.pid == GetCurrentProcessId() && wire->header.configuredMode == 3 && wire->owner.fresh == 1;
 }
 bool Increase(std::uint64_t before, std::uint64_t after, std::uint64_t expected) noexcept {
     return after >= before && after - before == expected;
@@ -290,7 +291,7 @@ bool AccumulateSample(reporting::DurationCounters& total, std::uint64_t ticks,
     if (ticks > total.maximumTicks) total.maximumTicks = ticks;
     return true;
 }
-bool RecordTimingSample(const reporting::StatusWire& before, const reporting::StatusWire& after,
+bool RecordTimingSample(const reporting::StatusWireV3& before, const reporting::StatusWireV3& after,
     bool builder, TimingOrdinal& ordinal, TimingResult& result) noexcept {
     const std::size_t begin = builder ? 2 : 0;
     std::uint64_t calls{}, own{}, overrun{};
@@ -347,10 +348,13 @@ bool TimingProtocol(TimingResult& result, FixtureSteamSnapshotFn snapshot) noexc
         FixtureReportSkipBuilder = builder ? 0 : 1;
         // Only this disposable process waits. All pacing and status reads are
         // OUTSIDE the measured wrapper interval; no logging is done per sample.
-        Sleep(iteration < kMainPumps ? 50 : 1);
-        reporting::StatusWire before{}, after{};
+        // Pace selected builders within the unchanged eight-frame/second native
+        // transport budget. This tests sustained service, not deliberate queue
+        // overload; dedicated backpressure fixtures cover overload and recovery.
+        Sleep(iteration < kMainPumps ? 50 : 350);
+        reporting::StatusWireV3 before{}, after{};
         TimingCounters first{}, last{};
-        if (!ReadStatus(&before) || !HealthyTimingStatus(before, result.frequency)) {
+        if (!ReadTimingStatus(&before, result.frequency)) {
             result.failure = "status-before"; return false;
         }
         if (!before.owner.sourceEpoch || !before.owner.bindingEpoch) {
@@ -397,7 +401,7 @@ bool TimingProtocol(TimingResult& result, FixtureSteamSnapshotFn snapshot) noexc
         if (!haveEnd || end.QuadPart < start.QuadPart) {
             result.failure = "clock-after"; return false;
         }
-        if (!ReadStatus(&after) || !HealthyTimingStatus(after, result.frequency) ||
+        if (!ReadTimingStatus(&after, result.frequency) ||
             std::memcmp(&before.header, &after.header, sizeof(before.header)) ||
             before.owner.sourceEpoch != after.owner.sourceEpoch || before.owner.bindingEpoch != after.owner.bindingEpoch) {
             result.failure = "status-after"; return false;
@@ -544,13 +548,14 @@ bool TimingFixture(FixtureSteamSnapshotFn snapshot) noexcept {
                 (o.role == TimingRole::Warmup ? "warmup-outside-protocol" : (ok ? "final-support-not-published" : result.failure)),
             o.durationClass, o.own, o.missing);
     }
-    // This artificial pump cadence and separate accelerated-builder phase are
+    // This artificial pump cadence and separate paced-builder phase are
     // calibration smoke, not the real server's all-wrapper qualification window.
     // Preserve the conservative aggregate diagnostic without promoting it into
     // that different gate. The collector still charges MAX overhead to all calls.
     std::printf("report_timing=%s pump_sample_count=%llu builder_sample_count=%llu builder_selected_count=%llu "
         "pump_maximum_missing_ticks=%llu builder_maximum_missing_ticks=%llu qpc_frequency=%llu "
-        "measurement_id=rs2-wrapper-own-deferred-v2 protocol_id=rs2-deferred-v2-fixed6000-1024 "
+        "measurement_id=rs2-wrapper-own-deferred-v2 protocol_id=rs2-native-log-v3-writefile-fixed6000-1024-350ms "
+        "main_pump_sleep_ms=50 builder_support_sleep_ms=350 "
         "main_pump_sample_count=6000 main_management_sample_count=%llu coverage_pass=%s "
         "ordinal_count=%u pump_bridge_calls=1 pump_duration_lag=1 builder_duration_lag=0 "
         "calibration_start_qpc=%llu calibration_end_qpc=%llu calibration_ticks=%llu "
@@ -634,7 +639,7 @@ bool ExerciseReportingFixture() {
     SetLastError(0x4321);
     void* interfaceObject = FixtureSteamAccessor();
     ok = interfaceObject && GetLastError() == 0x5678 && ok;
-    if (!interfaceObject || !SetUp(interfaceObject)) { TearDown(); return false; }
+    if (!interfaceObject || !SetUp(interfaceObject) || !PrepareFixtureNativeLog()) { TearDown(); CloseFixtureNativeLog(); return false; }
     FixtureReportTickable tickable;
     auto* secondary = static_cast<FixtureReportSecondary*>(&tickable);
     const auto secondaryOffset = reinterpret_cast<std::uintptr_t>(secondary) - reinterpret_cast<std::uintptr_t>(&tickable);
@@ -644,15 +649,37 @@ bool ExerciseReportingFixture() {
         TearDown(); return false;
     }
     FixtureReportTickableObject = reinterpret_cast<std::uintptr_t>(secondary);
+    unsigned loggerWarmPumps{},loggerDrainPumps{};
+    FixtureReportSkipBuilder=1;
+    // Receipt qualification is asynchronous. Warm only the native pump until
+    // bootstrap is actually observed; do not synthesize any ready DATA or gate.
+    const auto warmStart=GetTickCount64();
+    while(GetTickCount64()-warmStart<5000) {
+        reporting::StatusWireV3 current{};
+        if(ReadStatus(&current) && (current.worker.startupObserved || current.revokeReasons || current.lossReasons)) break;
+        FixtureReportEngine();++loggerWarmPumps;Sleep(260);
+    }
+    FixtureReportSkipBuilder=0;
     for (unsigned iteration = 0; iteration < kLoops; ++iteration) {
         if (iteration) Sleep(260); // Own process only; past the fast floor, idle calls may only forward.
         FixtureReportEngine();
     }
     const bool timing = Option(L"--report-timing-fixture");
     if (timing) ok = TimingFixture(snapshot) && ok;
+    // Do not ask shutdown/finally to log. Give the normal owner seam a chance
+    // to submit accepted tail frames before shutting this owned host down.
+    FixtureReportSkipBuilder=1;
+    const auto drainStart=GetTickCount64();
+    while(GetTickCount64()-drainStart<(timing ? 60000U : 5000U)) {
+        reporting::StatusWireV3 current{};
+        if(!ReadStatus(&current) || current.revokeReasons || current.lossReasons || !current.worker.startupObserved ||
+            current.worker.observedSequence==current.ownerTransport.generatedSequence) break;
+        Sleep(260);FixtureReportEngine();++loggerDrainPumps;
+    }
+    FixtureReportSkipBuilder=0;
     const auto active = snapshot();
     const auto expectedBuilders = kLoops + (timing ? kTimingSamples : 0);
-    const auto expectedPumps = kLoops + (timing ? kProtocolIterations : 0);
+    const auto expectedPumps = kLoops + loggerWarmPumps + loggerDrainPumps + (timing ? kProtocolIterations : 0);
     ok = g_builderCalls == expectedBuilders && active.init == 1 && active.factory == 1 && active.pump == expectedPumps &&
         active.shutdown == 0 && active.badArguments == 0 && !FixtureReportCallbackErrors &&
         !FixtureReportBuilderErrors && !FixtureReportTimingClockErrors && !g_holderErrors &&
@@ -664,7 +691,7 @@ bool ExerciseReportingFixture() {
         std::printf("steam_prehook=installed-before-audio preserved=%s\n", preserved ? "true" : "false");
         ok = preserved && active.factoryAlias == 1 && ok;
     } else ok = active.factoryAlias == 0 && ok;
-    reporting::StatusWire pre{};
+    reporting::StatusWireV3 pre{};
     const bool haveStatus = ReadStatus(&pre);
     char runId[33]{}; RunId(pre.header, runId);
     std::printf("report_fixture=%s status_available=%s pid=%lu run_id=%s process_creation=%llu qpc_frequency=%llu "
@@ -672,7 +699,7 @@ bool ExerciseReportingFixture() {
         "request=%llu witness=%llu normalAttempts=%llu fullSelected=%llu selectedTrue=%llu "
         "builder_calls=%lu full_builds=%lu false_builds=%lu producer_consumed=%lu callback_errors=%lu holder_errors=%lu clock_errors=%lu "
         "builder_inner_clock_errors=%lu pump_inner_clock_errors=%u "
-        "init_result=%s factory_calls=%u factory_alias=%u init_calls=%u pump_calls=%u client_loads=%u client_load_failures=%u secondary_offset=%zu\n",
+        "init_result=%s factory_calls=%u factory_alias=%u init_calls=%u pump_calls=%u client_loads=%u client_load_failures=%u secondary_offset=%zu logger_warm_pumps=%u logger_drain_pumps=%u transport_state=%llu transport_reason=%llu startup_observed=%llu generated_sequence=%llu submitted_sequence=%llu observed_sequence=%llu\n",
         ok ? "pass" : "fail", haveStatus ? "true" : "false", GetCurrentProcessId(), runId,
         pre.header.processCreation, pre.header.qpcFrequency, pre.headerReady, pre.header.validity, pre.header.configuredMode,
         pre.owner.phase, pre.owner.reason, pre.revokeReasons, pre.lossReasons, pre.owner.requestSequence,
@@ -680,7 +707,9 @@ bool ExerciseReportingFixture() {
         g_builderCalls, g_fullBuilds, g_falseBuilds, g_producerConsumed, FixtureReportCallbackErrors, g_holderErrors, FixtureReportTimingClockErrors,
         g_builderInnerClockErrors, active.pumpClockErrors,
         initialized ? "true" : "false", active.factory, active.factoryAlias, active.init, active.pump,
-        active.clientLoads, active.clientLoadFailures, static_cast<std::size_t>(secondaryOffset));
+        active.clientLoads, active.clientLoadFailures, static_cast<std::size_t>(secondaryOffset),loggerWarmPumps,loggerDrainPumps,
+        pre.ownerTransport.state,pre.ownerTransport.reason,pre.worker.startupObserved,pre.ownerTransport.generatedSequence,
+        pre.ownerTransport.submittedSequence,pre.worker.observedSequence);
     std::fflush(stdout);
     SetLastError(0x4321);
     reinterpret_cast<api::ShutdownFn>(__imp_SteamGameServer_Shutdown)();
@@ -688,13 +717,13 @@ bool ExerciseReportingFixture() {
     const auto after = snapshot();
     ok = shutdownError && after.shutdown == 1 && after.badArguments == 0 &&
         after.clientUnloads == after.clientLoads && ok;
-    TearDown();
+    TearDown(); CloseFixtureNativeLog();
     Sleep(1200); // Only the disposable host waits for its own bounded writer.
-    reporting::StatusWire post{};
+    reporting::StatusWireV3 post{};
     const bool havePost = ReadStatus(&post);
     std::printf("report_shutdown=%s status_available=%s phase=%llu stopping=%llu shutdown_calls=%u client_unloads=%u "
-        "records_written=%llu last_flushed_sequence=%llu\n", ok ? "pass" : "fail", havePost ? "true" : "false",
-        post.owner.phase, post.stopping, after.shutdown, after.clientUnloads, post.recordsWritten, post.lastFlushedSequence);
+        "submitted_sequence=%llu observed_sequence=%llu\n", ok ? "pass" : "fail", havePost ? "true" : "false",
+        post.owner.phase, post.stopping, after.shutdown, after.clientUnloads, post.ownerTransport.submittedSequence, post.worker.observedSequence);
     std::fflush(stdout);
     return ok;
 }

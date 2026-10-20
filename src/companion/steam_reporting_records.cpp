@@ -1,16 +1,30 @@
 #include "companion/steam_reporting_records.h"
+#include "companion/steam_reporting_records_v3.h"
+#include "companion/steam_reporting_status_v3.h"
 #include <Windows.h>
 #include <cstring>
 #include <limits>
 
 namespace rs2fix::reporting {
 namespace {
-bool ValidHeader(const ReportHeader& header) noexcept {
-    return header.sequence==0 && header.kind>=static_cast<std::uint32_t>(RecordKind::State) &&
-        header.kind<static_cast<std::uint32_t>(RecordKind::Count) && header.reason<kReasonCount;
+template<class Record> constexpr std::uint32_t KindCount() noexcept {
+    return std::is_same_v<Record, ReportRecordV3> ? static_cast<std::uint32_t>(RecordKindV3::Count) :
+        static_cast<std::uint32_t>(RecordKind::Count);
 }
-void CanonicalRecord(const ReportRecord& in, std::uint64_t sequence,
-    std::uint32_t owner, ReportRecord& out) noexcept {
+template<class Record> bool ValidHeader(const ReportHeader& header) noexcept {
+    return header.sequence==0 && header.kind>=static_cast<std::uint32_t>(RecordKind::State) &&
+        header.kind<KindCount<Record>() && header.reason<kReasonCount;
+}
+template<class Record> bool ValidRecovery(const Record& record) noexcept {
+    if constexpr (std::is_same_v<Record, ReportRecordV3>) {
+        if (record.header.kind == static_cast<std::uint32_t>(RecordKindV3::Recovery))
+            return record.header.reason == 0 && record.header.flags == 0 &&
+                record.payload.recovery.recordSequence == 0 && RecoveryPayloadValid(record.payload.recovery);
+    }
+    return true;
+}
+template<class Record> void CanonicalRecord(const Record& in, std::uint64_t sequence,
+    std::uint32_t owner, Record& out) noexcept {
     // Deliberately do not copy a union/variant wholesale: even a caller's
     // reserved bytes or inactive member contents must never reach the writer.
     out={};
@@ -81,16 +95,57 @@ void CanonicalRecord(const ReportRecord& in, std::uint64_t sequence,
         }
         break;
     }
-    case RecordKind::Count: break; // Rejected before canonicalization.
+    case RecordKind::Count: break; // Legacy sentinel; V3 extras are handled below.
+    }
+    if constexpr (std::is_same_v<Record, ReportRecordV3>) {
+        if (in.header.kind == static_cast<std::uint32_t>(RecordKindV3::TransportSummary)) {
+            out.payload.transport = {};
+            const auto& a = in.payload.transport; auto& b = out.payload.transport;
+            b.anchorSequence = a.anchorSequence; b.nativeSubmitCalls = a.nativeSubmitCalls;
+            b.nativeSubmitElapsedTicks = a.nativeSubmitElapsedTicks;
+            b.nativeSubmitMaximumTicks = a.nativeSubmitMaximumTicks;
+            b.nativeSubmitOverFiveMilliseconds = a.nativeSubmitOverFiveMilliseconds;
+            b.forwardedPumpWithoutCapture = a.forwardedPumpWithoutCapture;
+            b.forwardedBuilderWithoutCapture = a.forwardedBuilderWithoutCapture;
+            b.transportState = a.transportState; b.transportReason = a.transportReason;
+            b.pauseEpoch = a.pauseEpoch; b.pauseBoundarySequence = a.pauseBoundarySequence;
+            b.submittedSequence = a.submittedSequence; b.observedSequence = a.observedSequence;
+            b.timingAccountedThroughQpc = a.timingAccountedThroughQpc;
+            b.generatedSequence = a.generatedSequence;
+        } else if (in.header.kind == static_cast<std::uint32_t>(RecordKindV3::Control)) {
+            out.payload.control = {};
+            const auto& a = in.payload.control; auto& b = out.payload.control;
+            b.event = a.event; b.transportState = a.transportState; b.transportReason = a.transportReason;
+            b.pauseEpoch = a.pauseEpoch; b.pauseBoundarySequence = a.pauseBoundarySequence;
+            b.abandonedPendingRequest = a.abandonedPendingRequest; b.abandonedWitness = a.abandonedWitness;
+            b.lastRequestQpc = a.lastRequestQpc; b.generatedBefore = a.generatedBefore;
+            b.submittedBefore = a.submittedBefore; b.observedBefore = a.observedBefore;
+            b.forwardedPumpWithoutCapture = a.forwardedPumpWithoutCapture;
+            b.forwardedBuilderWithoutCapture = a.forwardedBuilderWithoutCapture;
+            b.timingAccountedThroughQpc = a.timingAccountedThroughQpc;
+        } else if (in.header.kind == static_cast<std::uint32_t>(RecordKindV3::Recovery)) {
+            out.payload.recovery = {};
+            const auto& a = in.payload.recovery; auto& b = out.payload.recovery;
+            b.phase = a.phase; b.event = a.event; b.reason = a.reason; b.outcome = a.outcome; b.flags = a.flags;
+            b.operationSequence = a.operationSequence; b.transitionSequence = a.transitionSequence;
+            b.qpc = a.qpc; b.sourceEpoch = a.sourceEpoch; b.sdkEpoch = a.sdkEpoch; b.ownerThreadId = a.ownerThreadId;
+            b.resourcePhase = a.resourcePhase; b.nativeStage = a.nativeStage; b.exceptionCode = a.exceptionCode;
+            b.requestId = a.requestId; b.callbackId = a.callbackId; b.callbackResult = a.callbackResult;
+            b.apiReturnedId = a.apiReturnedId; b.oldSdkFingerprint = a.oldSdkFingerprint;
+            b.newSdkFingerprint = a.newSdkFingerprint; b.oldCacheFingerprint = a.oldCacheFingerprint;
+            b.newCacheFingerprint = a.newCacheFingerprint; b.finishDeadlineQpc = a.finishDeadlineQpc;
+            b.overallDeadlineQpc = a.overallDeadlineQpc; b.recordSequence = a.recordSequence;
+            b.callbackOwnTicks = a.callbackOwnTicks;
+        }
     }
 }
-ReportWriteResult Admission(StatusWire& status) noexcept {
+template<class Status> ReportWriteResult Admission(Status& status) noexcept {
     if (ReadStatusWord(status.stopping)) return ReportWriteResult::Stopping;
     if (StatusRevoked(status)) return ReadStatusWord(status.stopping) ?
         ReportWriteResult::Stopping : ReportWriteResult::Revoked;
     return ReportWriteResult::Accepted;
 }
-ReportWriteResult WriteLoss(StatusWire& status, Reason reason) noexcept {
+template<class Status> ReportWriteResult WriteLoss(Status& status, Reason reason) noexcept {
     // Initial admission precedes validation: once admitted, a detected failure
     // commits to loss even if stopping races this latch. A later stop must not
     // erase failed required publication. Initial/final admission suppress only
@@ -102,9 +157,12 @@ bool SinkEntry(void* context, const ReportRecord& record, std::uint64_t* sequenc
     if (!context) { if (sequence) *sequence=0; return false; }
     return EnqueueReport(*static_cast<ReportRing*>(context),record,sequence)==ReportWriteResult::Accepted;
 }
-} // namespace
+bool SinkEntryV3(void* context, const ReportRecordV3& record, std::uint64_t* sequence) noexcept {
+    if (!context) { if (sequence) *sequence = 0; return false; }
+    return EnqueueReport(*static_cast<ReportRingV3*>(context), record, sequence) == ReportWriteResult::Accepted;
+}
 
-bool InitializeReportRing(ReportRing& ring, StatusWire& status,
+template<class Ring, class Status> bool InitializeRing(Ring& ring, Status& status,
     std::uint32_t ownerThreadId) noexcept {
     if (ReadStatusWord(ring.ready)!=0 || !ownerThreadId) return false;
     if (GetCurrentThreadId()!=ownerThreadId) { RevokeStatus(status,Reason::ForeignThread); return false; }
@@ -115,7 +173,7 @@ bool InitializeReportRing(ReportRing& ring, StatusWire& status,
     return true;
 }
 
-ReportWriteResult EnqueueReport(ReportRing& ring, const ReportRecord& input,
+template<class Ring, class Record> ReportWriteResult Enqueue(Ring& ring, const Record& input,
     std::uint64_t* acceptedSequence) noexcept {
     if (acceptedSequence) *acceptedSequence=0;
     if (ReadStatusWord(ring.ready)!=1 || !ring.status) return ReportWriteResult::Unavailable;
@@ -126,13 +184,13 @@ ReportWriteResult EnqueueReport(ReportRing& ring, const ReportRecord& input,
     }
     const auto admitted=Admission(status);
     if (admitted!=ReportWriteResult::Accepted) return admitted;
-    if (!acceptedSequence || !ValidHeader(input.header)) return WriteLoss(status,Reason::RecordLoss);
+    if (!acceptedSequence || !ValidHeader<Record>(input.header) || !ValidRecovery(input)) return WriteLoss(status,Reason::RecordLoss);
     const auto written=ReadStatusWord(ring.reportWriteSequence);
     const auto read=ReadStatusWord(ring.reportReadSequence);
     if (read>written || written-read>kReportRecordCapacity) return WriteLoss(status,Reason::RecordLoss);
     if (written==(std::numeric_limits<std::uint64_t>::max)()) return WriteLoss(status,Reason::CounterOverflow);
     if (written-read==kReportRecordCapacity) return WriteLoss(status,Reason::RecordLoss);
-    ReportRecord record{};
+    Record record{};
     CanonicalRecord(input,written+1,ring.ownerThreadId,record);
     const auto finalAdmission=Admission(status);
     if (finalAdmission!=ReportWriteResult::Accepted) return finalAdmission;
@@ -144,7 +202,7 @@ ReportWriteResult EnqueueReport(ReportRing& ring, const ReportRecord& input,
     return ReportWriteResult::Accepted;
 }
 
-ReportReadResult DequeueReport(ReportRing& ring, ReportRecord* output) noexcept {
+template<class Ring, class Record> ReportReadResult Dequeue(Ring& ring, Record* output) noexcept {
     if (output) *output={};
     if (ReadStatusWord(ring.ready)!=1 || !ring.status) return ReportReadResult::Unavailable;
     auto& status=*ring.status;
@@ -159,8 +217,8 @@ ReportReadResult DequeueReport(ReportRing& ring, ReportRecord* output) noexcept 
     // not silently skipped, renumbered or turned into an apparently valid log.
     auto& slot=ring.slots[read%kReportRecordCapacity];
     if (slot.header.sequence!=read+1 || slot.header.kind<static_cast<std::uint32_t>(RecordKind::State) ||
-        slot.header.kind>=static_cast<std::uint32_t>(RecordKind::Count) || slot.header.reason>=kReasonCount ||
-        slot.header.threadId!=ring.ownerThreadId) {
+        slot.header.kind>=KindCount<Record>() || slot.header.reason>=kReasonCount ||
+        slot.header.threadId!=ring.ownerThreadId || !ValidRecovery(slot)) {
         LoseStatus(status,Reason::RecordLoss); return ReportReadResult::Lost;
     }
     *output=slot;
@@ -170,6 +228,23 @@ ReportReadResult DequeueReport(ReportRing& ring, ReportRecord* output) noexcept 
     StoreStatusWord(ring.reportReadSequence,read+1);
     return ReportReadResult::Record;
 }
+} // namespace
+
+bool InitializeReportRing(ReportRing& ring, StatusWire& status, std::uint32_t owner) noexcept {
+    return InitializeRing(ring, status, owner);
+}
+bool InitializeReportRing(ReportRingV3& ring, StatusWireV3& status, std::uint32_t owner) noexcept {
+    return InitializeRing(ring, status, owner);
+}
+ReportWriteResult EnqueueReport(ReportRing& ring, const ReportRecord& record, std::uint64_t* sequence) noexcept {
+    return Enqueue(ring, record, sequence);
+}
+ReportWriteResult EnqueueReport(ReportRingV3& ring, const ReportRecordV3& record, std::uint64_t* sequence) noexcept {
+    return Enqueue(ring, record, sequence);
+}
+ReportReadResult DequeueReport(ReportRing& ring, ReportRecord* output) noexcept { return Dequeue(ring, output); }
+ReportReadResult DequeueReport(ReportRingV3& ring, ReportRecordV3* output) noexcept { return Dequeue(ring, output); }
 
 ReportSink ReportRingSink(ReportRing& ring) noexcept { return {&ring,SinkEntry}; }
+ReportSinkV3 ReportRingSink(ReportRingV3& ring) noexcept { return {&ring,SinkEntryV3}; }
 } // namespace rs2fix::reporting

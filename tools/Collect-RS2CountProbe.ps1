@@ -8,11 +8,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $script:ProbePins=@{
-    tool='075893EC0104B97CD742964E1EE1D9CAEB57C88BF56E8DF08C41BD8CC48107F1'
+    tool='414F4F3FCC3B6CB338C8485E5B6FB21AE2453229DDDB9A52ED5A9171A849BF91'
     manifest='63D96BA7F55AC05EDBEE62C2FD9EFA2DA345D785863996C63AD5452B19B80FEF'
     host='0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393'
-    bootstrap='292AB4742F9FDDDFF809DECA411251A00E52BC97D551BDB2920A44546976C4F9'
-    companion='DEBC6E5D9252731DFAFCA85FC32F45A8148134BC83777D1EFDC9BE175E2B81FB'
+    bootstrap='114EC2545906ACD724947C8F955FCA7B8DA782940EC476D510D3C67498A0F0DC'
+    # Exact locally built 0.6 bytes; re-pin if a reviewed code change rebuilds them.
+    companion='62F3FFE70DCD71810C40A8812EF41F945BEAC3F9B461920F38E8A7F1143CD421'
     sdk='A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9'
     client='8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE'
 }
@@ -67,9 +68,10 @@ function Assert-ProbeInventoryIdentity($Fields,[uint32]$SelectedPid) {
         host_sha256=$script:ProbePins.host;observed_bootstrap_sha256=$script:ProbePins.bootstrap
         observed_companion_sha256=$script:ProbePins.companion;sdk_sha256=$script:ProbePins.sdk;steamclient_sha256=$script:ProbePins.client
         recon_artifact_result='pass';'reporting.captured'='true';'reporting.header_valid'='true';'reporting.identity_complete'='true'
-        'reporting.schema'='2';'reporting.bytes'='1288';'reporting.artifact_version'='262656';'reporting.mode'='3';'reporting.pid'=[string]$SelectedPid
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';'reporting.pid'=[string]$SelectedPid
         'reporting.qpc_frequency'=[string][Diagnostics.Stopwatch]::Frequency
     }
+    if(!$Fields.ContainsKey('reporting.mode') -or $Fields['reporting.mode'] -cnotin @('2','3')){throw 'CountProbe requires an explicit observe or repair reporting run.'}
 }
 function Invoke-ProbeInventory([string]$Package,[string]$Server,[uint32]$SelectedPid,[string]$Path) {
     $tool=Join-Path $Package 'rs2_runtime_inventory.exe';$manifest=Join-Path $Package 'qualified_x3audio_genuine.manifest'
@@ -104,7 +106,13 @@ function Get-ProbeCorrelation($Before,$After,$Raw) {
     if($Before.end_qpc -gt $Raw.BeginQpc -or $Raw.BeginQpc -gt $Raw.EndQpc -or $Raw.EndQpc -gt $After.begin_qpc){return 'timing-inconsistent'}
     if($a['reporting.owner_valid'] -cne 'true' -or $b['reporting.owner_valid'] -cne 'true'){return 'owner-status-unavailable'}
     if($a['reporting.state'] -notin @('ready','not-ready') -or $b['reporting.state'] -notin @('ready','not-ready')){return 'reporting-state-outside-ready-or-not-ready'}
-    foreach($key in @('reporting.sourceEpoch','reporting.bindingEpoch','reporting.stopping','reporting.revoke_reasons','reporting.loss_reasons','reporting.phase','reporting.reason','reporting.builderBound','reporting.current_ready','reporting.state')){
+    foreach($key in @('reporting.sourceEpoch','reporting.bindingEpoch','reporting.stopping','reporting.revoke_reasons','reporting.loss_reasons','reporting.phase','reporting.reason','reporting.builderBound','reporting.current_ready','reporting.state',
+        'reporting.mode','reporting.transport.state','reporting.transport.reason','reporting.transport.pauseEpoch',
+        'reporting.transport.transitionSequence','reporting.transport.qualifiedSinkEpoch','reporting.transport.actualRepairAdmitted',
+        'reporting.transport.startupSubmitted','reporting.worker.startupObserved','reporting.worker.pauseReason',
+        'reporting.worker.pauseConditionSequence','reporting.worker_pause_reason','reporting.worker_pause_changed',
+        'reporting.fatal_transport_reason','reporting.log_identity_available')){
+        if(!$a.ContainsKey($key) -or !$b.ContainsKey($key)){return 'v3-status-unavailable'}
         if($a[$key] -cne $b[$key]){return 'status-transition'}
     }
     return 'nearby-stable-observations-not-an-atomic-event'
@@ -120,6 +128,15 @@ function Format-ProbeReason([string]$Reason) {
     if($names.ContainsKey($Reason)){return $names[$Reason]+' ('+$Reason+')'}
     return $Reason
 }
+function Format-ProbeTransportReason([string]$Reason) {
+    $names=@('none','awaiting-logger','category-suppressed','force-flush-missing','framing-unsupported',
+        'sink-unsupported','file-manager-unsupported','receipt-unavailable','reader-behind','receipt-overdue',
+        'credit-pressure','same-file-requalification','receipt-gap','receipt-corrupt','file-identity-changed',
+        'file-truncated','profile-unsafe','native-log-exception')
+    [uint32]$value=0
+    if($Reason -cmatch '^(0|[1-9][0-9]?)$' -and [uint32]::TryParse($Reason,[ref]$value) -and $value -lt $names.Count){return $names[$value]+' ('+$Reason+')'}
+    return 'unavailable-or-invalid'
+}
 function Assert-ProbeReaderUnloaded {
     if('RS2CountProbe.Reader' -as [type]){throw 'A count reader is already loaded in this PowerShell process. Use Run-RS2CountProbe.cmd for a fresh session.'}
 }
@@ -127,6 +144,7 @@ function Invoke-CountProbe {
     $output=$null;$stream=$null;$process=$null
     $locks=New-Object 'Collections.Generic.List[IDisposable]'
     try {
+        if($script:ProbePins.companion -ceq ('0'*64)){throw 'This source copy is not a pinned kit yet. Use the matched packaged V3 CountProbe.'}
         if(![Environment]::Is64BitProcess){throw 'Run this kit with 64-bit Windows PowerShell.'}
         if(!$ProcessId){$entered=Read-Host 'PID of the running public server';if($entered -cnotmatch '^[1-9][0-9]{0,9}$' -or ![uint32]::TryParse($entered,[ref]$ProcessId)){throw 'Invalid PID.'}}
         if(!$TargetRoot){$TargetRoot=Read-Host 'Full server root directory (not Binaries/Win64 or the EXE)'}
@@ -163,7 +181,7 @@ function Invoke-CountProbe {
         Write-Host ('Evidence folder: '+$output)
         Write-Host 'Read-only. Q stops collection after the current sample is safely saved. No server restart.'
         $stream=[IO.StreamWriter]::new([IO.File]::Open((Join-Path $output 'counts.jsonl'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read),[Text.UTF8Encoding]::new($false));$stream.AutoFlush=$true
-        $stream.WriteLine(([ordered]@{type='startup';schema=1;version='0.2.0';utc=[DateTime]::UtcNow.ToString('o');pid=$ProcessId;
+        $stream.WriteLine(([ordered]@{type='startup';schema=1;version='0.3.0';reporting_schema=3;utc=[DateTime]::UtcNow.ToString('o');pid=$ProcessId;
             samples_requested=$Samples;interval_seconds=$IntervalSeconds;reader_sha256=(Get-FileHash -LiteralPath $reader.FullName).Hash;
             script_sha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash;meaning='Nearby read-only samples, not exact past DLL failure values or proof of backend recovery.'}|ConvertTo-Json -Compress))
         $identity=$null;$completed=0;$stop='sample-limit'
@@ -193,7 +211,9 @@ function Invoke-CountProbe {
                 'humans={0} bots={1} spectators={2} max={3}; sampled_checks={4}; readiness={5}' -f $raw.Second.Humans,$raw.Second.Bots,$raw.Second.Spectators,$raw.Second.Maximum,$checks,$readiness
             }else{$raw.State+'; pass='+$raw.Pass+' stage='+$raw.Stage+'; '+$raw.Detail}
             $reason=if($after.fields.ContainsKey('reporting.reason')){Format-ProbeReason $after.fields['reporting.reason']}else{'unavailable'}
-            Write-Host ('[{0}/{1}] {2}; DLL={3} last_reason={4}; {5}' -f $completed,$Samples,$counts,$after.fields['reporting.state'],$reason,$correlation)
+            $transport=if($after.fields.ContainsKey('reporting.transport.reason')){Format-ProbeTransportReason $after.fields['reporting.transport.reason']}else{'unavailable'}
+            $worker=if($after.fields.ContainsKey('reporting.worker_pause_reason')){Format-ProbeTransportReason $after.fields['reporting.worker_pause_reason']}else{'unavailable'}
+            Write-Host ('[{0}/{1}] {2}; DLL={3} runtime_reason={4}; transport_reason={5}; worker_gate={6}; {7}' -f $completed,$Samples,$counts,$after.fields['reporting.state'],$reason,$transport,$worker,$correlation)
             if(Test-ProbeQuit){$stop='operator-q';break}
             if($i+1 -lt $Samples){for($wait=0;$wait -lt $IntervalSeconds*5;++$wait){Start-Sleep -Milliseconds 200;if(Test-ProbeQuit){$stop='operator-q';break}};if($stop -eq 'operator-q'){break}}
         }

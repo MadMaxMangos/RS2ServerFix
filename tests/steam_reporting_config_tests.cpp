@@ -26,4 +26,31 @@ void ReportingConfigTests() {
     RS2_CHECK(ParseConfig(oversized.data(), oversized.size(), &config) == Reason::ConfigInvalid);
     RS2_CHECK(ParseConfig(nullptr, 1, &config) == Reason::ConfigInvalid && config.mode == Mode::Invalid);
     RS2_CHECK(ParseConfig("schema=2", 8, nullptr) == Reason::ConfigInvalid);
+
+    ConfigV3 native{Mode::Repair, Diagnostics::Detailed};
+    const auto parseNative = [&native](const char* value) {
+        return ParseConfigV3(value, std::strlen(value), &native);
+    };
+    RS2_CHECK(parseNative("schema=3\nmode=observe\ndiagnostics=normal\n") == Reason::None);
+    RS2_CHECK(native.mode == Mode::Observe && native.diagnostics == Diagnostics::Normal);
+    RS2_CHECK(parseNative(" diagnostics = detailed \r\nmode = repair\r\nschema = 3") == Reason::None);
+    RS2_CHECK(native.mode == Mode::Repair && native.diagnostics == Diagnostics::Detailed);
+    RS2_CHECK(parseNative("schema=3\nmode=disabled\ndiagnostics=normal") == Reason::ConfigDisabled);
+    for (const auto* invalid : {"schema=3\nmode=repair", "schema=3\ndiagnostics=normal",
+            "mode=repair\ndiagnostics=normal", "schema=2\nmode=repair\ndiagnostics=normal",
+            "schema=3\nmode=repair\ndiagnostics=normal\ndiagnostics=detailed",
+            "schema=3\nmode=repair\ndiagnostics=verbose", "schema=03\nmode=repair\ndiagnostics=normal",
+            "schema=3\nmode=repair\ndiagnostics=normal\nmax_log_mib=512",
+            "schema=3\nmode=repair\ndiagnostics=normal\nmode=observe",
+            "schema=3\nmode=repair\ndiagnostics=normal\nschema=3",
+            "schema=3\nmode=repair\ndiagnostics=normal # default", "schema=3\nmode=disabled"}) {
+        RS2_CHECK(parseNative(invalid) == Reason::ConfigInvalid);
+        RS2_CHECK(native.mode == Mode::Invalid && native.diagnostics == Diagnostics::Invalid);
+    }
+    const char nativeNul[] = "schema=3\nmode=repair\ndiagnostics=normal\0\n";
+    RS2_CHECK(ParseConfigV3(nativeNul, sizeof(nativeNul) - 1, &native) == Reason::ConfigInvalid);
+    RS2_CHECK(ParseConfigV3(nullptr, 1, &native) == Reason::ConfigInvalid);
+    RS2_CHECK(ParseConfigV3("schema=3", 8, nullptr) == Reason::ConfigInvalid);
+    RS2_CHECK(ParseConfigV3(oversized.data(), oversized.size(), &native) == Reason::ConfigInvalid);
+    RS2_CHECK(parse("schema=3\nmode=repair\ndiagnostics=normal") == Reason::ConfigInvalid);
 }

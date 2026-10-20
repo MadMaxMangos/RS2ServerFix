@@ -9,6 +9,13 @@ const char* ModeName(Mode mode) noexcept {
     default: return "invalid";
     }
 }
+const char* DiagnosticsName(Diagnostics diagnostics) noexcept {
+    switch (diagnostics) {
+    case Diagnostics::Normal: return "normal";
+    case Diagnostics::Detailed: return "detailed";
+    default: return "invalid";
+    }
+}
 const char* ReasonName(Reason reason) noexcept {
     static constexpr const char* names[]{
         "none", "config-missing", "config-disabled", "config-invalid", "observer-required",

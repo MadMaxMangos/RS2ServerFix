@@ -1,8 +1,11 @@
 #include "companion/steam_reporting.h"
 #include "companion/steam_reporting_config.h"
 #include "companion/steam_reporting_forward.h"
-#include "companion/steam_reporting_log.h"
+#include "companion/steam_reporting_console.h"
 #include "companion/steam_reporting_profile.h"
+#include "companion/steam_reporting_native_profile.h"
+#include "companion/steam_reporting_transport.h"
+#include "companion/leech_recovery.h"
 #include "shared/selected_reporting_profile.h"
 #include <bcrypt.h>
 #include <cstring>
@@ -11,15 +14,16 @@
 extern "C" {
 // The only extra export of the reporting artifact. Storage survives absent or
 // failed writer allocation and is never shared with the worker's lifetime.
-rs2fix::reporting::StatusWire RS2SteamReport_StatusV2{};
+rs2fix::reporting::StatusWireV3 RS2SteamReport_StatusV3{};
 }
 
 namespace rs2fix::reporting {
 namespace {
 struct Resident {
     Runtime runtime;
+    LeechRecovery recovery;
     observer::DispatchState dispatch;
-    ReportRing ring;
+    ReportRingV3 ring;
 };
 struct ProfileCheck {
     std::uintptr_t base;
@@ -32,28 +36,31 @@ bool Recheck(void* context, DWORD* error) noexcept {
     // IAT ownership is checked by the enclosing transaction; this callback runs
     // both before and after publication and validates immutable native evidence.
     return ValidateReportingProfile(check.base,*check.startup,*check.profile,
-        ProductionMemoryOps(),&pump,error)==ProfileResult::Ready;
+        ProductionMemoryOps(),&pump,error)==ProfileResult::Ready &&
+        ValidateNativeLoggingProfile(check.base,*check.startup,SelectedNativeLoggingProfile(),
+            ProductionMemoryOps(),ProductionNativeImportOps(),error)==ProfileResult::Ready;
 }
-void Notice(void* context, bool ready, Reason reason) noexcept {
-    RequestReportingNotice(static_cast<observer::Writer*>(context),ready,reason);
-}
-void Reject(Reason reason, Resident* resident=nullptr, observer::Writer* writer=nullptr) noexcept {
-    auto& status=RS2SteamReport_StatusV2;
+void Reject(Reason reason, Resident* resident=nullptr, NativeTransport* writer=nullptr) noexcept {
+    auto& status=RS2SteamReport_StatusV3;
     RevokeStatus(status,reason);
     StatusPayload payload{};
     if (resident) payload=resident->runtime.counters;
-    payload.phase=static_cast<std::uint64_t>(ReportPhase::Rejected);
+    payload.phase=static_cast<std::uint64_t>(ReportPhaseV3::Rejected);
     payload.reason=static_cast<std::uint64_t>(reason);
     payload.ownerThreadId=GetCurrentThreadId();
-    PublishStatus(status,payload);
+    OwnerTransport transport{};
+    if (resident) transport=resident->runtime.transport;
+    transport.state=static_cast<std::uint64_t>(TransportState::Faulted);
+    transport.generatedSequence=payload.reportSequence;
+    PublishOwnerV3(status,payload,transport);
     if (writer) {
         // Startup rejection happens before the writer is armed. Its stop path
         // cannot service a hook-style notice request, so schedule this one here.
         ScheduleReportingDisabledNotice(status,reason);
-        observer::StopUnarmedWriter(writer);
+        StopNativeTransport(writer);
     } else ScheduleReportingDisabledNotice(status,reason);
 }
-bool Header(const Config& config, bool configValid, const Sha256Digest& digest, bool hostValid) noexcept {
+bool Header(const ConfigV3& config, bool configValid, const Sha256Digest& digest, bool hostValid) noexcept {
     StatusHeader header{};
     header.configuredMode=static_cast<std::uint32_t>(config.mode);
     header.pid=GetCurrentProcessId();
@@ -79,17 +86,17 @@ bool Header(const Config& config, bool configValid, const Sha256Digest& digest, 
         header.validity|=HostIdentityValid;
     }
     StatusPayload payload{};
-    payload.phase=static_cast<std::uint64_t>(ReportPhase::Initializing);
+    payload.phase=static_cast<std::uint64_t>(ReportPhaseV3::Initializing);
     payload.ownerThreadId=GetCurrentThreadId();
-    return InitializeStatus(RS2SteamReport_StatusV2,header,payload);
+    return InitializeStatusV3(RS2SteamReport_StatusV3,header,payload);
 }
 } // namespace
 
 void StartReporting(const BootstrapContextV3& context, const StartupProfile& startup,
     const observer::Profile& observerProfile, const Sha256Digest& hostDigest,
-    HostHashLease& hostLease, const wchar_t* directory, bool reconEligible) noexcept {
-    Config config{}; DWORD error{};
-    const auto configured=ReadConfig(directory,&config,&error);
+    HostHashLease& hostLease, const wchar_t* directory, bool reconEligible,const NativeStartupSummary& startupSummary) noexcept {
+    ConfigV3 config{}; DWORD error{};
+    const auto configured=ReadConfigV3(directory,&config,&error);
     const auto& identities=SelectedReportingIdentities();
     const bool hostValid=hostLease.valid() && hostDigest==identities.hostDigest &&
         hostDigest==observerProfile.hostDigest;
@@ -97,12 +104,8 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     if (configured!=Reason::None) { Reject(configured); return; }
     if (!reconEligible) { Reject(Reason::ReconIneligible); return; }
     if (!hostValid) { Reject(Reason::HostMismatch); return; }
-    if (RS2SteamReport_StatusV2.header.validity!=CompleteHeaderIdentity) {
+    if (RS2SteamReport_StatusV3.header.validity!=CompleteHeaderIdentity) {
         Reject(Reason::IdentityIncomplete); return;
-    }
-    observer::Config prerequisite{};
-    if (observer::ReadObserverConfig(directory,&prerequisite)!=observer::Reason::None || !prerequisite.enabled) {
-        Reject(Reason::ObserverRequired); return;
     }
     if (observerProfile.sdkDigest!=identities.steamApiDigest ||
         observer::CheckColdProfile(context,startup,observerProfile,ProductionMemoryOps(),&error)!=observer::Reason::None) {
@@ -110,6 +113,10 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     }
     const auto base=reinterpret_cast<std::uintptr_t>(context.hostModule);
     const auto& profile=SelectedReportingProfile();
+    if (ValidateNativeLoggingProfile(base,startup,SelectedNativeLoggingProfile(),
+        ProductionMemoryOps(),ProductionNativeImportOps(),&error)!=ProfileResult::Ready) {
+        Reject(Reason::ProfileMismatch); return;
+    }
     std::uintptr_t nativePump{};
     if (ValidateReportingProfile(base,startup,profile,ProductionMemoryOps(),&nativePump,&error)!=ProfileResult::Ready) {
         Reject(Reason::ProfileMismatch); return;
@@ -129,33 +136,47 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     if (!resident) { Reject(Reason::PreparationFailed); return; }
     // A partially prepared writer may retain these addresses. This bounded
     // process-lifetime allocation is intentionally never raced by cleanup/free.
-    if (!InitializeReportRing(resident->ring,RS2SteamReport_StatusV2,context.startupThreadId)) {
+    if (!InitializeReportRing(resident->ring,RS2SteamReport_StatusV3,context.startupThreadId)) {
         Reject(Reason::PreparationFailed,resident); return;
     }
-    Reason writerReason{};
-    auto* writer=PrepareReportingWriter(directory,prerequisite.maxLogMiB,RS2SteamReport_StatusV2,
-        resident->ring,resident->dispatch,&writerReason,&error);
-    if (!writer) { Reject(writerReason==Reason::None ? Reason::WriterFailed : writerReason,resident); return; }
+    auto* writer=PrepareNativeTransport(RS2SteamReport_StatusV3,resident->ring,config,
+        identities,context.startupThreadId,&error);
+    if (!writer) { Reject(Reason::PreparationFailed,resident); return; }
+    if (!CompleteNativeTransportStartup(writer,startupSummary)) {
+        Reject(Reason::PreparationFailed,resident,writer); return;
+    }
     RuntimeConfig runtime{};
-    runtime.mode=config.mode; runtime.ownerThreadId=context.startupThreadId;
+    runtime.mode=config.mode; runtime.diagnostics=config.diagnostics; runtime.nativeTransport=writer;
+    runtime.ownerThreadId=context.startupThreadId;
     runtime.hostBase=base; runtime.hostSize=startup.imageSize;
     runtime.memory=ProductionMemoryOps(); runtime.dispatch=&resident->dispatch;
-    runtime.status=&RS2SteamReport_StatusV2; runtime.sink=GetReportingWriterSink(writer);
+    runtime.status=&RS2SteamReport_StatusV3; runtime.sink=ReportRingSink(resident->ring);
     runtime.pumpOriginal=originalPump;
     runtime.task=SelectedTaskLayout();
     runtime.builderOriginal=reinterpret_cast<BuilderFn>(base+runtime.task.builderRva);
     runtime.builderWrapper=reinterpret_cast<std::uintptr_t>(&BuilderEntry);
     runtime.source=SelectedSourceLayout(); runtime.prepared=SelectedPreparedLayout();
     runtime.ancestry=SelectedAncestryProfile();
-    runtime.noticeContext=writer; runtime.notice=Notice; runtime.qualifyClient=QualifyLoadedSteamClient;
-    const auto initialized=InitializeRuntime(resident->runtime,runtime,RS2SteamReport_StatusV2.header.qpcFrequency);
+    runtime.qualifyClient=QualifyLoadedSteamClient;
+    runtime.recovery=&resident->recovery;
+    // P4 consumes coherent owner/worker DATA; no hook-side console formatting.
+    const auto initialized=InitializeRuntime(resident->runtime,runtime,RS2SteamReport_StatusV3.header.qpcFrequency);
     if (initialized!=Reason::None) { Reject(initialized,resident,writer); return; }
+    const NativeLogReadContext nativeLog{ProductionMemoryOps(),base,startup.imageSize,context.startupThreadId,&SelectedNativeLogLayout()};
+    if (!InitializeNativeLogService(resident->runtime.nativeLog,RS2SteamReport_StatusV3,
+        resident->runtime.transport,writer,nativeLog,kSelectedNativeLogEntry)) {
+        Reject(Reason::PreparationFailed,resident,writer); return;
+    }
     HMODULE companion{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             reinterpret_cast<LPCWSTR>(&StartReporting),&companion) ||
         !PrepareRuntimeCapture(resident->runtime,companion)) {
         Reject(Reason::ProfileMismatch,resident,writer); return;
     }
+    // This capability is optional and startup-disabled. A failed third profile
+    // cannot alter publication of the two existing reporting capture profiles.
+    PrepareLeechRecovery(resident->recovery,resident->runtime,startup,directory,companion);
+    AttachNativeTransportRecovery(writer,&RS2LeechRecovery_StatusV1);
     dispatch.lifecycleSink=RuntimeLifecycleSink(resident->runtime);
     observer::InitializeDispatch(resident->dispatch,dispatch,{});
     if (!PublishRuntime(resident->runtime) || !observer::PublishDispatch(resident->dispatch)) {
@@ -170,6 +191,7 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
         if (installed.fatal) observer::FailFastObserverInstallation(installed);
         return;
     }
-    ArmReportingWriter(writer);
+    ArmNativeTransport(writer);
+    if (!StatusRevoked(RS2SteamReport_StatusV3)) ArmLeechRecovery(resident->recovery);
 }
 } // namespace rs2fix::reporting

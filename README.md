@@ -13,12 +13,14 @@ release. It is not a general performance patch or a fix for every server crash.
 
 Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
 companion is **0.3.0.0** and requires its own qualified trial package.
-Native advertisement recovery is a separate **0.4.2.0 experimental target**
-for limited operator-authorized trials. This revision allows the observed
+Steam reporting and manual Leech recovery use the **0.6.2.0 experimental target**.
+The current source includes the r5 guard corrections and remains intended for
+controlled training-server trials. It retains the 0.4.2 admission correction for
 negative-spectator and over-capacity human accounting drift without replacing
 the game's native advertised counts or changing authentication. Bot/capacity,
-memory and lifecycle safeguards remain. It is not a generally qualified
-production release or a proven Steam-outage fix.
+memory and lifecycle safeguards remain in force. The default configuration observes reporting
+and disables manual recovery. Live native recovery and Steam-outage browser-count
+repair remain unproven; this is not a generally qualified production release.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
   exact executable hash, expected instruction bytes and startup checks.
@@ -140,28 +142,55 @@ uses the existing bootstrap and launch command. It preserves native player/bot
 counting, authentication, anti-cheat decisions and publication scheduling.
 
 The first isolated trial uses the supplied [reporting config](config/RS2SteamReport.ini)
-with `schema=2`, `mode=observe`, plus the enabled
-[logging prerequisite](config/RS2SteamObserve.ini), both beside the companion.
+beside the companion:
+
+```ini
+schema=3
+mode=observe
+diagnostics=normal
+```
+
+`RS2SteamObserve.ini` is no longer a reporting prerequisite. Do not mix this
+config or the V3 tools with an older reporting DLL. The standalone 0.3 observer
+and recon-only 0.2 M1R checker retain their separate contracts.
 Observe makes no count-request or full-publication selection writes. Only a later
 separately approved `mode=repair` trial may request fresh native counts and select
 full data on already-scheduled native publications. This is not proof of Steam
 registration repair or backend/browser recovery.
 
-In the completed isolated repair trial, local safety, functional coverage and
+In the earlier 0.4.1 isolated repair trial, local safety, functional coverage and
 per-call latency checks passed. Measured wrapper overhead was approximately
 1.32-1.35 ms per second, exceeding the original strict 1 ms/s budget; the
 performance result remains **FAIL**. Limited staged field trials are an explicit
 operator risk decision, not a reclassification of that result. Full-server load
 and browser-count recovery following an actual Steam outage remain unproven.
 
-Reporting uses scalar-only logs under `RS2SteamReport`, without the verbose 0.3
-Steam-call trace or its private key store. The quota defaults to 512 MiB; actual
-record/write/quota loss disables new reporting mutations, while native forwarding
-continues. `[RS2SteamReport]` notices and the independent read-only DATA status
-distinguish readiness from rejection. Recon's own result remains separate.
+V3 reporting submits bounded structured `[RS2ServerFix:event]` records through
+the qualified native logger into the actual server `Launch.log`, including an
+`-ABSLOG` destination. Keep `-FORCELOGFLUSH`. There is no new reporting JSONL
+directory, quota, private key, rotation or retention subsystem. This does not
+move the game's logger off the engine thread: native logging and its console
+mirror remain synchronous. Normal diagnostics use a ten-second anchor/summary
+cadence plus state, request and builder events; detailed diagnostics use one
+second. Output is limited to eight native frames per second, not one per tick.
 
-The packaged `Run-SteamReport.cmd` reads current status before requesting logs and
-collects a fixed five-minute window. Local safety, coverage, measured performance,
+A read-only receipt worker verifies that submitted events reached the same log
+file. Missing logger qualification or temporary receipt/credit pressure visibly
+waits or pauses reporting and its repair admission; a real lost/corrupt record,
+changed/truncated file or unsafe native profile permanently closes that admission.
+Native forwarding and the separate recon result remain unchanged. Full structured
+events are retained in Launch.log; the game's console mirror may truncate them.
+Short `[RS2SteamReport]` notices report waiting, ready, pause, resume or disabled
+states through a separate bounded console worker. The per-PID recon loader marker
+still uses its original location and format.
+
+The matched V3 `Run-SteamReport.cmd` reads current DATA before requesting logs and
+collects a fixed five-minute window. When Launch.log is outside the server tree,
+it requires an explicit permitted log root. It copies at most 512 MiB from the
+run's original log offset, including unrelated game lines; this is a collection
+limit, not a log retention limit. Missing history or a pause cannot yield a false
+coverage pass. Archived evidence requires an explicit log path and saved DATA
+from that same file identity. Local safety, coverage, measured performance,
 operator smoke, client effect and outage recovery have separate verdicts. Missing
 timing calibration or insufficient evidence cannot produce a qualification PASS.
 Use only a reviewed, checksum-bound package and its deployment instructions.
@@ -169,6 +198,62 @@ The repository configuration defaults to observe; repair requires an explicit
 deployment decision. A source checkout or a successful build is not a qualified
 deployment package. Proprietary Steam DLLs and private operator bundles are not
 included in this repository.
+
+### Manual Leech recovery and the read-only guard probe
+
+The 0.6.2.0 r5 source corrects four native guard contracts: the cached session ID
+is a narrow `std::string`; a stable core GUID supplies lifetime identity while
+authorization tokens may rotate; valid retained Finish slots can be reused by
+the native allocator; and an unchanged public-IP value may move allocations.
+Cache fingerprints now hash narrow initialized bytes excluding NUL, so older
+UTF-16 cache fingerprints are not comparable across revisions.
+
+Manual recovery is separate from the reporting `mode=repair` setting above. It
+defaults to disabled in [RS2LeechRecovery.ini](config/RS2LeechRecovery.ini), which
+must be placed beside the EXE, not in a `config` subfolder. The current
+implementation is restricted to `E:\rs2v_trainingsrv\Binaries\Win64` under the
+training root `E:\rs2v_trainingsrv`. A one-shot request uses the matched
+[Request-LeechRecovery.ps1](tools/Request-LeechRecovery.ps1) helper and authenticates
+the configured operator SID through the named pipe. The server and helper must
+run as that same elevated administrator account. File permission changes are
+not required by this control mechanism. A request transmission alone does not
+establish admission, native completion or browser repair.
+
+For a controlled trial, use the reviewed, checksum-bound kit. To build the
+read-only guard variant from source, use a separate directory and supply the
+preserved, hash-matched full-dump EXE as a data input:
+
+```powershell
+cmake -S . -B build-leech-probe -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DRS2_RECOVERY_GUARD_PROBE=ON `
+  "-DRS2_CURRENT_FULLDUMP_PATH=C:/evidence/VNGame_pr3.exe"
+cmake --build build-leech-probe --target rs2_server_fix_companion_reporting rs2_reporting_tests rs2_pe_contract
+ctest --test-dir build-leech-probe -C Release `
+  -R '^(reporting_core|pe_reporting_companion_contract)$' --no-tests=error --output-on-failure
+```
+
+Replace the example evidence path with your preserved input. The probe DLL is
+under `build-leech-probe/diagnostic/guard-probe/Release`; its recovery native call
+sites are compiled out. A build with `RS2_RECOVERY_GUARD_PROBE=OFF` uses
+`production/reporting/Release` and can perform the native sequence only after
+explicit configuration and an authenticated manual request. Both variants retain
+FileVersion 0.6.2.0; distinguish them by their build setting and artifact hashes.
+Use tools and configuration from the same verified trial package. A local rebuild
+does not reproduce the kit's artifact hashes or inherit its package qualification.
+
+The probe's reason 63 / Inconclusive records snapshot and pre-submit admission
+only; a timeout without that result does not prove admission. A native-enabled
+attempt can fail irreversibly and require an operator restart. Native completion,
+subsequent cache publication, client adoption and actual browser-count repair
+need separate runtime evidence. ADF crash mitigation is not included here.
+
+The r5 source archive (SHA-256
+`98B01A306DE199B3C3B3299CBFE43E6C9B46CDFDC88D0E2CD7A4827E772DEAA5`)
+passed the existing active and probe `reporting_core` checks (20,185 and 18,475
+assertions, zero failures) and both companion PE contracts. The r4-to-r5 guard
+correction review and source-custody checks closed with no blocking or important
+findings; that was not a fresh review of the entire source tree. These local
+results do not establish live recovery or production qualification.
 
 Full qualification testing also requires locally supplied, preserved executable
 inputs. Set the CMake cache paths `RS2_PR1_BASELINE_PATH`,

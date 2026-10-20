@@ -8,10 +8,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 include(CTest)
+option(RS2_RECOVERY_GUARD_PROBE "Build a one-shot read-only native guard diagnostic" OFF)
 
 # Only this translation unit uses Windows aligned payload release stores.
 # Pin MSVC's ordering contract; all sequence/latch operations stay interlocked.
 set_source_files_properties(src/companion/steam_reporting_status.cpp
+  src/companion/steam_reporting_status_v3.cpp
+  src/companion/leech_recovery_wire.cpp
   PROPERTIES COMPILE_OPTIONS "/volatile:ms")
 
 set(RS2_PR1_BASELINE_PATH "" CACHE FILEPATH "Preserved PR1 stock input; never executed")
@@ -96,6 +99,9 @@ target_compile_definitions(rs2_missing_genuine_bootstrap PRIVATE
 add_library(rs2_evidence STATIC
   tools/pe_reader.cpp tools/tool_paths.cpp tools/genuine_manifest.cpp
   tools/file_evidence.cpp tools/pe_contract_lib.cpp
+  src/shared/steam_reporting_snapshot_v3.cpp
+  src/shared/leech_recovery_snapshot.cpp
+  src/shared/native_log_framing.cpp
   src/shared/digest.cpp src/companion/sha256.cpp)
 rs2_configure_target(rs2_evidence)
 target_link_libraries(rs2_evidence PUBLIC bcrypt version wintrust)
@@ -191,6 +197,8 @@ target_link_libraries(rs2_deployment_preflight PRIVATE rs2_evidence advapi32)
 add_executable(rs2_runtime_inventory tools/runtime_inventory_main.cpp tools/runtime_inventory.cpp
   tools/deployment_preflight.cpp src/shared/path_identity.cpp src/companion/build_identity.cpp)
 rs2_configure_target(rs2_runtime_inventory)
+rs2_resource(rs2_runtime_inventory "RS2ServerFix Runtime Inventory Tool"
+  "rs2_runtime_inventory.exe" VFT_APP "0.6.2.0" "0,6,2,0")
 target_compile_definitions(rs2_runtime_inventory PRIVATE RS2_PREFLIGHT_NO_MAIN)
 target_link_libraries(rs2_runtime_inventory PRIVATE rs2_evidence advapi32)
 
@@ -261,6 +269,8 @@ add_test(NAME startup_cases COMMAND rs2_startup_runner
   --production-bootstrap $<TARGET_FILE:rs2_x3daudio_bootstrap>)
 
 add_executable(rs2_profile_evidence_tests tests/profile_test_main.cpp tests/production_profile_tests.cpp
+  tests/native_log_file_profile_tests.cpp src/companion/steam_reporting_profile.cpp
+  src/companion/steam_reporting_native_profile.cpp
   tests/steam_observer_profile_tests.cpp src/companion/steam_observer_profile.cpp
   src/companion/host_hash.cpp src/shared/startup_profile.cpp src/shared/path_identity.cpp)
 rs2_configure_target(rs2_profile_evidence_tests)
@@ -369,6 +379,11 @@ add_test(NAME observer_collector COMMAND powershell.exe -NoProfile -ExecutionPol
 # Reporting foundations are inert: this target exercises owned data only and
 # cannot load the game/SDK or publish runtime hooks. Legacy artifacts stay intact.
 add_executable(rs2_reporting_tests tests/steam_reporting_test_main.cpp
+  tests/recovery_wire_tests.cpp tests/leech_recovery_policy_tests.cpp
+  tests/leech_recovery_native_tests.cpp tests/leech_recovery_control_tests.cpp tests/leech_recovery_tests.cpp
+  src/companion/leech_recovery_wire.cpp src/companion/leech_recovery_policy.cpp
+  src/companion/leech_recovery_native.cpp src/companion/leech_recovery_control.cpp
+  src/companion/leech_recovery.cpp
   tests/steam_reporting_config_tests.cpp tests/steam_reporting_state_tests.cpp
   tests/steam_reporting_json_tests.cpp tests/steam_reporting_profile_tests.cpp
   tests/steam_reporting_source_tests.cpp
@@ -377,6 +392,20 @@ add_executable(rs2_reporting_tests tests/steam_reporting_test_main.cpp
   tests/steam_reporting_capture_tests.cpp tests/steam_reporting_record_tests.cpp
   tests/steam_reporting_task_tests.cpp tests/steam_reporting_client_tests.cpp
   tests/steam_reporting_log_tests.cpp
+  tests/native_log_framing_tests.cpp
+  tests/native_log_format_tests.cpp src/companion/steam_reporting_format_v3.cpp
+  tests/native_log_receipt_tests.cpp src/companion/steam_reporting_receipts.cpp
+  tests/native_log_pipeline_tests.cpp src/companion/steam_reporting_pipeline.cpp
+  tests/native_log_file_tests.cpp src/companion/steam_reporting_log_file.cpp
+  src/companion/steam_reporting_worker.cpp
+  src/companion/steam_reporting_transport.cpp
+  src/companion/steam_reporting_native_log.cpp
+  tests/native_log_service_tests.cpp
+  tests/steam_reporting_console_tests.cpp src/companion/steam_reporting_console.cpp
+  src/companion/steam_reporting_hash.cpp
+  tests/native_log_source_tests.cpp src/companion/steam_reporting_native_source.cpp
+  src/companion/steam_reporting_native_profile.cpp
+  src/companion/steam_reporting_status_v3.cpp
   tests/steam_reporting_runtime_tests.cpp
   tests/steam_reporting_forward_tests.cpp
   src/companion/steam_reporting_types.cpp src/companion/steam_reporting_config.cpp
@@ -394,11 +423,33 @@ add_executable(rs2_reporting_tests tests/steam_reporting_test_main.cpp
   src/companion/host_hash.cpp
   src/shared/path_identity.cpp)
 rs2_configure_target(rs2_reporting_tests)
-target_compile_definitions(rs2_reporting_tests PRIVATE RS2_REPORTING_TESTING RS2_STEAM_REPORTING RS2_OBSERVER_TESTING)
+target_compile_definitions(rs2_reporting_tests PRIVATE
+  RS2_REPORTING_TESTING RS2_REPORTING_LEGACY_WRITER RS2_STEAM_REPORTING RS2_OBSERVER_TESTING
+  RS2_CURRENT_FULLDUMP_PATH=L\"${RS2_CURRENT_FULLDUMP_PATH}\")
+if(RS2_RECOVERY_GUARD_PROBE)
+  target_compile_definitions(rs2_reporting_tests PRIVATE RS2_RECOVERY_GUARD_PROBE)
+endif()
 target_link_libraries(rs2_reporting_tests PRIVATE rs2_evidence advapi32)
 add_test(NAME reporting_core COMMAND rs2_reporting_tests)
 
 set(RS2_REPORTING_SOURCES
+  src/companion/leech_recovery_wire.cpp src/shared/leech_recovery_snapshot.cpp
+  src/companion/leech_recovery_policy.cpp src/companion/leech_recovery_native.cpp
+  src/companion/leech_recovery_control.cpp src/companion/leech_recovery.cpp
+  src/companion/steam_reporting_console.cpp
+  src/companion/steam_reporting_native_log.cpp
+  src/companion/steam_reporting_transport.cpp
+  src/companion/steam_reporting_worker.cpp
+  src/companion/steam_reporting_log_file.cpp
+  src/companion/steam_reporting_hash.cpp
+  src/companion/steam_reporting_pipeline.cpp
+  src/companion/steam_reporting_receipts.cpp
+  src/companion/steam_reporting_format_v3.cpp
+  src/shared/native_log_framing.cpp
+  src/shared/steam_reporting_snapshot_v3.cpp
+  src/companion/steam_reporting_native_source.cpp
+  src/companion/steam_reporting_native_profile.cpp
+  src/companion/steam_reporting_status_v3.cpp
   src/companion/steam_reporting.cpp src/companion/steam_reporting_types.cpp
   src/companion/steam_reporting_config.cpp src/companion/steam_reporting_state.cpp
   src/companion/steam_reporting_json.cpp src/companion/steam_reporting_profile.cpp
@@ -407,12 +458,19 @@ set(RS2_REPORTING_SOURCES
   src/companion/steam_reporting_capture.cpp src/companion/steam_reporting_records.cpp
   src/companion/steam_reporting_task.cpp src/companion/steam_reporting_client.cpp
   src/companion/steam_reporting_runtime.cpp src/companion/steam_reporting_forward.cpp)
-rs2_companion(rs2_server_fix_companion_reporting production/reporting
-  "RS2ServerFix Active Recon Steam Reporting Companion" "0.4.2.0" "0,4,2,0"
+set(RS2_REPORTING_VARIANT_DIR production/reporting)
+if(RS2_RECOVERY_GUARD_PROBE)
+  set(RS2_REPORTING_VARIANT_DIR diagnostic/guard-probe)
+endif()
+rs2_companion(rs2_server_fix_companion_reporting ${RS2_REPORTING_VARIANT_DIR}
+  "RS2ServerFix Active Recon Steam Reporting Companion" "0.6.2.0" "0,6,2,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_server_fix_companion_reporting PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
 target_compile_definitions(rs2_server_fix_companion_reporting PRIVATE
   RS2_RECON_ACTIVE RS2_STEAM_OBSERVER RS2_STEAM_REPORTING)
+if(RS2_RECOVERY_GUARD_PROBE)
+  target_compile_definitions(rs2_server_fix_companion_reporting PRIVATE RS2_RECOVERY_GUARD_PROBE)
+endif()
 target_link_libraries(rs2_server_fix_companion_reporting PRIVATE advapi32)
 add_test(NAME pe_reporting_companion_contract COMMAND rs2_pe_contract
   --kind companion-reporting --file $<TARGET_FILE:rs2_server_fix_companion_reporting>)
@@ -438,6 +496,7 @@ add_custom_command(OUTPUT "${RS2_REPORTING_TEST_IMPORT_LIB}"
   DEPENDS tests/steam_reporting_api_named.def VERBATIM)
 add_custom_target(rs2_reporting_test_import DEPENDS "${RS2_REPORTING_TEST_IMPORT_LIB}")
 add_executable(rs2_reporting_startup_fixture tests/startup_fixture.cpp tests/startup_fixture.asm
+  tests/steam_reporting_native_log_fixture.cpp src/shared/steam_reporting_snapshot_v3.cpp
   tests/steam_reporting_startup_fixture.cpp tests/steam_reporting_startup_fixture.asm
   tests/steam_reporting_startup_fixture.def)
 rs2_configure_target(rs2_reporting_startup_fixture)
@@ -470,7 +529,7 @@ add_custom_command(OUTPUT "${RS2_REPORTING_FIXTURE_PROFILE}"
 add_custom_target(rs2_reporting_fixture_profiles DEPENDS "${RS2_REPORTING_FIXTURE_PROFILE}")
 rs2_bootstrap(rs2_reporting_fixture_bootstrap test-reporting/bootstrap "RS2ServerFix Test Fixture Bootstrap")
 rs2_companion(rs2_reporting_fixture_companion test-reporting/companion
-  "RS2ServerFix Test Fixture Steam Reporting Companion" "0.4.2.0" "0,4,2,0"
+  "RS2ServerFix Test Fixture Steam Reporting Companion" "0.6.2.0" "0,6,2,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_reporting_fixture_companion PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
 target_compile_definitions(rs2_reporting_fixture_companion PRIVATE RS2_RECON_ACTIVE RS2_STEAM_OBSERVER RS2_STEAM_REPORTING)
@@ -493,17 +552,20 @@ add_test(NAME reporting_startup_cases COMMAND rs2_reporting_startup_runner
   --bootstrap $<TARGET_FILE:rs2_reporting_fixture_bootstrap>
   --companion $<TARGET_FILE:rs2_reporting_fixture_companion>
   --sdk $<TARGET_FILE:rs2_reporting_test_api> --client $<TARGET_FILE:rs2_reporting_test_client>
-  --expected-companion-version 0.4.2.0
+  --expected-companion-version 0.6.2.0
   --genuine-manifest "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest")
 add_test(NAME reporting_timing_calibration COMMAND rs2_reporting_startup_runner
   --host $<TARGET_FILE:rs2_reporting_startup_fixture>
   --bootstrap $<TARGET_FILE:rs2_reporting_fixture_bootstrap>
   --companion $<TARGET_FILE:rs2_reporting_fixture_companion>
   --sdk $<TARGET_FILE:rs2_reporting_test_api> --client $<TARGET_FILE:rs2_reporting_test_client>
-  --expected-companion-version 0.4.2.0
+  --expected-companion-version 0.6.2.0
   --genuine-manifest "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest"
   --calibration-only)
 # The runner's 900-second owned-child timeout must precede the enclosing test.
 set_tests_properties(reporting_timing_calibration PROPERTIES TIMEOUT 1500)
 add_test(NAME reporting_collector COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/steam_reporting_collector_tests.ps1")
+add_test(NAME recovery_control_helper COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+  -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/leech_recovery_control_tests.ps1"
+  -HelperPath "${CMAKE_CURRENT_SOURCE_DIR}/tools/Request-LeechRecovery.ps1")

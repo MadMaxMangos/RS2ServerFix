@@ -18,13 +18,16 @@ $identity=@{
     host_sha256=$script:ProbePins.host;observed_bootstrap_sha256=$script:ProbePins.bootstrap
     observed_companion_sha256=$script:ProbePins.companion;sdk_sha256=$script:ProbePins.sdk;steamclient_sha256=$script:ProbePins.client
     recon_artifact_result='pass';'reporting.captured'='true';'reporting.header_valid'='true';'reporting.identity_complete'='true'
-    'reporting.schema'='2';'reporting.bytes'='1288';'reporting.artifact_version'='262656';'reporting.mode'='3';'reporting.pid'='1234'
+    'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';'reporting.mode'='3';'reporting.pid'='1234'
     'reporting.qpc_frequency'=[string][Diagnostics.Stopwatch]::Frequency
 }
 Assert-ProbeInventoryIdentity $identity 1234
 Assert $true 'new reporting artifact accepted by the real inventory assertion'
-$oldIdentity=$identity.Clone();$oldIdentity['reporting.artifact_version']='262400'
+$oldIdentity=$identity.Clone();$oldIdentity['reporting.artifact_version']='327680'
 Reject {Assert-ProbeInventoryIdentity $oldIdentity 1234} 'old reporting artifact rejected with otherwise matching identity'
+$oldIdentity=$identity.Clone();$oldIdentity['reporting.schema']='2';$oldIdentity['reporting.bytes']='1288'
+Reject {Assert-ProbeInventoryIdentity $oldIdentity 1234} 'V2 descriptor rejected even with new artifact field'
+$observeIdentity=$identity.Clone();$observeIdentity['reporting.mode']='2';Assert-ProbeInventoryIdentity $observeIdentity 1234
 $f=@{'module_sha256.7'=$script:ProbePins.host;'module.7'='7ff700000000|26000000|1:2:3|<TARGET_ROOT>/Binaries/Win64/VNGame.exe'}
 $hostModule=Get-ProbeHost $f;Assert ($hostModule.Base -eq [Convert]::ToUInt64('7ff700000000',16)) 'host module decoding'
 $f['module_sha256.8']=$script:ProbePins.host;$f['module.8']=$f['module.7'];Reject {Get-ProbeHost $f} 'ambiguous module rejected'
@@ -33,9 +36,20 @@ Assert (!(Test-ProbeWithin 'E:\server' 'E:\server-copy\x')) 'prefix sibling outs
 foreach($bad in @('D:\','\\host\share','D:\foo\..\bar','D:\bad:stream','D:\bad.','D:\bad*','D:\bad[1]')){Reject {Resolve-ProbeDirectory $bad} ('unsafe directory '+$bad)}
 $fields=@{process_creation_filetime='123';'reporting.run_id'='abc';'reporting.owner_valid'='true';'reporting.state'='ready'}
 foreach($key in @('sourceEpoch','bindingEpoch','stopping','revoke_reasons','loss_reasons','phase','reason','builderBound','current_ready')){$fields['reporting.'+$key]='0'}
+foreach($key in @('mode','transport.state','transport.reason','transport.pauseEpoch','transport.transitionSequence',
+    'transport.qualifiedSinkEpoch','transport.actualRepairAdmitted','transport.startupSubmitted','worker.startupObserved',
+    'worker.pauseReason','worker.pauseConditionSequence','worker_pause_reason','worker_pause_changed','fatal_transport_reason','log_identity_available')){$fields['reporting.'+$key]='0'}
 $a=@{fields=$fields;host=@{Base=1;Size=2};end_qpc=1};$b=@{fields=$fields.Clone();host=@{Base=1;Size=2};begin_qpc=4}
 $raw=[pscustomobject]@{Stable=$true;BeginQpc=2;EndQpc=3}
 Assert ((Get-ProbeCorrelation $a $b $raw) -eq 'nearby-stable-observations-not-an-atomic-event') 'stable does not claim atomic event'
+foreach($key in @('transport.state','transport.reason','transport.pauseEpoch','worker.pauseConditionSequence','worker_pause_reason')){
+    $b.fields=$fields.Clone();$b.fields['reporting.'+$key]='1'
+    Assert ((Get-ProbeCorrelation $a $b $raw) -eq 'status-transition') ('transport transition separated: '+$key)
+}
+$b.fields=$fields.Clone();$b.fields.Remove('reporting.worker_pause_reason')
+Assert ((Get-ProbeCorrelation $a $b $raw) -eq 'v3-status-unavailable') 'missing V3 gate does not masquerade as stable'
+$b.fields=$fields.Clone()
+Assert ((Format-ProbeTransportReason '8') -eq 'reader-behind (8)') 'transport reasons use their own domain'
 $b.fields['reporting.reason']='27';Assert ((Get-ProbeCorrelation $a $b $raw) -eq 'status-transition') 'source rejection transition separated'
 $b.fields=$fields.Clone();$b.fields['reporting.run_id']='different';Assert ((Get-ProbeCorrelation $a $b $raw) -eq 'identity-changed') 'PID/run change'
 $b.fields=$fields.Clone();$b.begin_qpc=2;Assert ((Get-ProbeCorrelation $a $b $raw) -eq 'timing-inconsistent') 'cross-clock/inconsistent bracket'

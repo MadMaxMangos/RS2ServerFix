@@ -15,8 +15,9 @@ pe::Image ReportingImage() {
     image.machine=IMAGE_FILE_MACHINE_AMD64; image.optionalMagic=IMAGE_NT_OPTIONAL_HDR64_MAGIC;
     image.characteristics=IMAGE_FILE_EXECUTABLE_IMAGE|IMAGE_FILE_DLL; image.sizeOfImage=0x4000;
     image.sizeOfHeaders=0x400; image.coffTimestamp=123; image.checksum=456;
-    image.exportFunctionCount=2;
-    image.exports={{"RS2ServerFix_InitializeV3",1,0x1000,{}},{"RS2SteamReport_StatusV2",2,0x2200,{}}};
+    image.exportFunctionCount=3;
+    image.exports={{"RS2ServerFix_InitializeV3",1,0x1000,{}},{"RS2SteamReport_StatusV3",2,0x2200,{}},
+        {"RS2LeechRecovery_StatusV1",3,0x3300,{}}};
     image.sections={{".text",0x1000,0x1000,0,0,IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_EXECUTE},
         {".data",0x2000,0x2000,0,0,IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE}};
     return image;
@@ -33,7 +34,8 @@ struct Fake {
     bool reportingEnabled{}, repeatSnapshot{}, shortStatusPayload{};
     pe::Image reportingImage;
     std::array<std::uint8_t,0x400> reportingHeaders{};
-    reporting::StatusWire status{};
+    reporting::StatusWireV3 status{};
+    reporting::RecoveryStatusWireV1 recovery{};
     std::size_t statusReads{}, payloadReads{};
     std::function<void(Fake&,std::size_t)> afterStatusRead;
     Fake() {
@@ -86,11 +88,14 @@ bool Read(void* opaque, HANDLE handle, std::uintptr_t address, void* output, std
     if (f.reportingEnabled && address>=0x402200 && address-0x402200<sizeof(f.status) &&
         size<=sizeof(f.status)-(address-0x402200)) {
         const auto offset=static_cast<std::size_t>(address-0x402200); ++f.statusReads;
-        if (offset==offsetof(reporting::StatusWire,owner)) ++f.payloadReads;
+        if (offset==offsetof(reporting::StatusWireV3,owner)) ++f.payloadReads;
         std::memcpy(output,reinterpret_cast<const unsigned char*>(&f.status)+offset,size);
-        if (f.shortStatusPayload && offset==offsetof(reporting::StatusWire,owner)) *actual=size-1;
+        if (f.shortStatusPayload && offset==offsetof(reporting::StatusWireV3,owner)) *actual=size-1;
         if (f.afterStatusRead) f.afterStatusRead(f,offset);
-    } else if (f.reportingEnabled && address>=0x400000 && address-0x400000<f.reportingHeaders.size() &&
+    } else if (f.reportingEnabled && address>=0x403300 && address-0x403300<sizeof(f.recovery) &&
+        size<=sizeof(f.recovery)-(address-0x403300))
+        std::memcpy(output,reinterpret_cast<const unsigned char*>(&f.recovery)+(address-0x403300),size);
+    else if (f.reportingEnabled && address>=0x400000 && address-0x400000<f.reportingHeaders.size() &&
         size<=f.reportingHeaders.size()-(address-0x400000))
         std::memcpy(output,f.reportingHeaders.data()+(address-0x400000),size);
     else if (address == 0x100100 && size == f.code.size()) std::memcpy(output, f.code.data(), size);
@@ -187,16 +192,27 @@ struct StatusFixture {
             std::memcpy(process.reportingHeaders.data()+0x80+sizeof(nt)+i*sizeof(section),&section,sizeof(section));
         }
         auto& status=process.status;
-        status.header.magic=reporting::kStatusMagic; status.header.schema=reporting::kStatusSchema;
-        status.header.bytes=sizeof(status); status.header.artifactVersion=reporting::kReportingArtifactVersion;
+        status.header.magic=reporting::kStatusMagic; status.header.schema=reporting::kStatusSchemaV3;
+        status.header.bytes=sizeof(status); status.header.artifactVersion=reporting::kReportingArtifactVersionV3;
         status.header.configuredMode=static_cast<std::uint32_t>(reporting::Mode::Observe);
         status.header.pid=process.identity.processId; status.header.processCreation=process.identity.creationTime;
         status.header.validity=reporting::CompleteHeaderIdentity; status.header.qpcFrequency=frequency;
         status.header.runId[0]=42; std::memcpy(status.header.hostDigest,files.host.data(),files.host.size());
-        status.headerReady=1; status.ownerSequence=2;
+        status.headerReady=1; status.ownerSequence=2; status.workerSequence=2; status.consoleSequence=2;
+        status.ownerTransport.state=static_cast<unsigned>(reporting::TransportState::Running);
+        status.ownerTransport.startupSubmitted=1; status.ownerTransport.qualifiedSinkEpoch=1;
+        status.worker.startupObserved=1; status.logIdentityReady=1;
+        constexpr char16_t logPath[]=u"E:\\logs\\Launch.log";
+        std::memcpy(status.log.path,logPath,sizeof(logPath));
+        status.log.pathChars=std::size(logPath)-1; status.log.transportKind=1;
+        status.log.utcFiletime=1; status.log.calibrationQpcBefore=status.log.calibrationQpcAfter=100;
         status.owner.phase=static_cast<std::uint64_t>(reporting::ReportPhase::Observing);
         status.owner.ownerThreadId=123; status.owner.sourceEpoch=1; status.owner.bindingEpoch=1;
         status.owner.lastOwnerQpc=100000; status.owner.readyQpc=99000; status.owner.builderBound=1;
+        auto& recovery=process.recovery;
+        recovery.schema=1; recovery.bytes=sizeof(recovery); recovery.artifactVersion=reporting::kRecoveryArtifactVersion;
+        recovery.pid=status.header.pid; std::memcpy(recovery.runId,status.header.runId,sizeof(recovery.runId));
+        recovery.headerReady=1; recovery.ownerSequence=2;
         std::string error;
         RS2_CHECK(CaptureStableRuntimeInventory(100,Ops(process),&inventory,&error));
     }
@@ -212,12 +228,50 @@ struct StatusFixture {
 };
 void StatusReaderChecks() {
     using namespace reporting;
+    { StatusFixture f; f.process.status.worker.preparedSequence=1;
+      f.process.recovery.payload.phase=static_cast<unsigned>(RecoveryPhase::Failed);
+      f.process.recovery.payload.reason=static_cast<unsigned>(RecoveryReason::RecordingUnavailable);
+      f.process.recovery.payload.flags=RecoveryTerminal|RecoveryRestartRequired;
+      ReportingStatusObservation result;
+      RS2_CHECK(!f.Read(&result) && result.state==ReportingStatusState::Invalid);
+      RS2_CHECK(result.headerValid && result.identityComplete && result.recoveryResult==RecoverySnapshotResult::Coherent);
+      RS2_CHECK(result.recovery.wire.payload.phase==static_cast<unsigned>(RecoveryPhase::Failed)); }
+    { StatusFixture f; f.process.recovery.ownerSequence=3; ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && result.recoveryResult==RecoverySnapshotResult::Busy); }
+    { StatusFixture f; f.process.recovery.headerReady=0; ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && result.recoveryResult==RecoverySnapshotResult::Unavailable); }
+    { StatusFixture f; ++f.process.recovery.runId[0]; ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && result.recoveryResult==RecoverySnapshotResult::Invalid); }
+    { StatusFixture f; f.process.status.header.artifactVersion=0x00050000; ReportingStatusObservation result;
+      RS2_CHECK(!f.Read(&result) && result.recoveryResult==RecoverySnapshotResult::Invalid && !result.currentReady); }
+    { StatusFixture f; f.process.status.consoleSequence=3; ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && result.currentReady && !result.consoleDiagnosticsAvailable); }
+    { StatusFixture f; f.process.status.workerPauseReason=static_cast<unsigned>(TransportReason::ReaderBehind);
+      ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && result.ownerValid && !result.currentReady && result.state==ReportingStatusState::NotReady); }
+    { StatusFixture f; unsigned workerReads{};
+      f.process.afterStatusRead=[&](Fake& process,std::size_t offset) {
+          if (offset==offsetof(StatusWireV3,workerSequence) && ++workerReads==2)
+              process.status.workerPauseReason=static_cast<unsigned>(TransportReason::ReceiptOverdue);
+      };
+      ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && result.ownerValid && !result.currentReady && result.workerPauseChanged); }
+    { StatusFixture f; f.process.status.logIdentityReady=0; ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && !result.currentReady && !result.logIdentityAvailable); }
+    { StatusFixture f; f.process.status.worker.startupObserved=0; ReportingStatusObservation result;
+      RS2_CHECK(f.Read(&result) && !result.currentReady); }
+    { StatusFixture f; f.process.status.ownerTransport.state=static_cast<unsigned>(TransportState::Paused);
+      ReportingStatusObservation result; RS2_CHECK(f.Read(&result) && !result.currentReady); }
+    { StatusFixture f; f.process.status.worker.preparedSequence=1; ReportingStatusObservation result;
+      RS2_CHECK(!f.Read(&result) && !result.currentReady && result.state==ReportingStatusState::Invalid); }
+    { StatusFixture f; f.process.status.header.schema=2; f.process.status.header.bytes=1288;
+      ReportingStatusObservation result; RS2_CHECK(!f.Read(&result) && !result.currentReady); }
     { StatusFixture f; ReportingStatusObservation result;
       RS2_CHECK(f.inventory.modules.back().reportingStatus.valid);
       RS2_CHECK(f.inventory.modules.back().image.sections.empty() && f.inventory.modules.back().image.exports.empty());
       RS2_CHECK(f.Read(&result) && result.captured && result.currentReady && result.identityComplete);
       RS2_CHECK(result.state==ReportingStatusState::Ready && result.attempts==1 && result.ownerValid);
-      RS2_CHECK(result.ownerSequence==2 && result.header.runId[0]==42 && f.process.payloadReads==1); }
+      RS2_CHECK(result.ownerSequence==2 && result.header.runId[0]==42 && f.process.payloadReads==2); }
     { StatusFixture f; f.process.status.owner.reason=static_cast<std::uint64_t>(Reason::KnownSpin);
       ReportingStatusObservation result; RS2_CHECK(f.Read(&result) && result.currentReady); }
     for (const unsigned change:{0u,1u,2u,3u,4u,5u,6u,7u}) {
@@ -227,7 +281,7 @@ void StatusReaderChecks() {
         if (change==2) ++status.header.hostDigest[0];
         if (change==3) ++status.header.schema;
         if (change==4) status.header.reserved[0]=1;
-        if (change==5) status.header.schema=1; // V1 cannot qualify as V2.
+        if (change==5) status.header.schema=1; // V1 cannot qualify as V3.
         if (change==6) status.header.bytes=1280;
         if (change==7) status.header.artifactVersion=0x00040000;
         ReportingStatusObservation result;
@@ -255,18 +309,18 @@ void StatusReaderChecks() {
       RS2_CHECK(f.Read(&result) && !result.currentReady && !result.ownerValid && result.attempts==3);
       RS2_CHECK(result.state==ReportingStatusState::Busy && f.process.payloadReads==0); }
     { StatusFixture f; f.process.afterStatusRead=[](Fake& process,std::size_t offset) {
-          if (offset==offsetof(StatusWire,owner)) process.status.ownerSequence+=2;
+          if (offset==offsetof(StatusWireV3,owner)) process.status.ownerSequence+=2;
       };
       ReportingStatusObservation result;
       RS2_CHECK(f.Read(&result) && result.state==ReportingStatusState::Busy && result.attempts==3);
-      RS2_CHECK(f.process.payloadReads==3 && !result.currentReady); }
+      RS2_CHECK(f.process.payloadReads==6 && !result.currentReady); }
     { StatusFixture f; f.process.afterStatusRead=[](Fake& process,std::size_t offset) {
-          if (offset==offsetof(StatusWire,owner) && process.payloadReads==1) process.status.ownerSequence+=2;
+          if (offset==offsetof(StatusWireV3,owner) && process.payloadReads==1) process.status.ownerSequence+=2;
       };
       ReportingStatusObservation result;
       RS2_CHECK(f.Read(&result) && result.currentReady && result.attempts==2 && result.ownerSequence==4); }
     { StatusFixture f; f.process.afterStatusRead=[](Fake& process,std::size_t offset) {
-          if (offset==offsetof(StatusWire,lossReasons)) process.status.lossReasons=1;
+          if (offset==offsetof(StatusWireV3,lossReasons)) process.status.lossReasons=1;
       };
       ReportingStatusObservation result;
       RS2_CHECK(f.Read(&result) && !result.currentReady && result.lossReasons==1);
@@ -292,7 +346,7 @@ void StatusReaderChecks() {
     for (unsigned change=0;change<5;++change) {
         StatusFixture f;
         f.process.afterStatusRead=[&](Fake& process,std::size_t offset) {
-            if (offset!=offsetof(StatusWire,owner)) return;
+            if (offset!=offsetof(StatusWireV3,owner)) return;
             if (change==0) ++process.identity.creationTime;
             if (change==1) f.files.changedIdentity=true;
             if (change==2) f.files.badHash=true;
@@ -308,32 +362,33 @@ void StatusReaderChecks() {
       };
       ReportingStatusObservation result; std::string error;
       RS2_CHECK(!f.Read(&result,&error) && !result.currentReady);
-      RS2_CHECK(error=="reporting-status-header-changed-after-qualification"); }
+      RS2_CHECK(error=="reporting-status-independent-identity-changed"); }
     { StatusFixture f; f.process.shortRead=true; ReportingStatusObservation result;
       RS2_CHECK(!f.Read(&result) && !result.currentReady); }
     { StatusFixture f; f.process.shortStatusPayload=true; ReportingStatusObservation result;
       RS2_CHECK(!f.Read(&result) && !result.currentReady && !result.ownerValid); }
     { StatusFixture f; f.process.afterStatusRead=[](Fake& process,std::size_t offset) {
-          if (offset==offsetof(StatusWire,owner)) process.status.ownerSequence=0;
+          if (offset==offsetof(StatusWireV3,owner)) process.status.ownerSequence=0;
       };
       ReportingStatusObservation result; std::string error;
-      RS2_CHECK(!f.Read(&result,&error) && error=="reporting-status-sequence-decreased"); }
+      RS2_CHECK(!f.Read(&result,&error) && error=="reporting-status-v3-schema-or-publication-invalid"); }
     { StatusFixture f; unsigned readyReads{};
       f.process.afterStatusRead=[&](Fake& process,std::size_t offset) {
-          if (offset==offsetof(StatusWire,headerReady) && ++readyReads==3) process.status.lossReasons=4;
+          if (offset==offsetof(StatusWireV3,headerReady) && ++readyReads==3) process.status.lossReasons=4;
       };
       ReportingStatusObservation result;
       RS2_CHECK(f.Read(&result) && !result.currentReady && result.lossReasons==4 && result.state==ReportingStatusState::Revoked); }
     { StatusFixture f; f.clockChanges=true; ReportingStatusObservation result;
       RS2_CHECK(!f.Read(&result) && !result.currentReady); }
-    for (unsigned change=0;change<6;++change) {
+    for (unsigned change=0;change<7;++change) {
         StatusFixture f([&](pe::Image& image) {
             if (change==0) image.exports[1].ordinal=3;
             if (change==1) image.exports[1].forwarder="other.module";
             if (change==2) image.exports[1].rva=0x2201;
             if (change==3) image.sections[1].characteristics|=IMAGE_SCN_MEM_EXECUTE;
-            if (change==4) image.exports.pop_back();
+            if (change==4) image.exports.erase(image.exports.begin()+1);
             if (change==5) image.exports[1].name="RS2SteamReport_StatusV1";
+            if (change==6) image.exports[1].name="RS2SteamReport_StatusV2";
         });
         ReportingStatusObservation result;
         RS2_CHECK(!f.inventory.modules.back().reportingStatus.valid && !f.Read(&result));
@@ -497,6 +552,27 @@ void RunRuntimeInventoryTests() {
     RS2_CHECK(report.bytes.find("private-account") == report.bytes.npos && report.bytes.find("vendor-secret") == report.bytes.npos);
     RS2_CHECK(report.bytes.find("<OTHER>/plugin.dll#full_path_sha256=") != report.bytes.npos);
     RS2_CHECK(report.bytes.find("process_creation_filetime=1000000\r\n") != report.bytes.npos);
+    inputs.reportingCompanion=true;
+    result.reporting.recoveryResult=reporting::RecoverySnapshotResult::Coherent;
+    auto& recovery=result.reporting.recovery.wire;
+    recovery.schema=1; recovery.bytes=256; recovery.artifactVersion=0x00060200; recovery.pid=inputs.processId;
+    recovery.runId[0]=42; recovery.headerReady=1; recovery.ownerSequence=2;
+    recovery.payload.oldSdkFingerprint=UINT64_MAX;
+    report.bytes.clear();
+    RS2_CHECK(WriteRuntimeInventoryReport(inventory, inputs, result, reportOps, &error));
+    std::size_t recoveryKeys{};
+    for (std::size_t cursor=0;(cursor=report.bytes.find("recovery.",cursor))!=std::string::npos;++cursor)
+        if (!cursor || report.bytes[cursor-1]=='\n') ++recoveryKeys;
+    RS2_CHECK(recoveryKeys==34 && report.bytes.find("recovery.old_sdk_fingerprint=18446744073709551615\r\n")!=std::string::npos);
+    for (auto state:{reporting::RecoverySnapshotResult::Busy,reporting::RecoverySnapshotResult::Unavailable,
+        reporting::RecoverySnapshotResult::Invalid,reporting::RecoverySnapshotResult::ReadFailure}) {
+        result.reporting.recoveryResult=state; report.bytes.clear();
+        RS2_CHECK(WriteRuntimeInventoryReport(inventory, inputs, result, reportOps, &error));
+        const auto key=report.bytes.find("recovery.");
+        RS2_CHECK(key!=std::string::npos && report.bytes.find("recovery.",key+1)==std::string::npos);
+        RS2_CHECK(report.bytes.find(std::string("recovery.snapshot_result=")+reporting::RecoverySnapshotResultName(state)+"\r\n")!=std::string::npos);
+    }
+    inputs.reportingCompanion=false;
     report.shortWrite = true;
     RS2_CHECK(!WriteRuntimeInventoryReport(inventory, inputs, result, reportOps, &error)); RS2_CHECK(report.removed);
     inputs.reportPath = reportRoot + L"\\bad-report.txt";
