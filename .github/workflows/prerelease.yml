@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     if: github.ref == 'refs/heads/main'
-    runs-on: windows-2025
+    runs-on: windows-2025-vs2026
     defaults:
       run:
         shell: pwsh
@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
       - name: Configure read-only recovery probe
         run: |
-          cmake -S . -B build-ci -G "Visual Studio 17 2022" -A x64 -DRS2_RECOVERY_GUARD_PROBE=ON
+          cmake -S . -B build-ci -G "Visual Studio 18 2026" -A x64 -DRS2_RECOVERY_GUARD_PROBE=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       - name: Build DLLs, tools and independent tests
         run: |
