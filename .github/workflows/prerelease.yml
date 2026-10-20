@@ -28,7 +28,13 @@ jobs:
           cmake --build build-ci --config Release --parallel 4 --target rs2_x3daudio_bootstrap rs2_server_fix_companion_active rs2_server_fix_companion_reporting rs2_pe_contract rs2_runtime_inventory rs2_deployment_preflight rs2_recon_tests rs2_observer_tests
           if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
       - name: Run public CI checks
+        shell: powershell
         run: |
+          # CTest starts powershell.exe fixtures. Do not inherit PowerShell 7's
+          # module search paths, which can hide the Windows Security cmdlets.
+          $env:PSModulePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
+          Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+          Get-Command Get-FileHash, Set-Acl -ErrorAction Stop | Out-Null
           ctest --test-dir build-ci -C Release -R '^(pe_bootstrap_contract|pe_active_companion_contract|pe_reporting_companion_contract|recon_transaction|observer_core|reporting_collector|recovery_control_helper)$' --no-tests=error --output-on-failure
           if ($LASTEXITCODE -ne 0) { throw 'Public CI checks failed' }
       - name: Package recon and guard-probe separately
