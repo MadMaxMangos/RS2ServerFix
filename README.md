@@ -66,7 +66,8 @@ recognized by the inventory tools without being supported by the recon fix.
 The full-dump executable modification is separate; these DLLs do not create it,
 and proprietary game executables or SDK DLLs are not distributed here.
 
-For a first deployment:
+For a first recon-only deployment (experimental variants require their own
+matched configuration and separately authorized trial):
 
 1. Verify the executable and DLL package identities. Preserve the current files
    and use a test server or a planned maintenance window.
@@ -88,6 +89,35 @@ test package, including its metadata and built utilities. A source checkout alon
 is not that package.
 
 ## Building from source
+
+### Automatic prerelease downloads
+
+Every push to `main` runs the [Windows build workflow](.github/workflows/prerelease.yml).
+After its seven public CI checks pass, it publishes two separate ZIPs under
+[Releases](https://github.com/MadMaxMangos/RS2ServerFix/releases): recon-only and
+the experimental read-only guard probe. Manual workflow runs on `main` are also
+supported. Each release is a prerelease, never the stable/latest release, and is
+bound to its source commit and workflow run. No server is deployed or restarted.
+
+Each ZIP contains this project's DLLs, matching tools/configuration, instructions,
+license and file checksums. The release has a separate ZIP checksum list. Versions
+can repeat across commits: identify a build by commit and hashes, not version alone.
+These DLLs are not Authenticode signed. The guard-probe config observes reporting
+and disables manual recovery; the native-enabled recovery variant is not published.
+Game/Steam DLLs, proprietary EXEs, private evidence and performance calibration are
+excluded. Preserve the qualified game/Steam files already on your server.
+
+Public CI runs recon transactions, observer fixtures, collector/helper tests and
+the three published DLL PE contracts. It does not run `reporting_core` or the full
+production-byte qualification suite because those require preserved proprietary
+inputs. Successful CI is not runtime approval, a production-qualified trial kit,
+or proof of browser-count repair. Keep the extracted guard-probe kit and collected
+reports outside the server tree; its collector requires the intact package manifest
+and matching utilities. Use only under a separately approved test procedure.
+Use `Run-SteamReport.cmd` for kit collection. The legacy CountProbe files remain
+only for manifest compatibility and are not supported in place in these ZIPs.
+
+### Local builds
 
 Requirements: Windows x64, an AMD64 MSVC C++ toolchain with the Windows SDK and
 MASM, CMake 3.24 or newer, and Ninja for the commands below.
@@ -240,6 +270,8 @@ explicit configuration and an authenticated manual request. Both variants retain
 FileVersion 0.6.2.0; distinguish them by their build setting and artifact hashes.
 Use tools and configuration from the same verified trial package. A local rebuild
 does not reproduce the kit's artifact hashes or inherit its package qualification.
+The guard probe is the next trial candidate. Native-enabled recovery remains held
+pending separate qualification and operator authorization.
 
 The probe's reason 63 / Inconclusive records snapshot and pre-submit admission
 only; a timeout without that result does not prove admission. A native-enabled
@@ -281,8 +313,9 @@ qualification. Referenced raw evidence and other private notes are not published
 ## Reporting problems and contributing
 
 [Open an issue](https://github.com/MadMaxMangos/RS2ServerFix/issues) with the project
-version, Windows version, executable SHA-256, passive/active mode and relevant
-loader status. Include reproduction steps and whether removing the package
+version, build variant and DLL SHA-256, Windows version, executable SHA-256,
+relevant INI modes and loader/reporting/recovery status. Include reproduction
+steps and whether removing the package
 restores the previous behaviour.
 
 Do not post full memory dumps, authentication material, unredacted player data
