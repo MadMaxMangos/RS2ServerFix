@@ -271,6 +271,13 @@ does not establish gameplay, Steam backend or anti-cheat compatibility on a live
 server. See [the retained profile evidence](tests/evidence/README.md) for the
 scope of the static checks.
 
+## Investigation reference
+
+The [9 October failure catalogue](reference/leech-reference-2026-10-09/FAILURE-CATALOGUE.md)
+and its five directly named Markdown documents preserve the bounded Leech/ADF
+findings. They are historical analysis, not implemented fixes or current release
+qualification. Referenced raw evidence and other private notes are not published.
+
 ## Reporting problems and contributing
 
 [Open an issue](https://github.com/MadMaxMangos/RS2ServerFix/issues) with the project
