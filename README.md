@@ -19,8 +19,10 @@ controlled training-server trials. It retains the 0.4.2 admission correction for
 negative-spectator and over-capacity human accounting drift without replacing
 the game's native advertised counts or changing authentication. Bot/capacity,
 memory and lifecycle safeguards remain in force. The default configuration observes reporting
-and disables manual recovery. Live native recovery and Steam-outage browser-count
-repair remain unproven; this is not a generally qualified production release.
+and disables manual recovery. A controlled two-player healthy-server trial has
+completed native Leech session recreation and subsequent browser-count convergence
+without player reconnects. Recovery after an actual Steam outage remains unproven;
+this is not a generally qualified production release.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
   exact executable hash, expected instruction bytes and startup checks.
@@ -231,6 +233,18 @@ included in this repository.
 
 ### Manual Leech recovery and the read-only guard probe
 
+Leech is the game's native backend integration, distinct from Steam's query
+responder. The in-game browser can replace Steam query counts with values from a
+Leech backend record. Correct WebAdmin or Steam query counts therefore do not,
+by themselves, establish a correct in-game browser count.
+
+Manual Leech recovery uses a different mechanism from reporting `mode=repair`:
+it submits a Finish for the old standalone server session, waits for a matched
+successful response, then follows the native cleanup/Start/Create path. It checks
+for a different session ID, publication into the game's session cache, and a fresh
+heartbeat binding. It does not restart the server, disconnect players, reset
+Steam authentication, or implement an automatic Tuesday-outage recovery loop.
+
 The 0.6.2.0 r5 source corrects four native guard contracts: the cached session ID
 is a narrow `std::string`; a stable core GUID supplies lifetime identity while
 authorization tokens may rotate; valid retained Finish slots can be reused by
@@ -270,8 +284,27 @@ explicit configuration and an authenticated manual request. Both variants retain
 FileVersion 0.6.2.0; distinguish them by their build setting and artifact hashes.
 Use tools and configuration from the same verified trial package. A local rebuild
 does not reproduce the kit's artifact hashes or inherit its package qualification.
-The guard probe is the next trial candidate. Native-enabled recovery remains held
-pending separate qualification and operator authorization.
+Public prereleases remain recon-only or read-only guard-probe variants.
+Native-enabled recovery is restricted to separately authorized training trials,
+not populated public-server deployment.
+
+#### Controlled healthy-server result (22 October 2026)
+
+One native-enabled r5 trial completed the Finish/Create/publication/rebind sequence
+in approximately **1.31 seconds**. Two Steam players remained connected and
+stationary, without rejoining or changing maps; WebAdmin continued to show two.
+The operator observed the in-game browser change from zero to one, then back to
+two players after a catch-up delay estimated at about a minute. Exact end-to-end
+browser latency was not measured. Backend propagation, player reassociation and
+browser caching have not been separated as causes of that delay.
+
+This demonstrates native session replacement and eventual browser convergence on
+a healthy training server, **not recovery from a real Steam outage**. The local
+terminal outcome `PublishedNotDelivered` is not a backend delivery receipt or
+proof of client session adoption. Repeated post-recreation `PreparedMismatch`
+diagnostics remain under investigation; they must not be dismissed simply because
+the displayed count eventually became correct. The trial does not establish
+full-server performance, automatic recovery or production qualification.
 
 The probe's reason 63 / Inconclusive records snapshot and pre-submit admission
 only; a timeout without that result does not prove admission. A native-enabled
