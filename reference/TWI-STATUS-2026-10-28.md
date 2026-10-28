@@ -45,7 +45,7 @@ The manual recovery path submits Finish for the existing standalone server sessi
 
 Its purpose is to replace stale standalone-session state while preserving connected players. It does not reset Steam authentication or manufacture a player count. This is different from the earlier reporting `mode=repair`, which requests fresh native advertisement data.
 
-In the separately prepared **0.7.x operator trial kits**, recovery ships disabled. Once explicitly configured, an operator can request it through authenticated PowerShell or the opted-in WebAdmin command below. These WebAdmin commands are not present in the older published 0.6.2 source:
+In the **0.7.1.0 source and separately prepared operator trial kits**, recovery ships disabled. Once explicitly configured, an operator can request it through authenticated PowerShell or the opted-in WebAdmin command below. Both command routes share the same request claim and native recovery opportunity:
 
 ```text
 rs2leech status
@@ -66,7 +66,9 @@ The latest trial ended with reason 65, `metadata-timeout`, approximately **30 se
 
 A later builder diagnostic observed a valid local prepared snapshot with 32 members and no prepared-state mismatch about **31.6 seconds after publication**. The first recorded normal builder after publication occurred at about 30.17 seconds, just after the local deadline, and still showed the members-only mismatch with zero prepared members. The native interval is 30 seconds. The deadline/cadence relationship is now a concrete follow-up; these local observations do not establish backend count projection or client adoption.
 
-**Remaining work:** reconcile the follow-up deadline with native rebuild cadence and remaining local readiness conditions; establish client adoption and backend membership/count behavior during an actual outage; then assess wider deployment and any automatic triggering.
+The reviewed r3 correction increases the local metadata window to **45 seconds**, bounded by the unchanged **120-second overall attempt deadline** and its margin. It preserves existing readiness gates and does not add native retries. This corrects the demonstrated early deadline; its own bot-inclusive runtime trial is still pending.
+
+**Remaining work:** test the corrected window and remaining local readiness conditions; establish client adoption and backend membership/count behavior during an actual outage; then assess wider deployment and any automatic triggering.
 
 ## 3. Diagnosed, not fixed: ADF analytics packing crash
 
@@ -127,7 +129,7 @@ SHA-256: 0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393
 
 The DLL changes memory in the running process; the executable's on-disk contents and ordinary launch command remain unchanged. Other builds require separate qualification. These trial observations do not include a matching clean-stock control.
 
-The 0.7.x versions above refer to separately prepared operator trial kits. This document does not promote those source snapshots or publish a native-recovery binary release. The repository's existing build/release instructions describe its published variants. Pushing this documentation also triggers the existing CI workflow to build and publish new recon-only/read-only-probe prereleases; that workflow does not publish the native-enabled recovery kit.
+The repository now includes the reviewed **0.7.1.0 r3** source, including the 45-second local metadata window. The operator trial kits remain separately checksum-bound artifacts; a public rebuild does not inherit their exact hashes or runtime evidence. The existing CI workflow continues to publish only recon-only/read-only-probe prereleases. It does not publish a native-enabled recovery kit or deploy a server.
 
 - [Project and published-source scope](../README.md)
 - [Recon patch profile](../src/companion/recon_profile.h)

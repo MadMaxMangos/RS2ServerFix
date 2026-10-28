@@ -555,7 +555,7 @@ void RunRuntimeInventoryTests() {
     inputs.reportingCompanion=true;
     result.reporting.recoveryResult=reporting::RecoverySnapshotResult::Coherent;
     auto& recovery=result.reporting.recovery.wire;
-    recovery.schema=1; recovery.bytes=256; recovery.artifactVersion=0x00060200; recovery.pid=inputs.processId;
+    recovery.schema=1; recovery.bytes=256; recovery.artifactVersion=0x00070100; recovery.pid=inputs.processId;
     recovery.runId[0]=42; recovery.headerReady=1; recovery.ownerSequence=2;
     recovery.payload.oldSdkFingerprint=UINT64_MAX;
     report.bytes.clear();

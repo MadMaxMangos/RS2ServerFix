@@ -177,9 +177,11 @@ private:
 const PreparedLayout& ProductionPreparedLayout() noexcept { return kProductionLayout; }
 
 Reason ReadPreparedState(const PreparedReadContext& context, const NativeCounts& expected,
-    char* scratch, std::size_t scratchCapacity, PreparedSnapshot* output) noexcept {
+    char* scratch, std::size_t scratchCapacity, PreparedSnapshot* output,
+    PreparedDiagnostic* diagnostic) noexcept {
     const Scrubber scrub{scratch, scratchCapacity < kJsonBytes ? scratchCapacity : kJsonBytes};
     if (output) *output = {};
+    if (diagnostic) *diagnostic = {};
     if (!scratch || !output) return Reason::PreparedUnavailable;
     if (scratchCapacity != kJsonBytes) return Reason::PreparedLimit;
     if (!context.memory.query || !context.memory.read || !context.hostBase || !context.hostImageSize ||
@@ -200,11 +202,10 @@ Reason ReadPreparedState(const PreparedReadContext& context, const NativeCounts&
     Headers before{}, after{};
     auto reason = reader.ReadHeaders(before);
     if (reason != Reason::None) return reason;
-    bool mismatch = before.maximum != expected.maximum || before.membersCount != expected.pi;
     if (!reader.Copy(before.gameMode, scratch)) return Reason::PreparedUnavailable;
-    reason = ValidatePreparedJson(scratch, static_cast<std::size_t>(before.gameMode.length), expected);
-    if (reason != Reason::None && reason != Reason::PreparedMismatch) return reason;
-    mismatch = mismatch || reason == Reason::PreparedMismatch;
+    NativeCounts json{};
+    reason = ReadPreparedJsonCounts(scratch, static_cast<std::size_t>(before.gameMode.length), &json);
+    if (reason != Reason::None) return reason;
     scope.Reset(); // The second live-header/protection observation gets no first-pass query answers.
     sections.Reset();
     reason = reader.ReadHeaders(after);
@@ -212,6 +213,14 @@ Reason ReadPreparedState(const PreparedReadContext& context, const NativeCounts&
     // Observe may accept stable, structurally valid stale numbers. It must not
     // confuse an unparsed JSON body or a changing header/lifetime with that case.
     if (!SameHeaders(before, after)) return Reason::PreparedUnavailable;
+    const std::uint32_t mismatch =
+        (before.maximum != expected.maximum ? PreparedMaximumDiffers : 0U) |
+        (before.membersCount != expected.pi ? PreparedMembersDiffer : 0U) |
+        (json.pi != expected.pi ? PreparedPiDiffers : 0U) |
+        (json.bots != expected.bots ? PreparedBotsDiffer : 0U) |
+        (json.maximum != expected.maximum ? PreparedJsonMaximumDiffers : 0U);
+    if (diagnostic) *diagnostic = {json, before.maximum, before.membersCount,
+        static_cast<std::uint32_t>(before.gameMode.length), mismatch, true};
     if (mismatch) return Reason::PreparedMismatch;
     output->counts = expected;
     output->membersCount = before.membersCount;

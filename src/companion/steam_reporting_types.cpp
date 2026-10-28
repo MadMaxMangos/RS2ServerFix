@@ -13,6 +13,7 @@ const char* DiagnosticsName(Diagnostics diagnostics) noexcept {
     switch (diagnostics) {
     case Diagnostics::Normal: return "normal";
     case Diagnostics::Detailed: return "detailed";
+    case Diagnostics::Operational: return "operational";
     default: return "invalid";
     }
 }

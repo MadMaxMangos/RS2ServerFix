@@ -477,15 +477,24 @@ function Read-ReportRecoveryPayload($Fields,[string]$Prefix) {
         if(!$Fields.ContainsKey($key)){throw "Missing recovery field: $key."}
         $p[$name]=Get-ReportUInt $Fields[$key] -RawBits:($name -cin $script:RecoveryFingerprints)
     }
-    foreach($domain in @(@('phase',11),@('event',4),@('reason',64),@('outcome',10),@('resource_phase',5),@('native_stage',17),@('callback_result',6))) {
+    foreach($domain in @(@('phase',11),@('event',4),@('reason',83),@('outcome',10),@('resource_phase',5),@('native_stage',22),@('callback_result',6))) {
         if($p[$domain[0]] -ge $domain[1]){throw 'Invalid recovery domain.'}
     }
     $flags=$p.flags
-    if(($flags -band 0x7fff) -ne $flags -or
+    if($flags -band 0x200000) {
+        if($p.phase -ne 10 -or $p.outcome -notin 1,4 -or !$p.operation_sequence -or ($flags -band 0x300201) -ne $flags -or
+            ($flags -band 513) -ne 513 -or $p.native_stage -or $p.resource_phase -or $p.exception_code -or
+            $p.request_id -or $p.callback_id -or $p.callback_result -or $p.api_returned_id) {throw 'Invalid retryable preflight payload.'}
+    }
+    if(($flags -band 0x3fffff) -ne $flags -or
         (($flags -band 16384) -and !($flags -band 2048)) -or
         (!($flags -band 16384) -and $p.callback_own_ticks) -or
         (($flags -band 8192) -and !($flags -band 4096)) -or
         (($flags -band 4096) -and !($flags -band 2048))){throw 'Invalid recovery flags/timing.'}
+    if((($flags -band 0xf0000) -and !($flags -band 0x8000)) -or
+        (($flags -band 0x20000) -and ($flags -band 0x40000)) -or
+        (($flags -band 0x80000) -and !($flags -band 0x10000)) -or
+        (($flags -band 0x100000) -and !$p.operation_sequence)){throw 'Invalid metadata/origin flags.'}
     foreach($name in @('owner_thread_id','exception_code','request_id','callback_id','api_returned_id')) {
         if($p[$name] -gt [uint32]::MaxValue){throw 'Invalid recovery scalar width.'}
     }
@@ -511,9 +520,9 @@ function Assert-ReportRecoveryFields($Fields) {
     if($keys.Count -ne $expected.Count){throw 'Unexpected recovery inventory key set.'}
     foreach($key in $expected){if(!$Fields.ContainsKey($key)){throw "Missing recovery inventory key: $key."}}
     if(!$coherent){return $null}
-    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='393728';
+    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459008';
         'recovery.header_ready'='1';'recovery.pid'=$Fields['pid'];'recovery.run_id'=$Fields['reporting.run_id'];
-        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';'reporting.header_valid'='true';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';'reporting.header_valid'='true';
         'reporting.identity_complete'='true';'reporting.header_validity'='31';'reporting.pid'=$Fields['pid']}
     if($Fields['recovery.run_id'] -cnotmatch '^[0-9a-f]{32}$' -or $Fields['recovery.run_id'] -ceq ('0'*32)) {throw 'Invalid recovery run identity.'}
     $ownerSequence=Get-ReportScalar $Fields 'recovery.owner_sequence'
@@ -526,7 +535,11 @@ function Assert-ReportRecoveryFields($Fields) {
 
 function Test-ReportRecoveryActive($Snapshot) {
     $f=$Snapshot.fields;$p=Assert-ReportRecoveryFields $f
-    if($null -eq $p -or $p.phase -notin 2,3,4,5,6,7 -or !$p.operation_sequence -or $p.reason -or $p.outcome -or
+    # Publication can briefly precede the new heartbeat binding. Only these
+    # documented phase-7 deferrals retain the existing readiness waiver; faults
+    # and terminal metadata outcomes must still end the training window.
+    $metadataWait=$null -ne $p -and $p.phase -eq 7 -and $p.reason -in 64,66 -and ($p.flags -band 32768)
+    if($null -eq $p -or $p.phase -notin 2,3,4,5,6,7 -or !$p.operation_sequence -or ($p.reason -and !$metadataWait) -or $p.outcome -or
         !($p.flags -band 1) -or ($p.flags -band (512+4+256))){return $false}
     $expected=@{'reporting.state'='not-ready';'reporting.current_ready'='false';'reporting.captured'='true';
         'reporting.owner_valid'='true';'reporting.phase'='3';'reporting.reason'='0';'reporting.builderBound'='0';
@@ -573,6 +586,9 @@ function Read-ReportConfiguration([string]$Text, [bool]$Reporting) {
     }
     if ($Reporting) {
         Assert-ReportFields $values @{ schema='3' }
+        if ($values.ContainsKey('diagnostics') -and $values['diagnostics'] -ceq 'operational') {
+            throw 'Operational logs are compact status, not qualification evidence. Restart with normal or detailed diagnostics for a qualification capture.'
+        }
         if ($values.Count -ne 3 -or !$values.ContainsKey('mode') -or $values['mode'] -cnotin @('disabled','observe','repair') -or
             !$values.ContainsKey('diagnostics') -or $values['diagnostics'] -cnotin @('normal','detailed')) { throw 'Unsupported reporting configuration.' }
         return @{ mode=$values['mode']; diagnostics=$values['diagnostics'] }
@@ -608,7 +624,7 @@ function Invoke-ReportInventory([string]$Package, $Files, [string]$ServerRoot, [
 
 function Test-ReportReady($Snapshot) {
     $f = $Snapshot.fields
-    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';
+    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';
         'reporting.log_identity_available'='true';'reporting.transport.state'='1';'reporting.transport.reason'='0';
         'reporting.transport.startupSubmitted'='1';'reporting.worker.startupObserved'='1';'reporting.worker_pause_reason'='0';
         'reporting.worker_pause_changed'='false';'reporting.fatal_transport_reason'='0'}
@@ -633,7 +649,7 @@ function Assert-ReportSnapshot($Snapshot, $First) {
     }
     Assert-ReportFields $f @{ host_sha256=$script:ReportHostHash; sdk_sha256=$script:ReportSdkHash;
         steamclient_sha256=$script:ReportClientHash; 'reporting.schema'='3'; 'reporting.bytes'='3896';
-        'reporting.artifact_version'='393728'; 'reporting.header_validity'='31';
+        'reporting.artifact_version'='459008'; 'reporting.header_validity'='31';
         'reporting.pid'=$f['pid'];'reporting.process_creation'=$f['process_creation_filetime'];
         observed_bootstrap_sha256=$f['bootstrap_sha256'];observed_companion_sha256=$f['companion_sha256'];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -700,6 +716,9 @@ function Assert-NativeDerivedUtc($Record,$Startup) {
         $expected -ne (Get-ReportScalar $Record 'utc_derived_filetime')) { throw 'Derived UTC contradicts source QPC/calibration.' }
 }
 function Assert-NativeReportStartup($Record,$Identity) {
+    if ($Record.ContainsKey('diagnostics') -and $Record['diagnostics'] -ceq 'operational') {
+        throw 'Operational logs are compact status, not qualification evidence; retain the raw log without a timing or coverage verdict.'
+    }
     $strings=@('type','artifact','version','run_id','mode','diagnostics','host_sha256','qualified_steam_api_sha256',
         'qualified_steamclient_sha256','transport','durability','utc_kind','file_id','log_path')
     $numbers=@('schema','artifact_version','pid','sequence','qpc','utc_derived_filetime','process_start_filetime','qpc_frequency',
@@ -708,11 +727,21 @@ function Assert-NativeReportStartup($Record,$Identity) {
         'ring_capacity','batch_limit','ledger_capacity','ready_capacity','message_limit','native_service_hz',
         'native_frames_per_opportunity','native_frames_per_second','request_floor_seconds')
     $booleans=@('authentication_changed','native_counting_preserved','termination_may_lose_tail')
+    if ($Record.ContainsKey('prepared_counts_schema')) {
+        $numbers+=@('prepared_counts_schema')
+        if ((Get-ReportScalar $Record 'prepared_counts_schema') -ne 1) { throw 'Unknown prepared-count log schema.' }
+    }
+    foreach($key in @('prepared_dirty_schema','recovery_origin_schema')) {
+        if ($Record.ContainsKey($key)) {
+            $numbers+=@($key)
+            if ((Get-ReportScalar $Record $key) -ne 1) { throw 'Unknown recovery diagnostic log schema.' }
+        }
+    }
     Assert-ReportShape $Record ($strings+$numbers+$booleans+@('startup'))
     foreach($key in $strings){if($Record[$key] -isnot [string]){throw 'Startup string field has wrong type.'}}
     foreach($key in $numbers){if($Record[$key] -isnot [uint64]){throw 'Startup scalar field has wrong type.'}}
     foreach($key in $booleans){if($Record[$key] -isnot [bool]){throw 'Startup boolean field has wrong type.'}}
-    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.6.2.0';artifact_version='393728';
+    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.7.1.0';artifact_version='459008';
         sequence='0';run_id=$Identity['reporting.run_id'];pid=$Identity['pid'];process_start_filetime=$Identity['process_creation_filetime'];
         qpc_frequency=$Identity['reporting.qpc_frequency'];configured_mode=$Identity['reporting.mode'];header_validity='31';
         transport='native';durability='unknown';utc_kind='derived';record_bytes='256';ring_capacity='256';batch_limit='32';
@@ -740,6 +769,43 @@ function Assert-NativeReportStartup($Record,$Identity) {
     foreach($key in $keys){if($startup[$key] -isnot [uint64]){throw 'Invalid startup-result scalar.'}}
     foreach($key in @('recon_qualified','marker_complete','startup_accepted')){if($startup[$key] -gt 1){throw 'Invalid startup-result boolean.'}}
     Assert-NativeDerivedUtc $Record $Record
+}
+
+function Get-ReportPreparedKeys($Record) {
+    # Optional, closed numeric group: retain old archives without admitting
+    # arbitrary extra fields or treating unavailable data as a real zero.
+    if (!$Record.ContainsKey('prepared_valid')) { return }
+    $valid=Get-ReportScalar $Record 'prepared_valid'
+    if ($valid -gt 1) { throw 'Invalid prepared-count validity.' }
+    $keys=@('prepared_valid')
+    if ($valid -eq 1) {
+        $keys+=@('prepared_mismatch_mask','prepared_maximum','prepared_members','prepared_pi',
+            'prepared_bots','prepared_json_maximum','prepared_json_bytes')
+        foreach ($key in $keys) {
+            if ((Get-ReportScalar $Record $key) -gt [uint32]::MaxValue) { throw 'Invalid prepared-count width.' }
+        }
+        if ($Record['prepared_members'] -gt 4096 -or $Record['prepared_json_bytes'] -lt 1 -or
+            $Record['prepared_json_bytes'] -gt 65536) { throw 'Invalid prepared-count bounds.' }
+        $mask=0
+        foreach ($pair in @(@('prepared_maximum','maximum',1),@('prepared_members','pi',2),
+            @('prepared_pi','pi',4),@('prepared_bots','bots',8),@('prepared_json_maximum','maximum',16))) {
+            if ($Record[$pair[0]] -ne $Record[$pair[1]]) { $mask=$mask -bor $pair[2] }
+        }
+        if ($Record['prepared_mismatch_mask'] -ne $mask) { throw 'Prepared mismatch mask disagrees with counts.' }
+    }
+    return $keys
+}
+
+function Get-ReportPreparedDirtyKeys($Record) {
+    if (!$Record.ContainsKey('prepared_dirty_valid')) { return }
+    $valid=Get-ReportScalar $Record 'prepared_dirty_valid'
+    if ($valid -gt 1) { throw 'Invalid prepared-dirty validity.' }
+    $keys=@('prepared_dirty_valid')
+    if ($valid -eq 1) {
+        $keys+=@('prepared_dirty_at_entry')
+        if ((Get-ReportScalar $Record 'prepared_dirty_at_entry') -gt 1) { throw 'Invalid prepared-dirty bit.' }
+    }
+    return $keys
 }
 
 function Read-ReportLog([string]$Path, $Identity, [string]$NativeLogPath, [uint64]$RawByteLimit, [uint64]$StartQpc, [uint64]$EndQpc, $Snapshots=@(),[switch]$TrainingRecoveryMode) {
@@ -807,6 +873,17 @@ function Read-ReportLog([string]$Path, $Identity, [string]$NativeLogPath, [uint6
         if($kind -eq 10 -and !$TrainingRecoveryMode){throw 'recovery-collection-mode-required'}
         if ($kind -lt 1 -or $kind -gt 10 -or $r['type'] -cne $types[$kind]) { throw 'Unknown reporting record kind.' }
         $extra = switch ($kind) { 1 { $stateKeys }; { $_ -in 2,3 } { $requestKeys }; { $_ -in 4,5,6 } { $buildKeys }; 7 { $anchorKeys }; 8 { $summaryKeys }; 9 { $controlKeys }; 10 { $recoveryKeys } }
+        if ($kind -in 4,5,6) {
+            if ($r.ContainsKey('prepared_valid') -ne $startup.ContainsKey('prepared_counts_schema')) {
+                throw 'Prepared diagnostic disagrees with declared log schema.'
+            }
+            $extra+=@(Get-ReportPreparedKeys $r)
+            if ($r.ContainsKey('prepared_dirty_valid') -ne $startup.ContainsKey('prepared_dirty_schema')) {
+                throw 'Prepared dirty diagnostic disagrees with declared log schema.'
+            }
+            $extra+=@(Get-ReportPreparedDirtyKeys $r)
+        }
+        if ($kind -eq 10 -and $startup.ContainsKey('recovery_origin_schema')) { $extra+=@('recovery_request_origin') }
         Assert-ReportShape $r ($common + $extra)
         Assert-ReportFields $r @{ schema='3'; run_id=$Identity['reporting.run_id']; pid=$Identity['pid'];thread_id=$Identity['reporting.ownerThreadId'];flags='0' }
         foreach ($key in $r.Keys) { if ($key -cnotin @('type','run_id','durations') -and $r[$key] -isnot [uint64]) { throw 'Record numeric field has wrong JSON type.' } }
@@ -817,6 +894,10 @@ function Read-ReportLog([string]$Path, $Identity, [string]$NativeLogPath, [uint6
         if($kind -eq 10) {
             if($r['reason'] -ne 0){throw 'Recovery header reason must be None.'}
             $recoveryPayload=Read-ReportRecoveryPayload $r 'recovery_'
+            if ($startup.ContainsKey('recovery_origin_schema')) {
+                $origin=if (!$recoveryPayload.operation_sequence) { 0 } elseif ($recoveryPayload.flags -band 0x100000) { 2 } else { 1 }
+                if ((Get-ReportScalar $r 'recovery_request_origin') -ne $origin) { throw 'Recovery request origin disagrees with payload.' }
+            }
             if($recoveryPayload.qpc -gt $r['qpc']){throw 'Recovery observation is newer than its emission clock.'}
             if($recoveryPayload.record_sequence -ne 0){throw 'Emitted recovery payload sequence must be zero.'}
             if($paused -and ($recoveryPayload.phase -ne 9 -or $recoveryPayload.event -notin 1,2 -or
@@ -864,6 +945,13 @@ function Read-ReportLog([string]$Path, $Identity, [string]$NativeLogPath, [uint6
             ++$totals.normal_attempts; $totals.build_sequence=$lastBuild
         } elseif ($kind -in 5,6) {
             if ($null -eq $openBuild) { throw 'Builder completion without enter.' }
+            if ($r.ContainsKey('prepared_valid') -ne $openBuild.ContainsKey('prepared_valid')) { throw 'Prepared diagnostic linkage mismatch.' }
+            foreach ($key in @(Get-ReportPreparedKeys $r)) {
+                if ($r[$key] -ne $openBuild[$key]) { throw 'Prepared diagnostic changed between enter and return.' }
+            }
+            foreach ($key in @(Get-ReportPreparedDirtyKeys $r)) {
+                if ($r[$key] -ne $openBuild[$key]) { throw 'Entry dirty diagnostic changed between enter and return.' }
+            }
             foreach ($key in @('build_sequence','request_sequence','witness_sequence','source_epoch','binding_epoch','entry_qpc','classification','pi','bots','maximum')) {
                 if ($r[$key] -ne $openBuild[$key]) { throw 'Builder completion linkage mismatch.' }
             }
@@ -1517,7 +1605,7 @@ function Read-ReportMarker([string]$Path, [string]$Executable, [uint32]$Selected
     if (![IO.Path]::GetFileName($plain).Equals("RS2ServerFix.loader.$SelectedId.log",[StringComparison]::OrdinalIgnoreCase)) { throw 'Loader marker PID filename mismatch.' }
     $stream=[RS2ReportCollection.Files]::Open($plain,$false); $Locks.Add($stream)
     $text=Read-ReportText $stream 8192; $fields=Read-ReportFields $text
-    $required=@{schema='3';version='0.6.2.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
+    $required=@{schema='3';version='0.7.1.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
         executable_size=[string](Get-Item -LiteralPath $Executable).Length;sha256=$script:ReportHostHash;build_identity='current-full-dump';
         bootstrap='X3DAudio1_7.dll';bootstrap_beside_executable='true';companion='RS2ServerFix.dll';companion_beside_executable='true';
         genuine_module='system32';genuine_initialize_present='true';genuine_calculate_present='true';trigger='exe-crt-initialize';
@@ -1621,7 +1709,7 @@ function Invoke-SteamReportCollection {
             $savedStream=[RS2ReportCollection.Files]::Open($savedPath,$false);$locks.Add($savedStream)
             $savedText=Read-ReportText $savedStream 8MB;$fields=Read-ReportFields $savedText
             Assert-ReportFields $fields @{schema='1';mode='runtime-inventory';companion_kind='companion-reporting';
-                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';
+                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';
                 'reporting.captured'='true';'reporting.header_valid'='true';'reporting.log_identity_available'='true'}
             $null=Assert-ReportRecoveryFields $fields
             if($ProcessId -and [string]$ProcessId -cne $fields['pid']){throw 'Archived inventory PID differs from selected PID.'}

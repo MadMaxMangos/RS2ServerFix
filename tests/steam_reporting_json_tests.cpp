@@ -141,6 +141,13 @@ void AdmissionLimits() {
 } // namespace
 
 void ReportingJsonTests() {
+    NativeCounts parsed{99,99,99};
+    const auto json = Document();
+    RS2_CHECK(ReadPreparedJsonCounts(json.data(), json.size(), &parsed) == Reason::None);
+    RS2_CHECK(EqualCounts(parsed, kCounts));
+    const auto invalid = json + "trailing";
+    RS2_CHECK(ReadPreparedJsonCounts(invalid.data(), invalid.size(), &parsed) == Reason::PreparedMalformed);
+    RS2_CHECK(EqualCounts(parsed, {0,0,0}));
     NativeShapeAndCoherence();
     EscapesAndAmbiguity();
     FullSyntaxAndUnicode();

@@ -161,10 +161,11 @@ struct Fixture {
         *error = ERROR_SUCCESS; return true;
     }
     PreparedReadContext Context() noexcept { return {{this, Query, Read}, kHost, kImageSize}; }
-    Reason Run(const NativeCounts& expected = kCounts, PreparedSnapshot* output = nullptr) {
+    Reason Run(const NativeCounts& expected = kCounts, PreparedSnapshot* output = nullptr,
+        PreparedDiagnostic* diagnostic = nullptr) {
         scratch.fill('X');
         PreparedSnapshot local{};
-        const auto reason = ReadPreparedState(Context(), expected, scratch.data(), scratch.size(), output ? output : &local);
+        const auto reason = ReadPreparedState(Context(), expected, scratch.data(), scratch.size(), output ? output : &local, diagnostic);
         RS2_CHECK(std::all_of(scratch.begin(), scratch.end(), [](char c) { return c == 0; }));
         RS2_CHECK(!forbiddenRead);
         return reason;
@@ -250,6 +251,37 @@ void VectorAndJsonCoherence() {
         RS2_CHECK(f.Run(kCounts, &result) == reasons[mutation] && f.mutated && result.membersCount == 0);
     }
 }
+void CountDiagnostics() {
+    // Model cleanup/Create leaving Members empty while JSON already agrees.
+    Fixture f;
+    f.Put(kVector + 8, kMemberData);
+    PreparedSnapshot result{};
+    PreparedDiagnostic diagnostic{};
+    RS2_CHECK(f.Run(kCounts, &result, &diagnostic) == Reason::PreparedMismatch);
+    RS2_CHECK(diagnostic.valid && diagnostic.mismatchMask == PreparedMembersDiffer &&
+        diagnostic.membersCount == 0 && diagnostic.maximum == 64 &&
+        EqualCounts(diagnostic.json, kCounts) && diagnostic.jsonBytes == f.jsonSize);
+    RS2_CHECK(result.membersCount == 0 && result.jsonBytes == 0);
+    RS2_CHECK(f.payloadReads == 1 && f.ipTerminatorReads == 2);
+    // Independent mismatches must remain distinguishable, and may coexist.
+    f.Put(kMaximum, std::uint32_t{32}); f.SetJson(Json(2));
+    RS2_CHECK(f.Run(kCounts, &result, &diagnostic) == Reason::PreparedMismatch);
+    RS2_CHECK(diagnostic.valid && diagnostic.mismatchMask ==
+        (PreparedMaximumDiffers | PreparedMembersDiffer | PreparedPiDiffers));
+    RS2_CHECK(diagnostic.maximum == 32 && diagnostic.json.pi == 2);
+    RS2_CHECK(f.Run({2, 0, 32}, &result, &diagnostic) == Reason::PreparedMismatch);
+    RS2_CHECK(diagnostic.mismatchMask == (PreparedMembersDiffer | PreparedBotsDiffer | PreparedJsonMaximumDiffers));
+    // No diagnostic may escape an incomplete parse or unstable header sample.
+    f.SetJson(Json() + "trailing");
+    RS2_CHECK(f.Run(kCounts, &result, &diagnostic) == Reason::PreparedMalformed);
+    RS2_CHECK(!diagnostic.valid && diagnostic.mismatchMask == 0 && diagnostic.jsonBytes == 0 && diagnostic.json.pi == 0);
+    f.SetJson(Json()); f.mutateAfterCopy = true; f.mutation = 0;
+    RS2_CHECK(f.Run(kCounts, &result, &diagnostic) == Reason::PreparedUnavailable);
+    RS2_CHECK(!diagnostic.valid && diagnostic.jsonBytes == 0);
+    Fixture matching;
+    RS2_CHECK(matching.Run(kCounts, &result, &diagnostic) == Reason::None);
+    RS2_CHECK(diagnostic.valid && diagnostic.mismatchMask == 0 && diagnostic.membersCount == 65);
+}
 void FaultsAndScrubbing() {
     for (const auto address : {kService, kRegistration + 0x10, kGameMode + 0x18, kVector + 8,
         kMaximum, kJson}) {
@@ -284,5 +316,6 @@ void ReportingPreparedTests() {
     ValidAndOpaqueReads();
     HeaderAndLengthRejections();
     VectorAndJsonCoherence();
+    CountDiagnostics();
     FaultsAndScrubbing();
 }

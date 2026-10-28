@@ -10,6 +10,8 @@ using namespace reporting;
 // Synthetic PE/memory/import observations only. No image is loaded by Windows,
 // and no native host, SDK, allocator, import or callback target is invoked.
 #include "companion/leech_recovery_native_profile_data.inc"
+#include "companion/leech_recovery_metadata_profile_data.inc"
+#include "companion/leech_recovery_console_profile_data.inc"
 struct NativeFixture {
     static constexpr std::uintptr_t kSyntheticBase=0x180000000ULL,kSyntheticHeapBase=0x190000000ULL;
     static constexpr char kInitialSession[]="11111111-2222-3333-4444-555555555555";
@@ -157,14 +159,55 @@ struct NativeFixture {
         }
         std::memcpy(out,f.image.data()+(address-f.base),bytes);return true;
     }
-    static bool Resolve(void* context,const char*,const char* name,std::uintptr_t* out,DWORD*) noexcept {
+    static bool Resolve(void* context,const char* module,const char* name,std::uintptr_t* out,DWORD*) noexcept {
         auto& f=*static_cast<NativeFixture*>(context);
-        for(std::size_t i=0;i<std::size(kRecoveryImports);++i)if(!std::strcmp(name,kRecoveryImports[i].name)){
-            *out=0x1C0000000ULL+i*0x100+(f.failImport?1:0);return true;}
-        return false;
+        const auto value=ImportAddress(module,name);*out=value+(value && f.failImport ? 1 : 0);return value!=0;
     }
     MemoryOps Memory(){return {this,Query,Read};}
     RecoveryNativeContext Context(){return {base,host.imageSize,Memory(),&imports,&layout};}
     RecoveryNativeResult Snapshot(RecoveryNativeSnapshot& out){observations=0;DWORD error{};return ReadNativeRecoverySnapshot(Context(),&out,&error);}
+    void LoadMetadataProfile() {
+        for(const auto& part:kMetadataPartitions) {
+            for(std::size_t i=0;i<part.body.spanCount;++i) {const auto& s=part.body.spans[i].span;std::memcpy(image.data()+s.rva,s.bytes,s.size);}
+            for(std::size_t i=0;i<part.body.pointerCount;++i) {const auto& p=part.body.pointers[i];Put(p.slotRva,base+p.targetRva);}
+            for(std::size_t i=0;i<part.body.exceptionCount;++i) {const auto& e=part.body.exceptions[i];std::uint32_t row[]{e.beginRva,e.endRva,e.unwindRva};std::memcpy(image.data()+e.entryRva,row,12);}
+        }
+        std::vector<PumpImportRecipe> values(std::begin(kRecoveryImports),std::end(kRecoveryImports));
+        for(const auto& part:kMetadataPartitions) for(std::size_t i=0;i<part.importCount;++i) {
+            const auto& item=part.imports[i];bool found{};
+            for(const auto& old:values) if(old.slotRva==item.slotRva) found=true;
+            if(!found) values.push_back(item);
+        }
+        const char* modules[]{"MSVCR110.dll","MSVCP110.dll","KERNEL32.dll"};
+        IMAGE_NT_HEADERS64 nt{};std::memcpy(&nt,image.data()+0x80,sizeof(nt));
+        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size=4*sizeof(IMAGE_IMPORT_DESCRIPTOR);Put(0x80,nt);
+        std::memset(image.data()+0x1A00000,0,4*sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        for(unsigned module=0;module<3;++module) {
+            IMAGE_IMPORT_DESCRIPTOR descriptor{};descriptor.Name=0x1A00100+module*64;
+            descriptor.FirstThunk=0xE94000;descriptor.OriginalFirstThunk=0x1A01000+module*0x2000;
+            Put(0x1A00000+module*sizeof(descriptor),descriptor);Text(descriptor.Name,modules[module]);
+            std::memset(image.data()+descriptor.OriginalFirstThunk,0,0x2000);
+            for(std::size_t i=0;i<values.size();++i) if(!_stricmp(values[i].module,modules[module])) {
+                const auto nameRva=static_cast<std::uint32_t>(0x1A08000+i*128);Text(nameRva+2,values[i].name);
+                Put<std::uint64_t>(descriptor.OriginalFirstThunk+values[i].slotRva-descriptor.FirstThunk,nameRva);
+                Put(values[i].slotRva,ImportAddress(values[i].module,values[i].name));
+            }
+        }
+    }
+    void LoadConsoleProfile() {
+        LoadMetadataProfile();
+        const auto& part=kConsoleProduction;
+        for(std::size_t i=0;i<part.body.spanCount;++i) {const auto& s=part.body.spans[i].span;std::memcpy(image.data()+s.rva,s.bytes,s.size);}
+        for(std::size_t i=0;i<part.body.pointerCount;++i) {const auto& p=part.body.pointers[i];Put(p.slotRva,base+p.targetRva);}
+        for(std::size_t i=0;i<part.body.exceptionCount;++i) {const auto& e=part.body.exceptions[i];std::uint32_t row[]{e.beginRva,e.endRva,e.unwindRva};std::memcpy(image.data()+e.entryRva,row,12);}
+    }
+    static std::uintptr_t ImportAddress(const char* module,const char* name) noexcept {
+        for(std::size_t i=0;i<std::size(kRecoveryImports);++i)
+            if(!_stricmp(module,kRecoveryImports[i].module) && !std::strcmp(name,kRecoveryImports[i].name)) return 0x1C0000000ULL+i*0x100;
+        std::size_t index{};
+        for(const auto& part:kMetadataPartitions) for(std::size_t i=0;i<part.importCount;++i,++index)
+            if(!_stricmp(module,part.imports[i].module) && !std::strcmp(name,part.imports[i].name)) return 0x1D0000000ULL+index*0x100;
+        return 0;
+    }
 };
 } // namespace rs2fix::testcases::leech_fixture

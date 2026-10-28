@@ -46,6 +46,10 @@ struct alignas(8) NativePipeline {
     std::uint64_t startupObserved;
     std::uint64_t heldMatch;
     std::uint64_t initialized;
+    // Worker-private formatting state only; no owner admission or record selection.
+    bool recoveryDetail,terminalDetailSeen,builderDetailActive,builderDetail,builderPostBoundary;
+    std::uint32_t detailBoundaryPairs;
+    std::uint64_t detailBuildSequence,detailSourceEpoch,detailBindingEpoch,detailOverallDeadlineQpc;
     std::size_t bootstrapBytes;
     char bootstrap[native_log::kMessageLimit+1];
     char scratch[native_log::kMessageLimit+1];

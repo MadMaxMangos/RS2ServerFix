@@ -28,7 +28,12 @@ constexpr const char* kRecoveryReasons[]{"none","permission-disabled","invalid-r
     "guard-snapshot-provenance","guard-readiness","guard-standalone","guard-session",
     "guard-issued-id","guard-finish-free","guard-create-free","guard-heartbeat-slot",
     "guard-heartbeat-type","guard-heartbeat-id","guard-generic-id",
-    "guard-generic-holder","guard-heartbeat-references","snapshot-guard-passed"};
+    "guard-generic-holder","guard-heartbeat-references","snapshot-guard-passed",
+    "metadata-unavailable","metadata-timeout","metadata-counts-not-ready","metadata-unsupported-state",
+    "metadata-random-unavailable","metadata-unverified","published-identity-changed","metadata-count-limit",
+    "pump-headroom-unavailable","bots-training-policy","population-or-mode-unsupported",
+    "heartbeat-state-unsupported","heartbeat-schedule-invalid","heartbeat-errors-invalid","heartbeat-throttle-invalid",
+    "heartbeat-expedite-invalid","heartbeat-interval-unsupported","heartbeat-overrides-unsupported","heartbeat-retry-unsupported"};
 static_assert(std::size(kRecoveryPhases)==static_cast<std::size_t>(RecoveryPhase::Count));
 static_assert(std::size(kRecoveryReasons)==static_cast<std::size_t>(RecoveryReason::Count));
 #if defined(RS2_RECOVERY_GUARD_PROBE)
@@ -166,7 +171,7 @@ bool FormatReportingConsoleNotice(const StatusHeader& header,const ConsoleNotice
     for(std::size_t i=0;i<16;++i) { run[i*2]=hex[header.runId[i]>>4]; run[i*2+1]=hex[header.runId[i]&15]; }
     const auto* reason=n.transportReason ? kTransportNames[n.reason] : ReasonName(static_cast<Reason>(n.reason));
     const int size=std::snprintf(output->line,sizeof(output->line),
-        "[RS2SteamReport] v0.6.2.0; status=%s; event=%s; mode=%s; pid=%u; run_id=%s; "
+        "[RS2SteamReport] v0.7.1.0; status=%s; event=%s; mode=%s; pid=%u; run_id=%s; "
         "epoch=%llu; qpc=%llu; reason_domain=%s; reason=%s; owner_transition=%llu; worker_condition=%llu\r\n",
         state,event,ModeName(static_cast<Mode>(header.configuredMode)),header.pid,run,
         static_cast<unsigned long long>(n.epoch),static_cast<unsigned long long>(n.sourceQpc),
@@ -189,7 +194,7 @@ bool FormatRecoveryConsoleNotice(const RecoveryStatusWireV1& wire,ConsoleReportC
     if (!bits) return false;
     const auto& p=wire.payload;
     const int size=std::snprintf(output->line,sizeof(output->line),
-        "[RS2LeechRecovery] v0.6.2.0%s; pid=%u; run_id=%s; phase=%s; reason=%s; transition=%llu; "
+        "[RS2LeechRecovery] v0.7.1.0%s; pid=%u; run_id=%s; phase=%s; reason=%s; transition=%llu; "
         "last_valid_qpc=%llu; restart_required=%u\r\n",kRecoveryModeSuffix,wire.pid,run,kRecoveryPhases[p.phase],kRecoveryReasons[p.reason],
         static_cast<unsigned long long>(p.transitionSequence),static_cast<unsigned long long>(p.qpc),
         (p.flags&RecoveryRestartRequired) ? 1U : 0U);
@@ -359,7 +364,7 @@ void ScheduleReportingDisabledNotice(const StatusWireV3& status,Reason reason) n
     }
     ConsoleReportContext report{};
     const int bytes=std::snprintf(report.line,sizeof(report.line),
-        "[RS2SteamReport] v0.6.2.0; status=disabled; mode=%s; reason=%s; run_id=%s; pid=%u\r\n",
+        "[RS2SteamReport] v0.7.1.0; status=disabled; mode=%s; reason=%s; run_id=%s; pid=%u\r\n",
         ModeName(header ? static_cast<Mode>(header->configuredMode) : Mode::Invalid),ReasonName(reason),
         identified ? run : "unavailable",header ? header->pid : 0);
     if (bytes>0 && static_cast<std::size_t>(bytes)<sizeof(report.line)) {

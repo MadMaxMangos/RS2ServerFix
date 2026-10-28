@@ -66,6 +66,169 @@ void Parsers() {
     RS2_CHECK(!StartControl(disabledState, &error));
     RS2_CHECK(error == ERROR_INVALID_STATE && !disabledState.started && !disabledState.thread && !disabledState.latched);
 }
+void PilotParsers() {
+    const std::string prefix="schema=2\npermission=manual-pilot-finish-recreate\nserver_root=";
+    const std::string suffix="\noperator_sid=S-1-5-21-1-2-3-1001\n";
+    const auto enabled=prefix+"E:\\servertwo"+suffix;
+    ControlConfig config{};
+    RS2_CHECK(ParseControlConfig(enabled.data(),enabled.size(),&config)==ControlResult::Ready);
+    RS2_CHECK(config.enabled && config.scope.schema==2 && std::wcscmp(config.scope.serverRoot,L"E:\\servertwo")==0);
+    RS2_CHECK(!config.consoleRequested);
+    const auto scope=config.scope;const auto identity=Identity();ControlRequest parsed{};
+    for(const auto& choice:{std::string("disabled"),std::string("server-admin")}) {
+        const auto text=enabled+"console_trigger="+choice+"\n";
+        RS2_CHECK(ParseControlConfig(text.data(),text.size(),&config)==ControlResult::Ready);
+        RS2_CHECK(config.consoleRequested==(choice=="server-admin"));
+    }
+    for(const auto& text:{enabled+"console_trigger=enabled\n",
+            enabled+"console_trigger=server-admin\nconsole_trigger=disabled\n",
+            std::string("schema=1\npermission=training-finish-recreate\ntraining_root=E:\\rs2v_trainingsrv")+
+                suffix+"console_trigger=disabled\n"}) {
+        RS2_CHECK(ParseControlConfig(text.data(),text.size(),&config)==ControlResult::InvalidConfig);
+        RS2_CHECK(!config.enabled && !config.consoleRequested);
+    }
+    const std::string request="{\"schema\":2,\"action\":\"finish-recreate\",\"pid\":73,"
+        "\"run_id\":\"000102030405060708090a0b0c0d0e0f\",\"server_root\":\"E:\\\\servertwo\"}";
+    RS2_CHECK(ParseControlRequest(request.data(),request.size(),identity,&parsed,&scope)==ControlResult::Ready);
+    RS2_CHECK(ParseControlRequest(request.data(),request.size(),identity,&parsed)==ControlResult::InvalidRequest);
+    const auto training=Request();
+    RS2_CHECK(ParseControlRequest(training.data(),training.size(),identity,&parsed,&scope)==ControlResult::InvalidRequest);
+    auto other=scope;wcscpy_s(other.serverRoot,L"E:\\serverone");
+    RS2_CHECK(ParseControlRequest(request.data(),request.size(),identity,&parsed,&other)==ControlResult::InvalidRequest);
+    auto wrongSchema=request;wrongSchema.replace(wrongSchema.find("\"schema\":2"),10,"\"schema\":1");
+    RS2_CHECK(ParseControlRequest(wrongSchema.data(),wrongSchema.size(),identity,&parsed,&scope)==ControlResult::InvalidRequest);
+    auto mixedKey=request;mixedKey.replace(mixedKey.find("server_root"),11,"training_root");
+    RS2_CHECK(ParseControlRequest(mixedKey.data(),mixedKey.size(),identity,&parsed,&scope)==ControlResult::InvalidRequest);
+    for(const auto* root:{"E:\\","E:server","E:/server","E:\\server\\child","E:\\..","E:\\server.",
+            "E:\\server name","\\\\server\\share","\\\\?\\E:\\server","E:\\server~1"}) {
+        const auto text=prefix+root+suffix;
+        RS2_CHECK(ParseControlConfig(text.data(),text.size(),&config)==ControlResult::InvalidConfig);
+        RS2_CHECK(!config.enabled && !config.operatorSidBytes);
+    }
+    const auto longest=prefix+"E:\\"+std::string(32,'a')+suffix;
+    RS2_CHECK(ParseControlConfig(longest.data(),longest.size(),&config)==ControlResult::Ready);
+    const auto tooLong=prefix+"E:\\"+std::string(33,'a')+suffix;
+    RS2_CHECK(ParseControlConfig(tooLong.data(),tooLong.size(),&config)==ControlResult::InvalidConfig);
+    for(const auto& text:{
+            std::string("schema=2\npermission=training-finish-recreate\nserver_root=E:\\servertwo")+suffix,
+            std::string("schema=1\npermission=manual-pilot-finish-recreate\ntraining_root=E:\\rs2v_trainingsrv")+suffix,
+            enabled+"training_root=E:\\rs2v_trainingsrv\n",enabled+"schema=1\n"}) {
+        RS2_CHECK(ParseControlConfig(text.data(),text.size(),&config)==ControlResult::InvalidConfig);
+        RS2_CHECK(!config.enabled && !config.operatorSidBytes);
+    }
+    const std::string disabled="schema=2\npermission=disabled\nserver_root=E:\\servertwo\noperator_sid=none\n";
+    RS2_CHECK(ParseControlConfig(disabled.data(),disabled.size(),&config)==ControlResult::Disabled);
+    RS2_CHECK(!config.enabled && config.scope.schema==2 && !config.operatorSidBytes);
+}
+void ConsoleParser() {
+    const auto identity = Identity();
+    char confirmation[kConsoleConfirmationCharacters + 1]{};
+    ConsoleConfirmation(identity.runId, confirmation);
+    RS2_CHECK(std::strcmp(confirmation, "0001020304050607") == 0);
+    struct Case { const wchar_t* text; ConsoleCommand expected; };
+    const Case cases[] = {
+        {L"rs2leech status", ConsoleCommand::Status},
+        {L"  RS2LEECH  STATUS  ", ConsoleCommand::Status},
+        {L"rs2leech recover 0001020304050607", ConsoleCommand::Recover},
+        {L"RS2LEECH RECOVER 0001020304050607 ", ConsoleCommand::Recover},
+        {L"rs2leech", ConsoleCommand::Invalid},
+        {L"rs2leech status extra", ConsoleCommand::Invalid},
+        {L"rs2leech recover", ConsoleCommand::Invalid},
+        {L"rs2leech recover 1001020304050607", ConsoleCommand::Invalid},
+        {L"rs2leech recover 000102030405060", ConsoleCommand::Invalid},
+        {L"rs2leech recover 0001020304050607 extra", ConsoleCommand::Invalid},
+        {L"rs2leech recover 0001020304050607\nquit", ConsoleCommand::Invalid},
+        {L"rs2leech\tstatus", ConsoleCommand::Invalid},
+        {L"rs2leech st\x00e4tus", ConsoleCommand::Invalid},
+        {L"rs2fix status", ConsoleCommand::Unrelated},
+        {L"rs2leechother status", ConsoleCommand::Unrelated},
+        {L"say rs2leech recover 0001020304050607", ConsoleCommand::Unrelated},
+    };
+    for (const auto& item : cases)
+        RS2_CHECK(ParseConsoleCommand(item.text, std::wcslen(item.text), confirmation) == item.expected);
+    // A supplied span is authoritative; no accidental dependence on a trailing
+    // NUL or read beyond its end, including embedded-NUL command injection.
+    const wchar_t exact[] = {L'r',L's',L'2',L'l',L'e',L'e',L'c',L'h',L' ',L's',L't',L'a',L't',L'u',L's'};
+    RS2_CHECK(ParseConsoleCommand(exact, std::size(exact), confirmation) == ConsoleCommand::Status);
+    const wchar_t embedded[] = L"rs2leech status\0recover 0001020304050607";
+    RS2_CHECK(ParseConsoleCommand(embedded, std::size(embedded) - 1, confirmation) == ConsoleCommand::Invalid);
+    confirmation[0] = 'z';
+    RS2_CHECK(ParseConsoleCommand(L"rs2leech recover 0001020304050607", 33, confirmation) == ConsoleCommand::Invalid);
+}
+struct ClaimFixture { ControlState* state; HANDLE gate; RequestOrigin origin; bool won; };
+DWORD WINAPI ClaimThread(void* parameter) noexcept {
+    auto& fixture = *static_cast<ClaimFixture*>(parameter);
+    if (WaitForSingleObject(fixture.gate, INFINITE) == WAIT_OBJECT_0)
+        fixture.won = ClaimControlForTesting(*fixture.state, fixture.origin);
+    return 0;
+}
+void SharedClaim() {
+    auto* state = new ControlState{};
+    state->identity = Identity();
+    state->scope={2,L"E:\\servertwo"};
+    state->enabled = true;
+    state->started = 1;
+    state->result = static_cast<LONG>(ControlResult::Ready);
+    RS2_CHECK(!ClaimConsoleControlRequest(*state) && !state->latched);
+    RS2_CHECK(!ClaimControlForTesting(*state, RequestOrigin::None) && !state->latched);
+    state->consoleRequested = true;
+    state->consoleRegistration = static_cast<LONG>(ConsoleRegistration::Available);
+    state->scope=kTrainingControlScope;
+    RS2_CHECK(!ClaimConsoleControlRequest(*state) && !state->latched);
+    state->scope={};
+    RS2_CHECK(!ClaimControlForTesting(*state,RequestOrigin::Pipe) && !state->latched);
+    state->scope={2,L"E:\\servertwo"};
+    for (unsigned round = 0; round < 16; ++round) {
+        state->latched = 0; // Fresh disposable fixture, never an operator reset.
+        const auto gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        RS2_CHECK(gate != nullptr);
+        if (!gate) break;
+        ClaimFixture contenders[] = {{state, gate, RequestOrigin::Pipe, false},
+            {state, gate, RequestOrigin::ServerAdminConsole, false}};
+        HANDLE threads[2]{};
+        for (unsigned i = 0; i < 2; ++i) {
+            threads[i] = CreateThread(nullptr, 0, ClaimThread, &contenders[i], 0, nullptr);
+            RS2_CHECK(threads[i] != nullptr);
+        }
+        RS2_CHECK(SetEvent(gate));
+        for (auto thread : threads) if (thread) {
+            RS2_CHECK(WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0);
+            RS2_CHECK(CloseHandle(thread));
+        }
+        RS2_CHECK(CloseHandle(gate));
+        if (threads[0] && threads[1]) {
+            RS2_CHECK(contenders[0].won != contenders[1].won);
+            ControlRequest request{}; RequestOrigin origin{};
+            RS2_CHECK(ReadLatchedControl(*state, &request, &origin));
+            RS2_CHECK(origin == (contenders[0].won ? RequestOrigin::Pipe : RequestOrigin::ServerAdminConsole));
+            const auto identity = Identity();
+            RS2_CHECK(std::memcmp(&request, &identity, sizeof(identity)) == 0);
+            RS2_CHECK(std::memcmp(&state->identity, &identity, sizeof(identity)) == 0);
+            RS2_CHECK(!ClaimControlForTesting(*state, RequestOrigin::Pipe));
+            RS2_CHECK(!ClaimConsoleControlRequest(*state));
+        }
+    }
+    state->latched = 0;
+    // A failed pipe worker consumes the process's attempt even before the
+    // owner next visits it. Neither a late console request nor its duplicate
+    // may report queued after that failure.
+    state->result = static_cast<LONG>(ControlResult::InvalidRequest);
+    RS2_CHECK(!ClaimConsoleControlRequest(*state) && !state->latched);
+    RS2_CHECK(!ClaimConsoleControlRequest(*state) && !state->latched);
+    state->result = static_cast<LONG>(ControlResult::Ready);
+    state->stop = 1;
+    RS2_CHECK(!ClaimControlForTesting(*state, RequestOrigin::Pipe) && !state->latched);
+    state->stop = 0; state->started = 0;
+    RS2_CHECK(!ClaimConsoleControlRequest(*state) && !state->latched);
+    state->started = 1; state->enabled = false;
+    RS2_CHECK(!ClaimControlForTesting(*state, RequestOrigin::Pipe) && !state->latched);
+    state->latched = 3;
+    ControlRequest request{}; RequestOrigin origin = RequestOrigin::Pipe;
+    RS2_CHECK(!ReadLatchedControl(*state, &request, &origin) && !request.pid && origin == RequestOrigin::None);
+    state->latched = 2; state->consoleRegistration = static_cast<LONG>(ConsoleRegistration::Unavailable);
+    RS2_CHECK(!ReadLatchedControl(*state, &request, &origin) && !request.pid);
+    delete state;
+}
 bool Descriptor(const wchar_t* sddl, PSECURITY_DESCRIPTOR* descriptor) {
     return ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, descriptor, nullptr) != FALSE;
 }
@@ -170,10 +333,25 @@ void FilesAndWorker() {
     RS2_CHECK(ReadControlConfigForTesting(permissionPath.c_str(), policy, &loaded, &error) == ControlResult::Ready);
     RS2_CHECK(loaded.enabled && loaded.operatorSidBytes);
     RS2_CHECK(DeleteFileW(permissionPath.c_str()));
+    const std::string pilotPermission="schema=2\npermission=manual-pilot-finish-recreate\n"
+        "server_root=E:\\servertwo\noperator_sid=S-1-5-21-1-2-3-1001\n";
+    const auto pilotPermissionPath=std::wstring(unique)+L"\\RS2LeechRecovery.ini";
+    RS2_CHECK(WriteFixture(pilotPermissionPath.c_str(),pilotPermission,writableDescriptor));
+    for(const bool allowPilot:{false,true}) {
+        auto* refused=new ControlState{};
+        RS2_CHECK(InitializeControl(*refused,unique,identity.pid,identity.runId,&error,allowPilot)==
+            (allowPilot?ControlResult::InvalidPath:ControlResult::InvalidConfig));
+        RS2_CHECK(!refused->enabled && !refused->pipe && !refused->thread);
+        for(const auto handle:refused->directories) RS2_CHECK(!handle);
+        delete refused;
+    }
+    RS2_CHECK(DeleteFileW(pilotPermissionPath.c_str()));
     // Real Windows pipe, peer-token check and joined worker, never VNGame.
-    for (unsigned scenario = 0; scenario < 6; ++scenario) {
+    for (unsigned scenario = 0; scenario < 7; ++scenario) {
         auto* state = new ControlState{};
         state->identity = identity; state->identity.pid = GetCurrentProcessId();
+        state->scope=kTrainingControlScope;
+        if(scenario==6) state->scope.schema=2;
         state->identity.runId[15] = static_cast<BYTE>(scenario);
         state->security = policy;
         RS2_CHECK(PrepareControlPipeForTesting(*state, &error) == ControlResult::Ready);
@@ -193,6 +371,11 @@ void FilesAndWorker() {
         }
         state->enabled = true; state->result = static_cast<LONG>(ControlResult::Ready);
         RS2_CHECK(StartControl(*state, &error));
+        if (scenario == 6) {
+            state->consoleRequested = true;
+            state->consoleRegistration = static_cast<LONG>(ConsoleRegistration::Available); // Own-code fixture publication.
+            RS2_CHECK(ClaimConsoleControlRequest(*state));
+        }
         HANDLE client = INVALID_HANDLE_VALUE;
         if (scenario != 3) {
             client = CreateFileW(state->requestPath, FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
@@ -206,9 +389,10 @@ void FilesAndWorker() {
         else {
             char run[33]{}; constexpr char hex[] = "0123456789abcdef";
             for (unsigned i = 0; i < 16; ++i) { run[i*2]=hex[state->identity.runId[i]>>4]; run[i*2+1]=hex[state->identity.runId[i]&15]; }
-            auto bytes = std::string("{\"schema\":1,\"action\":\"finish-recreate\",\"pid\":") +
+            auto bytes = std::string("{\"schema\":")+std::to_string(state->scope.schema)+",\"action\":\"finish-recreate\",\"pid\":" +
                 std::to_string(GetCurrentProcessId()) + ",\"run_id\":\"" + run +
-                "\",\"training_root\":\"E:\\\\rs2v_trainingsrv\"}";
+                (state->scope.schema==1 ? "\",\"training_root\":\"E:\\\\rs2v_trainingsrv\"}" :
+                    "\",\"server_root\":\"E:\\\\rs2v_trainingsrv\"}");
             if (scenario == 1) bytes.replace(bytes.find("000102"), 6, "100102");
             if (scenario == 2) bytes.resize(513, ' ');
             DWORD written{};
@@ -218,13 +402,34 @@ void FilesAndWorker() {
                 RS2_CHECK(CloseHandle(client)); client = INVALID_HANDLE_VALUE;
             }
         }
+        if(scenario==6) {
+            // Schema2 keeps its authenticated endpoint after a duplicate request.
+            // Emulate owner-confirmed preflight release and reconnect through
+            // the actual Windows pipe rather than resetting a fixture latch.
+            RS2_CHECK(WaitNamedPipeW(state->requestPath,5000));
+            RS2_CHECK(CloseHandle(client));client=INVALID_HANDLE_VALUE;
+            RS2_CHECK(ReleasePreflightClaim(*state));
+            client=CreateFileW(state->requestPath,FILE_WRITE_DATA|FILE_READ_ATTRIBUTES|READ_CONTROL,0,nullptr,
+                OPEN_EXISTING,SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,nullptr);
+            RS2_CHECK(client!=INVALID_HANDLE_VALUE);
+            char run[33]{};constexpr char hex[]="0123456789abcdef";
+            for(unsigned i=0;i<16;++i) {run[i*2]=hex[state->identity.runId[i]>>4];run[i*2+1]=hex[state->identity.runId[i]&15];}
+            const auto bytes=std::string("{\"schema\":2,\"action\":\"finish-recreate\",\"pid\":")+
+                std::to_string(GetCurrentProcessId())+",\"run_id\":\""+run+"\",\"server_root\":\"E:\\\\rs2v_trainingsrv\"}";
+            DWORD written{};RS2_CHECK(WriteFile(client,bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr));
+            // A bounded fixture wait observes claim publication; no engine runs.
+            const auto deadline=GetTickCount64()+5000;
+            while(!InterlockedCompareExchange(&state->latched,0,0) && GetTickCount64()<deadline) Sleep(1);
+            RS2_CHECK(state->latched==static_cast<LONG>(RequestOrigin::Pipe));
+            StopControl(*state);
+        }
         RS2_CHECK(state->thread && WaitForSingleObject(state->thread, 5000) == WAIT_OBJECT_0);
-        const auto expected = scenario == 0 ? ControlResult::Latched : scenario == 1 || scenario == 2 ?
+        const auto expected = scenario == 6 ? ControlResult::Stopped : scenario == 0 ? ControlResult::Latched : scenario == 1 || scenario == 2 ?
             ControlResult::InvalidRequest : scenario == 5 ? ControlResult::SecurityRejected : ControlResult::Stopped;
-        RS2_CHECK(ReadLatchedControl(*state, &parsed) == (scenario == 0));
+        RS2_CHECK(ReadLatchedControl(*state, &parsed) == (scenario == 0 || scenario == 6));
         RS2_CHECK(state->result == static_cast<LONG>(expected));
         RS2_CHECK(!StartControl(*state, &error));
-        RS2_CHECK(ReadLatchedControl(*state, &parsed) == (scenario == 0));
+        RS2_CHECK(ReadLatchedControl(*state, &parsed) == (scenario == 0 || scenario == 6));
         StopControl(*state);
         if (client != INVALID_HANDLE_VALUE) RS2_CHECK(CloseHandle(client));
         RS2_CHECK(CloseHandle(state->thread));
@@ -234,5 +439,5 @@ void FilesAndWorker() {
     delete[] acl; LocalFree(writableDescriptor); LocalFree(descriptor); RS2_CHECK(RemoveDirectoryW(unique));
 }
 } // namespace
-void RunLeechRecoveryControlTests() { Parsers(); Security(); FilesAndWorker(); }
+void RunLeechRecoveryControlTests() { Parsers(); PilotParsers(); ConsoleParser(); SharedClaim(); Security(); FilesAndWorker(); }
 } // namespace rs2fix::testcases

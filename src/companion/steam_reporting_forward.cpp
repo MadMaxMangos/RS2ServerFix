@@ -82,6 +82,7 @@ __declspec(noinline) void AfterPump(Runtime& state, CallFrame& frame) {
     std::int64_t now{};
     if (!RuntimeClock(state,&now)) { RecoveryOwnerClockFault(state); return; }
     const bool recoveryDue=RecoveryServiceDue(state);
+    const bool consoleDue=LeechConsoleRegistrationDue(state);
     bool cleanup=RuntimeCleanupAdmission(state);
     const bool safe=RuntimeAdmission(state);
     const bool transportDue=safe && NativeLogServiceDue(state.nativeLog,static_cast<std::uint64_t>(now));
@@ -91,13 +92,17 @@ __declspec(noinline) void AfterPump(Runtime& state, CallFrame& frame) {
     const auto interval=idle ? frequency*2 : frequency/kManagementHz+(frequency%kManagementHz!=0);
     const bool managementDue=(cleanup || RuntimeCaptureAdmission(state)) &&
         (!state.haveManagement || now-state.lastManagement>=interval);
-    if (!transportDue && !managementDue && !recoveryDue) return;
+    if (!transportDue && !managementDue && !recoveryDue && !consoleDue) return;
     frame.managed=true; // Includes transport-only classification/qualification cost.
     std::uint32_t callers[kCaptureFrames]{};
     std::size_t count{}; bool truncated{};
     // Must stay DIRECTLY in this noinline frame: CaptureHostCallers,AfterPump,PumpEntry.
     const bool captured=CaptureHostCallers(state.config.pumpCapture,callers,&count,&truncated);
     const auto classification=captured ? ClassifyPumpFrames(state.config.ancestry,callers,count,truncated) : CallerClass::Unknown;
+    if(consoleDue && classification==CallerClass::NormalPump && !truncated) {
+        RegisterLeechConsole(state,classification,count,truncated);
+        if(!RuntimeClock(state,&now)) {RecoveryOwnerClockFault(state);return;}
+    }
     if (transportDue && classification==CallerClass::NormalPump) {
         const auto service=ServiceNativeLog(state.nativeLog,classification,frame.topLevel,
             static_cast<std::uint64_t>(now),frame.outgoing);

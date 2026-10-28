@@ -1,5 +1,6 @@
 #include "companion/leech_recovery.h"
 #include "companion/steam_reporting_runtime.h"
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -11,6 +12,9 @@ struct CaptureFixture {std::uint32_t frames[kCaptureFrames];std::size_t count;bo
 CaptureFixture g_captureFixture{};
 #endif
 constexpr std::uint64_t kFinishSeconds=60, kAttemptSeconds=120;
+// The native heartbeat runs every 30 seconds; leave scheduling margin for its
+// first post-publication build. The overall attempt deadline still caps this.
+constexpr std::uint64_t kMetadataSeconds=45;
 bool PureClock(std::uint64_t* output) noexcept {
     const DWORD error=GetLastError(); LARGE_INTEGER qpc{};
     const bool ok=output && QueryPerformanceCounter(&qpc) && qpc.QuadPart>0;
@@ -33,9 +37,27 @@ bool SameBytes(const RecoveryNativeString& a,const unsigned char* aa,
         !std::memcmp(a.header,b.header,sizeof(a.header)) && !std::memcmp(aa,bb,static_cast<std::size_t>(a.size));
 }
 void Fault(LeechRecovery& r,RecoveryReason reason,RecoveryOutcome outcome,bool restart) noexcept {
+    // Publication is a positively observed local fact. Losing a later source,
+    // logger, deadline or metadata observation cannot undo that fact or invent
+    // a restart requirement. Actual native unwind/identity failure still can.
+    const bool critical=reason==RecoveryReason::NativeException || reason==RecoveryReason::InverseUnavailable ||
+        reason==RecoveryReason::PublishedIdentityChanged;
+    const bool existingNativeFault=(r.value.flags&RecoveryExceptionObserved) ||
+        r.value.reason==static_cast<std::uint64_t>(RecoveryReason::PublishedIdentityChanged) ||
+        r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::NativeUnwind);
+    const bool wasRetryable=(r.value.flags&RecoveryPreflightRetryable)!=0;
+    if(restart || critical || existingNativeFault) {
+        r.value.flags&=~RecoveryPreflightRetryable;
+        if(wasRetryable) r.finalPending=true;
+    }
+    if((r.value.flags&RecoveryPublishedLocally) && !critical && !existingNativeFault) {
+        restart=false;outcome=RecoveryOutcome::PublishedNotDelivered;
+        if(!(r.value.flags&RecoveryMetadataCoherent)) r.value.flags|=RecoveryMetadataUnverified;
+        if(reason==RecoveryReason::AttemptTimeout) reason=RecoveryReason::MetadataTimeout;
+    }
     if (r.terminal) {
         if(restart) r.value.flags|=RecoveryRestartRequired;
-        if(reason==RecoveryReason::NativeException ||
+        if((wasRetryable && restart) || reason==RecoveryReason::NativeException ||
             (reason==RecoveryReason::InverseUnavailable && !(r.value.flags&RecoveryExceptionObserved))) {
             r.value.reason=static_cast<std::uint64_t>(reason);r.value.outcome=static_cast<std::uint64_t>(outcome);
         }
@@ -115,7 +137,38 @@ bool Lifetime(const LeechRecovery& r,const RecoveryNativeSnapshot& n) noexcept {
         n.heartbeat.descriptor==r.before.heartbeat.descriptor && n.heartbeat.type==r.before.heartbeat.type &&
         SameBytes(n.coreGuid,n.coreGuidBytes,r.before.coreGuid,r.before.coreGuidBytes);
 }
-bool Lease(Runtime& state,LeechRecovery& r,std::uint32_t standalone,bool oldSession) noexcept {
+bool CacheMatches(const RecoveryNativeSnapshot&) noexcept;
+RecoveryReason PopulationReason(const Runtime& state,const LeechRecovery& r) noexcept {
+    if(r.control.scope.schema==1) return r.source.bots ? RecoveryReason::BotsUnsupported :
+        r.source.humans==2 ? RecoveryReason::None : RecoveryReason::PopulationUnsupported;
+    // H is not the advertised native PI. Preserve the source reader's accounting
+    // rules: in particular do not clamp PI (or H) to the human slot capacity.
+    return r.control.scope.schema==2 && state.config.mode==Mode::Observe &&
+        r.source.maximum && r.source.maximum<=64 ? RecoveryReason::None : RecoveryReason::PopulationUnsupported;
+}
+RecoveryReason Preflight(Runtime& state,LeechRecovery& r,CallerClass classification,std::size_t count,bool truncated) noexcept {
+    if(!RecoveryPumpHeadroomAvailable(classification,count,truncated)) return RecoveryReason::PumpHeadroomUnavailable;
+    const auto source=RecoveryRuntimeSource(state,&r.source);
+    if(source!=Reason::None) return source==Reason::SpectatorsPresent ? RecoveryReason::SpectatorsPresent :
+        source==Reason::UnsupportedCounts ? RecoveryReason::CountsInvalid : RecoveryReason::SourceUnavailable;
+    const auto population=PopulationReason(state,r);
+    if(population!=RecoveryReason::None) return population;
+    if(RecoveryRuntimeTask(state,&r.oldHeartbeat)!=Reason::None) return RecoveryReason::HeartbeatUnavailable;
+    const auto& schedule=r.oldHeartbeat.schedule;
+    if(r.oldHeartbeat.state!=2) return RecoveryReason::HeartbeatStateUnsupported;
+    if(!schedule.valid) return RecoveryReason::HeartbeatScheduleInvalid;
+    if(schedule.interval!=30000) return RecoveryReason::HeartbeatIntervalUnsupported;
+    // BF7400 can requeue a periodic task in idle state2 after backend failure.
+    // Nonzero history is not native ownership or in-flight work. Preserve it,
+    // and keep exact schedule equality through retirement/cancellation leases.
+    if(schedule.errors<0) return RecoveryReason::HeartbeatErrors;
+    if(schedule.throttles<0) return RecoveryReason::HeartbeatThrottled;
+    if(schedule.expedite>1) return RecoveryReason::HeartbeatExpedited;
+    if(schedule.intervalOverride || schedule.retryOverride) return RecoveryReason::HeartbeatOverridesUnsupported;
+    if(schedule.retryLimit!=3) return RecoveryReason::HeartbeatRetryUnsupported;
+    return RecoveryReason::None;
+}
+bool Lease(Runtime& state,LeechRecovery& r,std::uint32_t standalone,bool oldSession,bool publishedSession=false) noexcept {
     if(r.terminal || !RuntimeCaptureAdmission(state) || state.idleLifecycle!=r.value.sdkEpoch ||
         state.counters.sourceEpoch!=r.value.sourceEpoch || !LoggerLease(state)) return false;
     DWORD error{};
@@ -123,11 +176,18 @@ bool Lease(Runtime& state,LeechRecovery& r,std::uint32_t standalone,bool oldSess
         *r.native.imports,&error)!=ProfileResult::Ready ||
         RecoveryRuntimeSource(state,&r.scratchSource)!=Reason::None ||
         !EqualSourceIdentity(r.scratchSource.identity,r.source.identity) ||
-        r.scratchSource.maximum!=r.source.maximum || r.scratchSource.realTimeSeconds<r.source.realTimeSeconds || r.scratchSource.bots!=0 ||
+        r.scratchSource.maximum!=r.source.maximum || r.scratchSource.realTimeSeconds<r.source.realTimeSeconds ||
+        (r.control.scope.schema==1 && r.scratchSource.bots) ||
+        (r.control.scope.schema==2 && state.config.mode!=Mode::Observe) ||
         ReadNativeRecoverySnapshot(r.native,&r.current,&error)!=RecoveryNativeResult::Ready ||
         RequireNativeRecoveryReady(r.current)!=RecoveryNativeResult::Ready ||
         r.current.standalone!=standalone || !Lifetime(r,r.current)) return false;
     if(oldSession && !SameBytes(r.current.sdkSession,r.current.sdkBytes,r.before.sdkSession,r.before.sdkBytes)) return false;
+    if(publishedSession && (r.current.sdkSession.size!=r.publishedSession.size ||
+        std::memcmp(r.current.sdkBytes,r.publishedSessionBytes,static_cast<std::size_t>(r.publishedSession.size)) ||
+        !CacheMatches(r.current))) {
+        Fault(r,RecoveryReason::PublishedIdentityChanged,RecoveryOutcome::MechanicsFailed,true);return false;
+    }
     std::int64_t now{};
     if(!RuntimeClock(state,&now) || now<0) {RecoveryOwnerClockFault(state);return false;}
     if(static_cast<std::uint64_t>(now)>=r.value.overallDeadlineQpc ||
@@ -465,19 +525,178 @@ RecoveryReason NativeGuardReason(RecoveryNativeResult readResult,const RecoveryN
         return RecoveryReason::GuardHeartbeatReferences;
     return RecoveryReason::SnapshotGuardPassed;
 }
+void CompleteMetadata(LeechRecovery& r,std::uint64_t now,RecoveryReason reason,bool coherent) noexcept {
+    r.value.reason=static_cast<std::uint64_t>(reason);
+    r.value.outcome=static_cast<std::uint64_t>(RecoveryOutcome::PublishedNotDelivered);
+    r.value.flags|=RecoveryTerminal|(coherent ? RecoveryMetadataCoherent : RecoveryMetadataUnverified);
+    if(coherent) r.value.flags&=~RecoveryMetadataUnverified;
+    Transition(r,RecoveryPhase::Observed,now);r.terminal=true;r.finalPending=true;
+}
+#if !defined(RS2_RECOVERY_GUARD_PROBE)
+bool MetadataProfile(Runtime& state,LeechRecovery& r) noexcept {
+    DWORD error{};
+    return ValidateNativeRecoveryMetadataProfile(state.config.hostBase,r.startup,state.config.memory,
+        *r.native.imports,&error)==ProfileResult::Ready &&
+        RequireRecoveryMetadataAllocator(r.native,r.before.gmalloc,&error)==RecoveryNativeResult::Ready;
+}
+bool MetadataInputs(Runtime& state,LeechRecovery& r,NativeCounts* counts,
+    PreparedDiagnostic* diagnostic,RecoveryMetadataCache* cached) noexcept {
+    *counts={};*diagnostic={};*cached={};
+    if(!Lease(state,r,3,false,true) || !MetadataProfile(state,r) || ReadTaskPhase(state.task)!=TaskPhase::Armed) return false;
+    TaskSnapshot heartbeat{};DWORD error{};
+    if(RecoveryRuntimeTask(state,&heartbeat)!=Reason::None || heartbeat.state!=2 ||
+        heartbeat.identity.id==r.oldHeartbeat.identity.id || heartbeat.builder!=state.task.wrapper ||
+        !EqualTaskIdentity(heartbeat.identity,state.task.identity) ||
+        state.task.epoch.source!=state.counters.sourceEpoch || state.task.epoch.binding!=state.counters.bindingEpoch ||
+        ReadRecoveryMetadataCache(r.native,cached,&error)!=RecoveryNativeResult::Ready) return false;
+    *counts=r.scratchSource.outer;
+    PreparedSnapshot snapshot{};
+    ReadPreparedState({state.config.memory,state.config.hostBase,state.config.hostSize,&state.config.prepared},
+        *counts,state.scratch,sizeof(state.scratch),&snapshot,diagnostic);
+    std::int64_t now{};
+    if(!RuntimeClock(state,&now) || now<0) {RecoveryOwnerClockFault(state);return false;}
+    r.value.qpc=static_cast<std::uint64_t>(now);
+    if(r.value.qpc>=r.value.overallDeadlineQpc) return false;
+    return diagnostic->valid;
+}
+bool StableMetadataGate(const NativeCounts& source,const PreparedDiagnostic& prepared,
+    const RecoveryMetadataCache& cached,bool allowBots) noexcept {
+    return source.pi && source.pi<=kRecoveryMetadataMemberLimit && (allowBots || !source.bots) &&
+        source.maximum && source.maximum<=64 && EqualCounts(source,cached.counts) &&
+        !cached.countdownBits && !cached.registrationChanged && prepared.valid &&
+        prepared.mismatchMask==PreparedMembersDiffer && !prepared.membersCount;
+}
+bool MetadataInverse(Runtime& state,LeechRecovery& r) noexcept {
+    DWORD error{};
+    return RecoveryRuntimeSafeOwner(state) &&
+        ValidateNativeRecoveryProfile(state.config.hostBase,r.startup,state.config.memory,*r.native.imports,&error)==ProfileResult::Ready &&
+        MetadataProfile(state,r);
+}
+void RestoreMetadata(Runtime& state,LeechRecovery& r,const NativeCounts& expected) {
+    r.metadataHeadOwned=false;r.metadataDestructorEntered=false;r.metadataUpdateReturned=false;
+    auto* properties=reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(r.metadataPropertiesStorage)+15)&~std::uintptr_t{15});
+    std::memset(properties,0,sizeof(RecoveryMetadataProperties));
+    constexpr std::uint64_t capacity=15;
+    for(const auto offset:{0x18,0x58,0x78}) std::memcpy(properties+offset,&capacity,sizeof(capacity));
+    __try {
+        __try {
+            r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::MetadataConstruct);
+            const auto head=r.metadataCalls.head();
+            if(!head) return;
+            // The completed store, not entry into the allocator, owns the one
+            // destructor. Native head construction cleans up its own failures.
+            std::memcpy(properties+0xA8,&head,sizeof(head));r.metadataHeadOwned=true;
+            r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::MetadataFill);
+            r.metadataCalls.fill(properties);
+            NativeCounts current{};PreparedDiagnostic prepared{};RecoveryMetadataCache cached{};
+            if(!MetadataInputs(state,r,&current,&prepared,&cached) || !EqualCounts(current,expected) ||
+                !StableMetadataGate(current,prepared,cached,r.control.scope.schema==2) || r.value.qpc>=r.metadataDeadlineQpc) return;
+            r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::MetadataUpdate);
+            r.value.flags|=RecoveryMetadataAttempted;
+            r.metadataCalls.update(properties,&r.metadataMembers.vector);
+            r.metadataUpdateReturned=true;
+        } __finally {
+            if(r.metadataHeadOwned && !r.metadataDestructorEntered) {
+                if(!MetadataInverse(state,r)) Fault(r,RecoveryReason::InverseUnavailable,RecoveryOutcome::NativeUnwind,true);
+                else {
+                    r.metadataDestructorEntered=true;r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::MetadataDestroy);
+                    r.metadataCalls.destroy(properties);r.metadataHeadOwned=false;
+                }
+            }
+        }
+    } __except(ObserveFailure(r,GetExceptionCode(),false)) { /* Preserve native exception search/unwind. */ }
+}
+// False lets the normal management path bind/run the new heartbeat. The heavy
+// read-only leases are checked at the existing management cadence, not per tick.
+bool ServiceMetadata(Runtime& state,LeechRecovery& r,CallerClass classification,std::size_t frameCount,std::uint64_t now) {
+    if(now>=r.metadataDeadlineQpc) {CompleteMetadata(r,now,RecoveryReason::MetadataTimeout,false);return true;}
+    if(state.counters.sourceEpoch!=r.value.sourceEpoch || state.idleLifecycle!=r.value.sdkEpoch) {
+        CompleteMetadata(r,now,RecoveryReason::MetadataUnavailable,false);return true;
+    }
+    const auto frequency=static_cast<std::uint64_t>(state.producer.frequency);
+    if(r.haveMetadataProbe && now-r.metadataLastProbeQpc<frequency/kManagementHz) return false;
+    r.haveMetadataProbe=true;r.metadataLastProbeQpc=now;
+    NativeCounts source{};PreparedDiagnostic prepared{};RecoveryMetadataCache cached{};
+    if(!MetadataInputs(state,r,&source,&prepared,&cached)) {
+        if(r.terminal) return true;
+        r.value.reason=static_cast<std::uint64_t>(RecoveryReason::MetadataUnavailable);Publish(r);return false;
+    }
+    if(!prepared.mismatchMask) {CompleteMetadata(r,now,RecoveryReason::None,true);return true;}
+    if(source.pi>kRecoveryMetadataMemberLimit) {CompleteMetadata(r,now,RecoveryReason::MetadataCountLimit,false);return true;}
+    if(!StableMetadataGate(source,prepared,cached,r.control.scope.schema==2) || !RecoveryPumpHeadroomAvailable(classification,frameCount,false)) {
+        r.value.reason=static_cast<std::uint64_t>(RecoveryReason::MetadataCountsNotReady);Publish(r);return false;
+    }
+    if(r.value.qpc>=r.metadataDeadlineQpc) {CompleteMetadata(r,r.value.qpc,RecoveryReason::MetadataTimeout,false);return true;}
+    if(!r.metadataCalls.head || !r.metadataCalls.fill || !r.metadataCalls.destroy || !r.metadataCalls.update) {
+        CompleteMetadata(r,now,RecoveryReason::MetadataUnavailable,false);return true;
+    }
+    if(!PrepareRecoveryMetadataMembers(r.metadataMembers,source.pi,r.metadataRandom)) {
+        CompleteMetadata(r,now,RecoveryReason::MetadataRandomUnavailable,false);return true;
+    }
+    RestoreMetadata(state,r,source);
+    if(r.terminal) return true;
+    if(!r.metadataUpdateReturned) {
+        if(!r.metadataDestructorEntered) {CompleteMetadata(r,r.value.qpc,RecoveryReason::MetadataUnavailable,false);return true;}
+        if(r.value.qpc>=r.metadataDeadlineQpc) {CompleteMetadata(r,r.value.qpc,RecoveryReason::MetadataTimeout,false);return true;}
+        r.value.reason=static_cast<std::uint64_t>(RecoveryReason::MetadataCountsNotReady);Publish(r);return false;
+    }
+    r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::MetadataVerify);
+    const bool read=MetadataInputs(state,r,&source,&prepared,&cached);
+    if(r.terminal) return true;
+    if(read && cached.fullDirty) r.value.flags|=RecoveryMetadataDirtyAfter;
+    CompleteMetadata(r,r.value.qpc,read && !prepared.mismatchMask ? RecoveryReason::None : RecoveryReason::MetadataUnverified,
+        read && !prepared.mismatchMask);
+    return true;
+}
+#endif
+bool RetryablePreflight(const LeechRecovery& r) noexcept {
+    // No reset based merely on Cancel not having run: descriptor/allocator and
+    // holder operations precede it. ANY native recipe entry is non-retryable.
+    if(r.control.scope.schema!=2 || r.recipeEntered || r.cancelEntered || r.bindEntered || r.bindCompleted ||
+        r.createInstalled || r.callbackDepth || r.metadataHeadOwned || r.holder ||
+        r.value.nativeStage || r.value.resourcePhase || r.value.exceptionCode ||
+        InterlockedCompareExchange(const_cast<volatile LONG*>(&r.foreignFault),0,0) ||
+        (r.value.flags&(RecoveryRecipeEntered|RecoveryExceptionObserved|RecoveryRestartRequired|RecoveryPublishedLocally))) return false;
+    // Do not merely move the one-shot trap to another diagnostic (for example
+    // a changing read-only SDK snapshot). Native non-entry is the boundary;
+    // every new request must independently reacquire all admission/leases.
+    return r.terminal && Phase(r)==RecoveryPhase::Rejected &&
+        (r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::MechanicsFailed) ||
+            r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::RecordingUnavailable)) &&
+        r.value.operationSequence && r.value.operationSequence!=UINT64_MAX &&
+        r.value.transitionSequence!=UINT64_MAX &&
+        r.value.reason!=static_cast<std::uint64_t>(RecoveryReason::InvalidRequest) &&
+        r.value.reason!=static_cast<std::uint64_t>(RecoveryReason::ClockFault);
+}
 void FinishTerminal(Runtime& state,LeechRecovery& r,std::uint64_t now) noexcept {
     (void)now; // Record headers sample a fresh clock; payload preserves fault time.
     TimingCopy(r);
-    const auto phase=(r.cancelEntered || (r.value.flags&RecoveryRestartRequired)) ? RecoveryPhase::Failed : RecoveryPhase::Rejected;
-    if(Phase(r)!=RecoveryPhase::Observed) {
+    const auto phase=(r.value.flags&RecoveryPublishedLocally) && !(r.value.flags&RecoveryRestartRequired) ? RecoveryPhase::Observed :
+        (r.cancelEntered || (r.value.flags&RecoveryRestartRequired)) ? RecoveryPhase::Failed : RecoveryPhase::Rejected;
+    if(Phase(r)!=phase) {
         r.value.flags|=RecoveryTerminal;Transition(r,phase,r.value.qpc);
-        if(r.exceptionPending && RuntimeCaptureAdmission(state)) {Queue(r,RecoveryEvent::Exception);r.exceptionPending=false;}
     }
+    if(r.exceptionPending && RuntimeCaptureAdmission(state)) {Queue(r,RecoveryEvent::Exception);r.exceptionPending=false;}
     if(r.finalPending) {Queue(r,RecoveryEvent::Final);r.finalPending=false;}
-    if(!Flush(state,r)) {r.pendingRead=0;r.pendingCount=0;Publish(r);}
+    // Preflight holds no native resources but still needs bounded record credit
+    // for its terminal transition/final. Do not silently drop its explanation.
+    if(!state.recoveryQuota.active && r.pendingRead<r.pendingCount && RuntimeCaptureAdmission(state))
+        ReserveCapture(state,state.recoveryQuota,r.pendingCount-r.pendingRead);
+    const bool flushed=Flush(state,r);
+    if(!flushed) {
+        // A revoked/stopped runtime cannot regain capture authority. Keeping
+        // records due forever would starve AfterPump's owned-hook cleanup.
+        // Retain only potentially recoverable transport/credit backlog.
+        if(!RuntimeAdmission(state) || ReadStatusWord(state.config.status->stopping)) {r.pendingRead=0;r.pendingCount=0;}
+        Publish(r);
+    }
     ReleaseCapture(state,state.recoveryQuota);
     if(!r.cancelEntered && !(r.value.flags&RecoveryRestartRequired) && RecoveryRuntimeSafeOwner(state) &&
         ReadTaskPhase(state.task)!=TaskPhase::Inert) state.bindingSuspended=false;
+    if(flushed && RuntimeCaptureAdmission(state) && !state.bindingSuspended && RetryablePreflight(r) &&
+        recovery::ReleasePreflightClaim(r.control)) {
+        r.value.flags|=RecoveryPreflightRetryable;Publish(r);
+    }
 }
 } // namespace
 
@@ -488,7 +707,8 @@ bool PrepareLeechRecovery(LeechRecovery& r,Runtime& state,const StartupProfile& 
     r.value.ownerThreadId=state.config.ownerThreadId;r.value.reason=static_cast<std::uint64_t>(RecoveryReason::PermissionDisabled);
     if(ReadStatusWord(r.status->headerReady)!=1) InitializeRecoveryStatus(*r.status,state.config.status->header);
     DWORD error{};
-    const auto control=recovery::InitializeControl(r.control,directory,state.config.status->header.pid,state.config.status->header.runId,&error);
+    const auto control=recovery::InitializeControl(r.control,directory,state.config.status->header.pid,state.config.status->header.runId,&error,
+        state.config.mode==Mode::Observe);
     if(control!=recovery::ControlResult::Ready) {
         using C=recovery::ControlResult;
         const auto reason=control==C::Disabled ? RecoveryReason::PermissionDisabled :
@@ -504,6 +724,7 @@ bool PrepareLeechRecovery(LeechRecovery& r,Runtime& state,const StartupProfile& 
     }
     const void* prefix[]{reinterpret_cast<const void*>(&CreateSuccess)};
     if(ValidateNativeRecoveryProfile(state.config.hostBase,startup,state.config.memory,*r.native.imports,&error)!=ProfileResult::Ready ||
+        ValidateNativeRecoveryMetadataProfile(state.config.hostBase,startup,state.config.memory,*r.native.imports,&error)!=ProfileResult::Ready ||
         !PrepareCaptureProfile(companion,state.config.hostBase,state.config.hostSize,prefix,1,&r.createCapture)) {
         r.value.reason=static_cast<std::uint64_t>(RecoveryReason::NativeProfileMismatch);Publish(r);return false;
     }
@@ -511,9 +732,13 @@ bool PrepareLeechRecovery(LeechRecovery& r,Runtime& state,const StartupProfile& 
     // Defense in depth: this build retains no recipe pointers. The compiled-out
     // owner call sites below are the primary no-native-mutation boundary.
     r.calls={};
+    r.metadataCalls={};r.metadataRandom={};
 #else
     r.calls=NativeRecoveryCallAddresses(state.config.hostBase);
+    r.metadataCalls=NativeRecoveryMetadataCallAddresses(state.config.hostBase);
+    r.metadataRandom=ProductionRecoveryRandomOps();
 #endif
+    PrepareLeechConsole(r.console,r,companion);
     r.prepared=true;return true;
 }
 void ArmLeechRecovery(LeechRecovery& r) noexcept {
@@ -528,9 +753,15 @@ void ArmLeechRecovery(LeechRecovery& r) noexcept {
 bool RecoveryServiceDue(const Runtime& state) noexcept {
     const auto* r=state.config.recovery;
     if(!r || !r->prepared || !r->controlStarted) return false;
-    if(r->requested) return !r->terminal || r->finalPending || r->pendingCount!=0;
+    if((r->value.flags&RecoveryPreflightRetryable) &&
+        InterlockedCompareExchange(const_cast<volatile LONG*>(&r->foreignFault),0,0)) return true;
+    if(r->requested && !(r->value.flags&RecoveryPreflightRetryable)) return !r->terminal || r->finalPending || r->pendingCount!=0;
     const auto result=static_cast<recovery::ControlResult>(InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.result),0,0));
-    return InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.latched),0,0)!=0 ||
+    const auto latch=InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.latched),0,0);
+    // There is no in-progress latch state. The single reader below either
+    // accepts the immutable claim or consumes an invalid value visibly; do not
+    // strand a nonzero invalid claim in Armed forever.
+    return latch!=0 ||
         (result!=recovery::ControlResult::Ready && result!=recovery::ControlResult::Missing && result!=recovery::ControlResult::PendingWrite);
 }
 void RecoveryOwnerClockFault(Runtime& state) noexcept {
@@ -565,14 +796,18 @@ bool ServiceLeechRecovery(Runtime& state,CallerClass classification,std::size_t 
                     Fault(r,RecoveryReason::FinishTimeout,RecoveryOutcome::MechanicsFailed,r.cancelEntered);
             }
             if(r.terminal) {
-                const auto phase=Phase(r)==RecoveryPhase::Observed ? RecoveryPhase::Observed :
+                const auto phase=(r.value.flags&RecoveryPublishedLocally) && !(r.value.flags&RecoveryRestartRequired) ? RecoveryPhase::Observed :
                     (r.cancelEntered || (r.value.flags&RecoveryRestartRequired)) ? RecoveryPhase::Failed : RecoveryPhase::Rejected;
                 if(Phase(r)!=phase) {
                     if(r.value.transitionSequence!=UINT64_MAX) ++r.value.transitionSequence;
                     r.value.phase=static_cast<std::uint64_t>(phase);
                 }
                 r.value.flags|=RecoveryTerminal;
-                r.pendingRead=0;r.pendingCount=0;r.finalPending=false;
+                r.pendingRead=0;r.pendingCount=0;
+                // No logging authority on this capture. A pure preflight
+                // terminal can be recorded/released on a later NORMAL visit;
+                // irreversible terminals preserve the existing fallthrough.
+                r.finalPending=!r.recipeEntered && phase==RecoveryPhase::Rejected;
                 Publish(r);ReleaseCapture(state,state.recoveryQuota);
                 // Management can be rate-limited on this fallthrough. Only a
                 // clean pre-cancel rejection may resume ordinary binding.
@@ -584,14 +819,39 @@ bool ServiceLeechRecovery(Runtime& state,CallerClass classification,std::size_t 
         return false;
     }
     const auto now=static_cast<std::uint64_t>(qpc);
+    if(r.terminal && (r.value.flags&RecoveryPreflightRetryable)) {
+        if(InterlockedCompareExchange(&r.foreignFault,0,0)) {
+            Fault(r,RecoveryReason::CallbackInvalid,RecoveryOutcome::MechanicsFailed,true);
+            FinishTerminal(state,r,now);SetLastError(incoming);return true;
+        }
+        if(InterlockedCompareExchange(&r.control.stop,0,0) ||
+            InterlockedCompareExchange(&r.control.result,0,0)!=static_cast<LONG>(recovery::ControlResult::Ready)) {
+            r.value.flags&=~RecoveryPreflightRetryable;
+            r.value.reason=static_cast<std::uint64_t>(RecoveryReason::ControlWorkerUnavailable);
+            r.finalPending=true;FinishTerminal(state,r,now);SetLastError(incoming);return true;
+        }
+        // Only the owner starts a NEW request. Keep process-resident native,
+        // console and worker state intact; the rejected preflight made no
+        // native calls and therefore has no borrowed resource to clean up.
+        recovery::ControlRequest next{};
+        if(!recovery::ReadLatchedControl(r.control,&next)) {SetLastError(incoming);return false;}
+        const auto operation=r.value.operationSequence,transition=r.value.transitionSequence,owner=r.value.ownerThreadId;
+        r.value={};r.value.flags=RecoveryPermissionEnabled;r.value.operationSequence=operation;
+        r.value.transitionSequence=transition;r.value.ownerThreadId=owner;
+        r.value.phase=static_cast<std::uint64_t>(RecoveryPhase::Armed);
+        r.requested=false;r.terminal=false;r.finalPending=false;r.qualifyingRecordSequence=0;
+    }
     if(r.requested && !r.terminal) r.value.qpc=now;
     if(InterlockedCompareExchange(&r.foreignFault,0,0)) Fault(r,RecoveryReason::CallbackInvalid,RecoveryOutcome::MechanicsFailed,true);
     if(!r.requested) {
-        recovery::ControlRequest request{};
-        if(!recovery::ReadLatchedControl(r.control,&request)) {
+        recovery::ControlRequest request{};recovery::RequestOrigin origin{};
+        if(!recovery::ReadLatchedControl(r.control,&request,&origin)) {
             r.requested=true;Fault(r,RecoveryReason::InvalidRequest,RecoveryOutcome::MechanicsFailed,false);
         } else {
-            r.requested=true;r.value.operationSequence=1;r.value.sourceEpoch=state.counters.sourceEpoch;r.value.sdkEpoch=state.idleLifecycle;
+            r.requested=true;
+            if(r.value.operationSequence==UINT64_MAX) {Fault(r,RecoveryReason::InvalidRequest,RecoveryOutcome::MechanicsFailed,false);FinishTerminal(state,r,now);SetLastError(incoming);return true;}
+            ++r.value.operationSequence;r.value.sourceEpoch=state.counters.sourceEpoch;r.value.sdkEpoch=state.idleLifecycle;
+            if(origin==recovery::RequestOrigin::ServerAdminConsole) r.value.flags|=RecoveryConsoleRequested;
             const auto frequency=state.producer.frequency;
             if(frequency<=0 || static_cast<std::uint64_t>(frequency)>static_cast<std::uint64_t>(INT64_MAX)/kAttemptSeconds ||
                 now>static_cast<std::uint64_t>(INT64_MAX)-static_cast<std::uint64_t>(frequency)*kAttemptSeconds)
@@ -628,22 +888,17 @@ bool ServiceLeechRecovery(Runtime& state,CallerClass classification,std::size_t 
             FinishTerminal(state,r,now);SetLastError(incoming);return true;
         }
         if(!r.qualifyingRecordSequence || ReadStatusWord(state.config.status->worker.observedSequence)<r.qualifyingRecordSequence) return true;
-        if(!RecoveryPumpHeadroomAvailable(classification,count,truncated) || RecoveryRuntimeSource(state,&r.source)!=Reason::None ||
-            r.source.bots!=0 || r.source.humans!=2 || RecoveryRuntimeTask(state,&r.oldHeartbeat)!=Reason::None ||
-            r.oldHeartbeat.state!=2 || !r.oldHeartbeat.schedule.valid || r.oldHeartbeat.schedule.interval!=30000 ||
-            r.oldHeartbeat.schedule.errors || r.oldHeartbeat.schedule.throttles || r.oldHeartbeat.schedule.expedite ||
-            r.oldHeartbeat.schedule.intervalOverride || r.oldHeartbeat.schedule.retryOverride || r.oldHeartbeat.schedule.retryLimit!=3) {
-            Fault(r,RecoveryReason::HeartbeatUnavailable,RecoveryOutcome::MechanicsFailed,false);
+        const auto preflight=Preflight(state,r,classification,count,truncated);
+        if(preflight!=RecoveryReason::None) {
+            Fault(r,preflight,RecoveryOutcome::MechanicsFailed,false);
+        } else if(r.source.outer.pi>kRecoveryMetadataMemberLimit) {
+            Fault(r,RecoveryReason::MetadataCountLimit,RecoveryOutcome::MechanicsFailed,false);
         } else {
             DWORD error{};
             const auto readResult=ReadNativeRecoverySnapshot(r.native,&r.before,&error);
             const auto guard=NativeGuardReason(readResult,r.before,r.oldHeartbeat);
             if(guard!=RecoveryReason::SnapshotGuardPassed) {
-#if defined(RS2_RECOVERY_GUARD_PROBE)
                 Fault(r,guard,RecoveryOutcome::MechanicsFailed,false);
-#else
-                Fault(r,RecoveryReason::NativeProfileMismatch,RecoveryOutcome::MechanicsFailed,false);
-#endif
             } else {
 #if !defined(RS2_RECOVERY_GUARD_PROBE)
                 r.value.oldSdkFingerprint=Fingerprint(r.before.sdkBytes,static_cast<std::size_t>(r.before.sdkSession.size));
@@ -685,17 +940,15 @@ bool ServiceLeechRecovery(Runtime& state,CallerClass classification,std::size_t 
                 r.value.newCacheFingerprint=Fingerprint(r.current.cacheBytes,static_cast<std::size_t>(r.current.cacheSession.size));
                 r.publishedSession=r.current.sdkSession;
                 std::memcpy(r.publishedSessionBytes,r.current.sdkBytes,sizeof(r.publishedSessionBytes));
+                r.value.flags|=RecoveryPublishedLocally;
+                const auto frequency=static_cast<std::uint64_t>(state.producer.frequency);
+                r.metadataDeadlineQpc=(std::min)(now+frequency*kMetadataSeconds,r.value.overallDeadlineQpc-frequency);
                 r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::Publish);TimingCopy(r);
                 Transition(r,RecoveryPhase::Published,now);state.bindingSuspended=false;
             }
         }
     } else if(Phase(r)==RecoveryPhase::Published) {
-        if(!Lease(state,r,3,false) || !SameBytes(r.current.sdkSession,r.current.sdkBytes,r.publishedSession,r.publishedSessionBytes) ||
-            !CacheMatches(r.current)) Fault(r,RecoveryReason::LifecycleChanged,RecoveryOutcome::MechanicsFailed,true);
-        else if(ReadTaskPhase(state.task)==TaskPhase::Armed) {
-            r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::Rebind);r.value.outcome=static_cast<std::uint64_t>(RecoveryOutcome::PublishedNotDelivered);
-            r.value.flags|=RecoveryTerminal;Transition(r,RecoveryPhase::Observed,now);r.terminal=true;r.finalPending=true;
-        } else {Publish(r);SetLastError(incoming);return false;} // Ordinary fresh Bind gets NEW authority.
+        if(!ServiceMetadata(state,r,classification,count,now)) {SetLastError(incoming);return false;}
     }
 #endif
     if(r.terminal) FinishTerminal(state,r,now);

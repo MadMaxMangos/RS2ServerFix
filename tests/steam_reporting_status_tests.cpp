@@ -137,7 +137,7 @@ void DurationAndOverflow() {
 void V3PublicationAndPauseGates() {
     StatusWireV3 wire{};
     RS2_CHECK(InitializeStatusV3(wire, Header(), Payload(1)));
-    RS2_CHECK(wire.header.schema == 3 && wire.header.bytes == 3896 && wire.header.artifactVersion == 0x00060200);
+    RS2_CHECK(wire.header.schema == 3 && wire.header.bytes == 3896 && wire.header.artifactVersion == 0x00070100);
     RS2_CHECK(!InitializeStatusV3(wire, Header(), Payload(2)));
     auto owner = Payload(2);
     owner.reportSequence = 10;

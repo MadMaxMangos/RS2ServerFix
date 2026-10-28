@@ -47,7 +47,7 @@ constexpr bool EqualCounts(const NativeCounts& a, const NativeCounts& b) noexcep
     return a.pi == b.pi && a.bots == b.bots && a.maximum == b.maximum;
 }
 struct Config { Mode mode; };
-enum class Diagnostics : std::uint32_t { Invalid = 0, Normal, Detailed };
+enum class Diagnostics : std::uint32_t { Invalid = 0, Normal, Detailed, Operational };
 struct ConfigV3 { Mode mode; Diagnostics diagnostics; };
 inline constexpr std::uint32_t kConfigSchemaV3 = 3;
 inline constexpr std::uint32_t kConfigSchema = 2;

@@ -98,7 +98,21 @@ struct ReportBuilderPayload {
     std::uint32_t result;
     std::uint32_t pending;
     std::uint32_t fresh;
-    std::uint64_t reserved[13];
+    // V3 count-only diagnostic, reusing formerly reserved space. The legacy
+    // V2 canonicalizer deliberately leaves these fields zero.
+    std::uint32_t preparedValid;
+    std::uint32_t preparedMismatchMask;
+    std::uint32_t preparedMaximum;
+    std::uint32_t preparedMembers;
+    std::uint32_t preparedPi;
+    std::uint32_t preparedBots;
+    std::uint32_t preparedJsonMaximum;
+    std::uint32_t preparedJsonBytes;
+    // Entry-time observation, copied unchanged to Return/Unwind. It is not a
+    // post-builder value or evidence of delivery to the backend.
+    std::uint32_t preparedDirtyValid;
+    std::uint32_t preparedDirtyAtEntry;
+    std::uint64_t reserved[8];
 };
 struct ReportDurationSummary {
     std::uint64_t calls;
@@ -132,6 +146,9 @@ static_assert(sizeof(ReportStatePayload)==208 && sizeof(ReportRequestPayload)==2
 static_assert(offsetof(ReportStatePayload,nativeScheduleValid)==104 &&
     offsetof(ReportStatePayload,nativeTier)==184 && offsetof(ReportStatePayload,reserved)==192);
 static_assert(sizeof(ReportBuilderPayload)==208 && sizeof(ReportAnchorPayload)==208);
+static_assert(offsetof(ReportBuilderPayload,preparedValid)==104 &&
+    offsetof(ReportBuilderPayload,preparedDirtyValid)==136 &&
+    offsetof(ReportBuilderPayload,reserved)==144);
 static_assert(sizeof(ReportPayload)==208 && sizeof(ReportRecord)==256 && alignof(ReportRecord)==8);
 static_assert(kReportBatchLimit*sizeof(ReportRecord)==8192);
 static_assert(std::is_trivial_v<ReportRecord> && std::is_standard_layout_v<ReportRecord> &&

@@ -49,6 +49,9 @@ void Formatting() {
     RS2_CHECK(FormatNativeBootstrap(c,output,sizeof(output),&bytes));
     CheckJson(output,bytes,c);
     RS2_CHECK(std::strstr(output,"\"sequence\":0")!=nullptr);
+    RS2_CHECK(std::strstr(output,"\"prepared_counts_schema\":1")!=nullptr);
+    RS2_CHECK(std::strstr(output,"\"prepared_dirty_schema\":1")!=nullptr &&
+        std::strstr(output,"\"recovery_origin_schema\":1")!=nullptr);
     RS2_CHECK(std::strstr(output,"\"log_path\":\"E:\\\\Logs\\\\Launch.log\"")!=nullptr);
     RS2_CHECK(std::strstr(output,"\"run_id\":\"ab0000000000000000000000000000ef\"")!=nullptr);
     // Every schema kind, including worst scalar widths, must remain bounded.
@@ -104,6 +107,30 @@ void Formatting() {
     invalid.header.sequence=1; invalid.header.kind=static_cast<std::uint32_t>(RecordKindV3::Count);
     RS2_CHECK(!FormatNativeRecord(c,invalid,output,sizeof(output),&bytes));
 }
+void PreparedFormatting() {
+    const auto c=Context(); ReportRecordV3 record{};
+    record.header.kind=static_cast<std::uint32_t>(RecordKindV3::BuilderReturn);
+    record.header.sequence=1; record.header.qpc=200;
+    auto& p=record.payload.builder;
+    p.preparedValid=1; p.preparedMismatchMask=2; p.preparedMaximum=32;
+    p.preparedPi=2; p.preparedJsonMaximum=32; p.preparedJsonBytes=150;
+    p.preparedDirtyValid=1; p.preparedDirtyAtEntry=1;
+    char output[native_log::kMessageLimit+1]{}; std::size_t bytes{};
+    RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes));
+    CheckJson(output,bytes,c);
+    RS2_CHECK(std::strstr(output,"\"prepared_valid\":1") &&
+        std::strstr(output,"\"prepared_mismatch_mask\":2") &&
+        std::strstr(output,"\"prepared_members\":0") &&
+        std::strstr(output,"\"prepared_pi\":2") &&
+        std::strstr(output,"\"prepared_json_maximum\":32") &&
+        std::strstr(output,"\"prepared_dirty_valid\":1") &&
+        std::strstr(output,"\"prepared_dirty_at_entry\":1"));
+    p.preparedValid=0;
+    p.preparedDirtyValid=0;
+    RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes));
+    RS2_CHECK(std::strstr(output,"\"prepared_valid\":0") && !std::strstr(output,"\"prepared_pi\":") &&
+        std::strstr(output,"\"prepared_dirty_valid\":0") && !std::strstr(output,"\"prepared_dirty_at_entry\":"));
+}
 void RecoveryFormatting() {
     auto c = Context();
     ReportRecordV3 record{};
@@ -140,7 +167,14 @@ void RecoveryFormatting() {
     }
     unsigned keyCount{};
     for (const char* at = output; (at = std::strstr(at, "\":")) != nullptr; at += 2) ++keyCount;
-    RS2_CHECK(keyCount == 39 && !std::strstr(output, "unused_quota"));
+    RS2_CHECK(keyCount == 40 && !std::strstr(output, "unused_quota"));
+    RS2_CHECK(std::strstr(output,"\"recovery_request_origin\":0"));
+    p.operationSequence=1;
+    RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes) &&
+        std::strstr(output,"\"recovery_request_origin\":1"));
+    p.flags|=RecoveryConsoleRequested;
+    RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes) &&
+        std::strstr(output,"\"recovery_request_origin\":2"));
     for (unsigned invalid = 0; invalid < 4; ++invalid) {
         auto bad = record;
         if (invalid == 0) bad.header.reason = 1;
@@ -148,6 +182,40 @@ void RecoveryFormatting() {
         if (invalid == 2) bad.payload.recovery.recordSequence = 42;
         if (invalid == 3) bad.payload.recovery.flags &= ~RecoveryCallbackOwnTimingValid;
         RS2_CHECK(!FormatNativeRecord(c, bad, output, sizeof(output), &bytes) && !bytes && !output[0]);
+    }
+}
+void OperationalFormatting() {
+    auto c=Context();c.config.diagnostics=Diagnostics::Operational;
+    char output[native_log::kMessageLimit+1]{};std::size_t bytes{};
+    RS2_CHECK(FormatNativeBootstrap(c,output,sizeof(output),&bytes));CheckJson(output,bytes,c);
+    RS2_CHECK(std::strstr(output,"\"diagnostics\":\"operational\"") &&
+        std::strstr(output,"\"anchor_interval_seconds\":60") &&
+        std::strstr(output,"\"operational_fields_schema\":1") &&
+        std::strstr(output,"\"qualification_evidence\":false") &&
+        std::strstr(output,"\"recovery_detail_post_terminal_pairs\":4") &&
+        std::strstr(output,"\"recovery_detail_deadline_fallback\":true"));
+    ReportRecordV3 record{};record.header.sequence=1;record.header.qpc=200;
+    for (const auto kind:{RecordKindV3::State,RecordKindV3::BuilderEnter,RecordKindV3::BuilderReturn,
+            RecordKindV3::BuilderUnwind,RecordKindV3::Anchor,RecordKindV3::TransportSummary}) {
+        record.header.kind=static_cast<std::uint32_t>(kind);
+        RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes));CheckJson(output,bytes,c);
+        const auto compactBytes=bytes;
+        RS2_CHECK(std::strstr(output,"\"detail\":\"operational\"") && !std::strstr(output,"\"probe_elapsed_ticks\":"));
+        RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes,true));CheckJson(output,bytes,c);
+        RS2_CHECK(std::strstr(output,"\"detail\":\"full\"") && bytes>compactBytes);
+    }
+    char tiny[8]{};bytes=99;
+    RS2_CHECK(!FormatNativeRecord(c,record,tiny,sizeof(tiny),&bytes) && !bytes && !tiny[0]);
+    c.log.pathChars=1023;
+    std::fill(std::begin(c.log.path),std::end(c.log.path),std::uint16_t{0x010A});c.log.path[1023]=0;
+    RS2_CHECK(FormatNativeBootstrap(c,output,sizeof(output),&bytes) && bytes<native_log::kMessageLimit);
+    CheckJson(output,bytes,c);
+    for (const auto legacy:{Diagnostics::Normal,Diagnostics::Detailed}) {
+        c.config.diagnostics=legacy;
+        RS2_CHECK(FormatNativeBootstrap(c,output,sizeof(output),&bytes));
+        RS2_CHECK(!std::strstr(output,"\"operational_fields_schema\":") && !std::strstr(output,"\"qualification_evidence\":"));
+        RS2_CHECK(FormatNativeRecord(c,record,output,sizeof(output),&bytes));
+        RS2_CHECK(!std::strstr(output,"\"detail\":"));
     }
 }
 void ClockArithmetic() {
@@ -170,5 +238,5 @@ void ClockArithmetic() {
     RS2_CHECK(!DeriveUtcFiletime(c.log,1,2,&utc));
 }
 }
-void NativeLogFormatTests() { Formatting(); ClockArithmetic(); RecoveryFormatting(); }
+void NativeLogFormatTests() { Formatting(); ClockArithmetic(); RecoveryFormatting(); PreparedFormatting(); OperationalFormatting(); }
 }

@@ -719,8 +719,27 @@ void PrepareBuilder(Runtime& state, CallerClass classification, void* holder,
         reason=ReadFreshTuple(state.producer,now,source.outer,source.bots,&fresh);
     if (reason==Reason::None) {
         PreparedSnapshot prepared{};
+        PreparedDiagnostic diagnostic{};
         reason=ReadPreparedState({state.config.memory,state.config.hostBase,state.config.hostSize,&state.config.prepared},
-            source.outer,state.scratch,sizeof(state.scratch),&prepared);
+            source.outer,state.scratch,sizeof(state.scratch),&prepared,&diagnostic);
+        if (diagnostic.valid) {
+            value.preparedValid=1; value.preparedMismatchMask=diagnostic.mismatchMask;
+            value.preparedMaximum=diagnostic.maximum; value.preparedMembers=diagnostic.membersCount;
+            value.preparedPi=diagnostic.json.pi; value.preparedBots=diagnostic.json.bots;
+            value.preparedJsonMaximum=diagnostic.json.maximum; value.preparedJsonBytes=diagnostic.jsonBytes;
+        }
+        // Optional read-only evidence. Unavailable/unstable dirty bits do not
+        // change builder admission or become an invented zero observation.
+        const auto savedError=GetLastError();
+        const auto rva=state.config.prepared.fullDirty;
+        std::uint8_t first{},second{}; DWORD error{};
+        if (rva<state.config.hostSize && Writable(state,state.config.hostBase+rva,1,true) &&
+            state.config.memory.read(state.config.memory.context,state.config.hostBase+rva,&first,1,&error) &&
+            state.config.memory.read(state.config.memory.context,state.config.hostBase+rva,&second,1,&error) &&
+            first<=1 && first==second) {
+            value.preparedDirtyValid=1; value.preparedDirtyAtEntry=first;
+        }
+        SetLastError(savedError);
     }
     std::int64_t finalQpc=now;
     if (reason==Reason::None) {
@@ -810,8 +829,8 @@ void PublishRuntimeStatus(Runtime& state, std::int64_t now, bool allowAnchor,Cap
     else if (!state.sdkReady) value.phase=static_cast<std::uint64_t>(ReportPhaseV3::AwaitingInit);
     else if (!state.sourceReady || !value.builderBound) value.phase=static_cast<std::uint64_t>(ReportPhaseV3::Prepared);
     else value.phase=static_cast<std::uint64_t>(state.config.mode==Mode::Repair ? ReportPhaseV3::Repairing : ReportPhaseV3::Observing);
-    const auto cadence=state.config.diagnostics==Diagnostics::Detailed ? state.producer.frequency :
-        state.producer.frequency*10;
+    const auto cadence=state.producer.frequency*(state.config.diagnostics==Diagnostics::Operational ? 60 :
+        state.config.diagnostics==Diagnostics::Detailed ? 1 : 10);
     if (allowAnchor && !state.bindingSuspended && state.readyNotified && RuntimeCaptureAdmission(state) && now>=0 &&
         (!state.haveAnchor || now-state.lastAnchor>=cadence)) {
         CaptureReservation own{};

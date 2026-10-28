@@ -4,10 +4,13 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <climits>
+#include <bcrypt.h>
 
 namespace rs2fix::reporting {
 namespace {
 #include "companion/leech_recovery_native_profile_data.inc"
+#include "companion/leech_recovery_metadata_profile_data.inc"
 constexpr RecoveryNativeLayout kLayout{
     0x17AAC80,0x17AAC78,0x17AA9C0,0x14AAD8C,0x179D450,
     0x14AAD20,0x14AAD28,0x14A4A08,0x1798800,0x17AEA18,0x14AAD70,
@@ -318,6 +321,11 @@ bool Context(const RecoveryNativeContext& c) noexcept {
     return c.hostBase && c.hostImageSize && c.hostImageSize<=(std::numeric_limits<std::uintptr_t>::max)()-c.hostBase &&
         c.memory.query && c.memory.read && c.imports && c.imports->resolve;
 }
+bool Random(void*,std::uint8_t* output,std::size_t bytes) noexcept {
+    return output && bytes && bytes<=ULONG_MAX && BCryptGenRandom(nullptr,output,
+        static_cast<ULONG>(bytes),BCRYPT_USE_SYSTEM_PREFERRED_RNG)==0;
+}
+constexpr RecoveryRandomOps kRandom{nullptr,Random};
 bool SameString(const RecoveryNativeString& a,const RecoveryNativeString& b) noexcept {
     return a.object==b.object && a.data==b.data && a.size==b.size && a.capacity==b.capacity &&
         !std::memcmp(a.header,b.header,sizeof(a.header));
@@ -336,6 +344,34 @@ bool SameSlot(const RecoveryNativeSnapshot& a,const RecoveryTypedSlot& aa,
 } // namespace
 const RecoveryNativeLayout& ProductionRecoveryNativeLayout() noexcept {return kLayout;}
 const char* NativeRecoveryInventorySha256() noexcept {return kRecoveryInventorySha256;}
+const RecoveryRandomOps& ProductionRecoveryRandomOps() noexcept {return kRandom;}
+const char* NativeRecoveryMetadataInventorySha256() noexcept {return kRecoveryMetadataInventorySha256;}
+bool PrepareRecoveryMetadataMembers(RecoveryMetadataMembers& out,std::uint32_t count,
+    const RecoveryRandomOps& random) noexcept {
+    std::memset(&out,0,sizeof(out));
+    if(count>kRecoveryMetadataMemberLimit || (count && !random.fill)) return false;
+    std::uint8_t entropy[kRecoveryMetadataMemberLimit*16]{};
+    if(count && !random.fill(random.context,entropy,static_cast<std::size_t>(count)*16)) return false;
+    constexpr char hex[]="0123456789abcdef";
+    for(std::uint32_t i=0;i<count;++i) {
+        auto* uuid=entropy+static_cast<std::size_t>(i)*16;
+        uuid[6]=static_cast<std::uint8_t>((uuid[6]&0x0f)|0x40);
+        uuid[8]=static_cast<std::uint8_t>((uuid[8]&0x3f)|0x80);
+        std::size_t cursor{};
+        for(std::size_t byte=0;byte<16;++byte) {
+            if(byte==4 || byte==6 || byte==8 || byte==10) out.text[i][cursor++]='-';
+            out.text[i][cursor++]=hex[uuid[byte]>>4];
+            out.text[i][cursor++]=hex[uuid[byte]&15];
+        }
+        // The zeroed final byte terminates each initialized 36-byte UUID.
+        out.strings[i]={reinterpret_cast<std::uintptr_t>(out.text[i]),0,36,36};
+    }
+    out.vector.begin=reinterpret_cast<std::uintptr_t>(out.strings);
+    out.vector.end=out.vector.begin+static_cast<std::uintptr_t>(count)*sizeof(out.strings[0]);
+    out.vector.capacity=out.vector.end;
+    out.count=count;
+    return true;
+}
 ProfileResult ValidateNativeRecoveryProfile(std::uintptr_t base,const StartupProfile& host,
     const MemoryOps& memory,const NativeImportOps& imports,DWORD* error) noexcept {
     // One invocation only. Sharing region metadata across these fixed immutable
@@ -349,8 +385,65 @@ ProfileResult ValidateNativeRecoveryProfile(std::uintptr_t base,const StartupPro
     }
     return ProfileResult::Ready;
 }
+ProfileResult ValidateNativeRecoveryMetadataProfile(std::uintptr_t base,const StartupProfile& host,
+    const MemoryOps& memory,const NativeImportOps& imports,DWORD* error) noexcept {
+    ReadScope scope(memory);
+    for(const auto& partition:kMetadataPartitions) {
+        const auto result=ValidateNativeLoggingProfile(base,host,partition,scope.Ops(),imports,error);
+        if(result!=ProfileResult::Ready) return result;
+    }
+    return ProfileResult::Ready;
+}
+RecoveryNativeResult ReadRecoveryMetadataCache(const RecoveryNativeContext& context,
+    RecoveryMetadataCache* output,DWORD* error) noexcept {
+    const auto incoming=GetLastError();if(output)*output={};if(error)*error=ERROR_INVALID_DATA;
+    auto result=RecoveryNativeResult::InvalidContext;
+    if(output && Context(context)) {
+        RecoveryMetadataCache observed[2]{};
+        result=RecoveryNativeResult::Ready;
+        for(auto& value:observed) {
+            std::uint8_t cached[24]{};
+            if(!ImageRangeProtection(context.hostBase,context.hostImageSize,0x17989F0,sizeof(cached),
+                    PAGE_READWRITE,context.memory,error) ||
+                !ReadImageRange(context.hostBase,context.hostImageSize,0x17989F0,cached,sizeof(cached),context.memory,error) ||
+                !ImageRangeProtection(context.hostBase,context.hostImageSize,0x14AAD88,1,PAGE_READWRITE,context.memory,error) ||
+                !ReadImageRange(context.hostBase,context.hostImageSize,0x14AAD88,&value.fullDirty,1,context.memory,error)) {
+                result=RecoveryNativeResult::Unreadable;break;
+            }
+            value.registrationChanged=cached[0];
+            std::memcpy(&value.counts.bots,cached+8,4);
+            std::memcpy(&value.counts.maximum,cached+12,4);
+            std::memcpy(&value.counts.pi,cached+16,4);
+            std::memcpy(&value.countdownBits,cached+20,4);
+            if(value.registrationChanged>1 || value.fullDirty>1) {result=RecoveryNativeResult::Shape;break;}
+        }
+        if(result==RecoveryNativeResult::Ready && std::memcmp(&observed[0],&observed[1],sizeof(observed[0])))
+            result=RecoveryNativeResult::Changed;
+        if(result==RecoveryNativeResult::Ready) {*output=observed[0];if(error)*error=ERROR_SUCCESS;}
+    }
+    SetLastError(incoming);return result;
+}
 bool EqualNativeRecoverySnapshot(const RecoveryNativeSnapshot& a,const RecoveryNativeSnapshot& b) noexcept {
     return !std::memcmp(&a,&b,sizeof(a));
+}
+RecoveryNativeResult RequireRecoveryMetadataAllocator(const RecoveryNativeContext& context,
+    std::uintptr_t expected,DWORD* error) noexcept {
+    const auto incoming=GetLastError();if(error)*error=ERROR_INVALID_DATA;
+    auto result=RecoveryNativeResult::InvalidContext;
+    if(expected && Context(context)) {
+        const auto& layout=context.layout?*context.layout:kLayout;Reader reader(context,error);
+        result=RecoveryNativeResult::Ready;
+        for(unsigned pass=0;pass<2;++pass) {
+            reader.Reset();std::uintptr_t current{},table{},allocate{},reallocate{},release{};
+            if(!reader.Global(layout.gmalloc,current) || current!=expected || !reader.Field(current,0,table) ||
+                table!=context.hostBase+layout.gmallocVtable || !reader.Field(table,8,allocate) ||
+                allocate!=context.hostBase+0xA6F420 || !reader.Field(table,16,reallocate) ||
+                reallocate!=context.hostBase+0xA71E40 || !reader.Field(table,24,release) ||
+                release!=context.hostBase+0xA6CE90) {result=RecoveryNativeResult::Allocator;break;}
+        }
+        if(result==RecoveryNativeResult::Ready && error)*error=ERROR_SUCCESS;
+    }
+    SetLastError(incoming);return result;
 }
 RecoveryNativeResult ReadNativeRecoverySnapshot(const RecoveryNativeContext& context,
     RecoveryNativeSnapshot* out,DWORD* error) noexcept {
@@ -483,5 +576,12 @@ RecoveryNativeCalls NativeRecoveryCallAddresses(std::uintptr_t base) noexcept {
         reinterpret_cast<RecoveryVoidFn>(base+0xBAB210),reinterpret_cast<RecoveryVoidFn>(base+0xA53560),
         reinterpret_cast<RecoveryCreateSuccessFn>(base+0xBAB120),reinterpret_cast<RecoveryAllocateFn>(base+0xBF0DB0),
         reinterpret_cast<RecoveryTypeFn>(base+0xBF55F0),reinterpret_cast<RecoverySlotReleaseFn>(base+0xBF1900)};
+}
+RecoveryMetadataCalls NativeRecoveryMetadataCallAddresses(std::uintptr_t base) noexcept {
+    if(!base || base>(std::numeric_limits<std::uintptr_t>::max)()-0xBA9490) return {};
+    return {reinterpret_cast<RecoveryMetadataHeadFn>(base+0xA576F0),
+        reinterpret_cast<RecoveryMetadataObjectFn>(base+0xA5CAA0),
+        reinterpret_cast<RecoveryMetadataObjectFn>(base+0xA45CF0),
+        reinterpret_cast<RecoveryMetadataUpdateFn>(base+0xBA9490)};
 }
 } // namespace rs2fix::reporting

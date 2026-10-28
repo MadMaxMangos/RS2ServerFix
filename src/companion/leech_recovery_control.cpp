@@ -11,12 +11,34 @@
 namespace rs2fix::recovery {
 static_assert(std::is_trivial_v<ControlState> && std::is_standard_layout_v<ControlState>);
 namespace {
+bool ClaimControl(ControlState&, RequestOrigin) noexcept;
 constexpr DWORD kMutation = DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_DATA |
     FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD;
 constexpr DWORD kKnownAccess = FILE_ALL_ACCESS | GENERIC_ALL | GENERIC_READ |
     GENERIC_WRITE | GENERIC_EXECUTE;
 bool Equal(const char* bytes, std::size_t count, const char* expected) noexcept {
     return std::strlen(expected) == count && std::memcmp(bytes, expected, count) == 0;
+}
+bool PilotRoot(const wchar_t* root) noexcept {
+    if(!root) return false;
+    std::size_t length{};
+    while(length<kControlRootCharacters && root[length]) ++length;
+    if(length<4 || length>=kControlRootCharacters || root[1]!=L':' || root[2]!=L'\\' ||
+        !((root[0]>=L'A' && root[0]<=L'Z') || (root[0]>=L'a' && root[0]<=L'z'))) return false;
+    for(std::size_t i=3;i<length;++i) {
+        const auto c=root[i];
+        if(!((c>=L'A' && c<=L'Z') || (c>=L'a' && c<=L'z') || (c>=L'0' && c<=L'9') || c==L'_' || c==L'-')) return false;
+    }
+    return true;
+}
+bool AsciiRoot(const char* bytes,std::size_t count,wchar_t (&root)[kControlRootCharacters]) noexcept {
+    if(!bytes || count>=std::size(root)) return false;
+    for(std::size_t i=0;i<count;++i) root[i]=static_cast<unsigned char>(bytes[i]);
+    root[count]=L'\0';return PilotRoot(root);
+}
+bool ValidScope(const ControlScope& scope) noexcept {
+    return PilotRoot(scope.serverRoot) && (scope.schema==2 ||
+        (scope.schema==1 && std::wcscmp(scope.serverRoot,kTrainingRoot)==0));
 }
 bool SidEqual(PSID left, PSID right) noexcept {
     return left && right && IsValidSid(left) && IsValidSid(right) && EqualSid(left, right);
@@ -336,6 +358,7 @@ bool AuthenticatePeer(ControlState& state) noexcept {
     return accepted;
 }
 ControlResult ReceivePipe(ControlState& state) noexcept {
+    if (!ResetEvent(state.ioEvent)) { state.error = GetLastError(); return ControlResult::WorkerFailure; }
     OVERLAPPED operation{}; operation.hEvent = state.ioEvent;
     DWORD count{};
     const bool connected = ConnectNamedPipe(state.pipe, &operation) != FALSE;
@@ -362,16 +385,37 @@ ControlResult ReceivePipe(ControlState& state) noexcept {
     if (InterlockedCompareExchange(&state.stop, 0, 0)) return ControlResult::Stopped;
     if (!AuthenticatePeer(state)) return ControlResult::SecurityRejected;
     ControlRequest request{};
-    const auto result = ParseControlRequest(bytes, count, state.identity, &request);
+    const auto result = ParseControlRequest(bytes, count, state.identity, &request, &state.scope);
     if (result != ControlResult::Ready) { state.error = ERROR_INVALID_DATA; return result; }
-    state.request = request;
-    InterlockedExchange(&state.latched, 1);
-    return ControlResult::Latched;
+    // ParseControlRequest returned the immutable armed identity. Claiming just
+    // the origin publishes everything the owner needs in one atomic operation.
+    // A console winner (once explicitly enabled) cannot be overwritten here.
+    if (ClaimControl(state, RequestOrigin::Pipe)) return ControlResult::Latched;
+    if (InterlockedCompareExchange(&state.stop, 0, 0)) return ControlResult::Stopped;
+    // The owner may release a preflight claim immediately after our CAS lost.
+    // A second latch read must not turn that valid concurrent request into a
+    // malformed-message failure which permanently closes the shared endpoint.
+    if (state.scope.schema == 2) return ControlResult::AlreadyClaimed;
+    return InterlockedCompareExchange(&state.latched, 0, 0) ?
+        ControlResult::AlreadyClaimed : ControlResult::InvalidRequest;
 }
 DWORD WINAPI Worker(void* parameter) noexcept {
     auto& state = *static_cast<ControlState*>(parameter);
-    const auto result = ReceivePipe(state);
-    DisconnectNamedPipe(state.pipe);
+    ControlResult result{};
+    do {
+        result = ReceivePipe(state);
+        const bool disconnected = DisconnectNamedPipe(state.pipe) != FALSE;
+        if (!disconnected && GetLastError() != ERROR_PIPE_NOT_CONNECTED) {
+            state.error = GetLastError(); result = ControlResult::WorkerFailure; break;
+        }
+        // Schema2 permits later EXPLICIT requests after an owner-qualified
+        // preflight rejection. Every connection is authenticated anew. The
+        // common CAS still admits only one request, and a native recipe never
+        // releases its claim. Legacy training remains one-shot.
+        if (state.scope.schema != 2 ||
+            (result != ControlResult::Latched && result != ControlResult::AlreadyClaimed)) break;
+    } while (!InterlockedCompareExchange(&state.stop, 0, 0));
+    if (InterlockedCompareExchange(&state.stop, 0, 0)) result = ControlResult::Stopped;
     CloseHandle(state.pipe);
     InterlockedExchange(&state.result, static_cast<LONG>(result));
     return 0;
@@ -381,7 +425,7 @@ DWORD WINAPI Worker(void* parameter) noexcept {
 ControlResult ParseControlConfig(const char* bytes, std::size_t size, ControlConfig* output) noexcept {
     if (output) *output = {};
     if (!bytes || !size || size > kControlFileBytes || !output) return ControlResult::InvalidConfig;
-    ControlConfig parsed{}; unsigned fields{}; bool none{};
+    ControlConfig parsed{}; unsigned fields{},permission{}; bool none{};
     for (std::size_t cursor = 0; cursor < size;) {
         const auto start = cursor;
         while (cursor < size && bytes[cursor] != '\n') {
@@ -402,35 +446,50 @@ ControlResult ParseControlConfig(const char* bytes, std::size_t size, ControlCon
         while (value < last && (bytes[value] == ' ' || bytes[value] == '\t')) ++value;
         unsigned field{}; bool valid{};
         if (Equal(bytes + first, keyEnd - first, "schema")) {
-            field = 1; valid = Equal(bytes + value, last - value, "1");
+            field = 1;
+            if(Equal(bytes+value,last-value,"1")) parsed.scope.schema=1;
+            else if(Equal(bytes+value,last-value,"2")) parsed.scope.schema=2;
+            valid=parsed.scope.schema!=0;
         } else if (Equal(bytes + first, keyEnd - first, "permission")) {
             field = 2;
-            parsed.enabled = Equal(bytes + value, last - value, "training-finish-recreate");
-            valid = parsed.enabled || Equal(bytes + value, last - value, "disabled");
+            if(Equal(bytes+value,last-value,"training-finish-recreate")) permission=1;
+            else if(Equal(bytes+value,last-value,"manual-pilot-finish-recreate")) permission=2;
+            parsed.enabled=permission!=0;
+            valid=parsed.enabled || Equal(bytes+value,last-value,"disabled");
         } else if (Equal(bytes + first, keyEnd - first, "training_root")) {
-            field = 4; valid = Equal(bytes + value, last - value, "E:\\rs2v_trainingsrv");
+            field = 4; valid = Equal(bytes + value, last - value, "E:\\rs2v_trainingsrv") &&
+                AsciiRoot(bytes+value,last-value,parsed.scope.serverRoot);
+        } else if (Equal(bytes + first, keyEnd - first, "server_root")) {
+            field = 16; valid = AsciiRoot(bytes+value,last-value,parsed.scope.serverRoot);
         } else if (Equal(bytes + first, keyEnd - first, "operator_sid")) {
             field = 8; none = Equal(bytes + value, last - value, "none");
             valid = none || ParseSid(bytes + value, last - value, &parsed);
+        } else if (Equal(bytes + first, keyEnd - first, "console_trigger")) {
+            field = 32;
+            parsed.consoleRequested = Equal(bytes + value, last - value, "server-admin");
+            valid = parsed.consoleRequested || Equal(bytes + value, last - value, "disabled");
         }
         if (!field || !valid || (fields & field)) return ControlResult::InvalidConfig;
         fields |= field;
     }
-    if (fields != 15 || (parsed.enabled && none)) return ControlResult::InvalidConfig;
+    if(!ValidScope(parsed.scope) || (fields & ~32u)!=(parsed.scope.schema==1 ? 15u : 27u) ||
+        ((fields & 32u) && parsed.scope.schema!=2) ||
+        (parsed.enabled && (none || permission!=parsed.scope.schema))) return ControlResult::InvalidConfig;
     *output = parsed;
     return parsed.enabled ? ControlResult::Ready : ControlResult::Disabled;
 }
 ControlResult ParseControlRequest(const char* bytes, std::size_t size,
-    const ControlRequest& identity, ControlRequest* output) noexcept {
+    const ControlRequest& identity, ControlRequest* output, const ControlScope* scope) noexcept {
     if (output) *output = {};
-    if (!bytes || !size || size > kControlFileBytes || !output || !ValidIdentity(identity))
+    const auto& expected=scope?*scope:kTrainingControlScope;
+    if (!bytes || !size || size > kControlFileBytes || !output || !ValidIdentity(identity) || !ValidScope(expected))
         return ControlResult::InvalidRequest;
     Json json{bytes, size, 0}; unsigned fields{};
     if (!json.Take('{')) return ControlResult::InvalidRequest;
     for (;;) {
         char key[32]{}, value[184]{}; DWORD number{}; unsigned field{}; bool valid{};
         if (!json.String(key, std::size(key)) || !json.Take(':')) return ControlResult::InvalidRequest;
-        if (std::strcmp(key, "schema") == 0) { field = 1; valid = json.Number(&number) && number == 1; }
+        if (std::strcmp(key, "schema") == 0) { field = 1; valid = json.Number(&number) && number == expected.schema; }
         else if (std::strcmp(key, "action") == 0) {
             field = 2; valid = json.String(value, std::size(value)) && std::strcmp(value, "finish-recreate") == 0;
         } else if (std::strcmp(key, "pid") == 0) { field = 4; valid = json.Number(&number) && number == identity.pid; }
@@ -440,8 +499,11 @@ ControlResult ParseControlRequest(const char* bytes, std::size_t size,
                 constexpr char hex[] = "0123456789abcdef";
                 valid &= value[i * 2] == hex[identity.runId[i] >> 4] && value[i * 2 + 1] == hex[identity.runId[i] & 15];
             }
-        } else if (std::strcmp(key, "training_root") == 0) {
-            field = 16; valid = json.String(value, std::size(value)) && std::strcmp(value, "E:\\rs2v_trainingsrv") == 0;
+        } else if (std::strcmp(key, expected.schema==1 ? "training_root" : "server_root") == 0) {
+            wchar_t root[kControlRootCharacters]{};
+            field=16;valid=json.String(value,std::size(value)) && AsciiRoot(value,std::strlen(value),root) &&
+                (expected.schema==1 ? std::wcscmp(root,expected.serverRoot)==0 :
+                    CompareStringOrdinal(root,-1,expected.serverRoot,-1,TRUE)==CSTR_EQUAL);
         }
         if (!field || !valid || (fields & field)) return ControlResult::InvalidRequest;
         fields |= field;
@@ -455,7 +517,7 @@ ControlResult ParseControlRequest(const char* bytes, std::size_t size,
     return ControlResult::Ready;
 }
 ControlResult InitializeControl(ControlState& state, const wchar_t* executableDirectory,
-    DWORD pid, const BYTE (&runId)[16], DWORD* error) noexcept {
+    DWORD pid, const BYTE (&runId)[16], DWORD* error, bool allowManualPilot) noexcept {
     DWORD localError = ERROR_SUCCESS;
     if (error) *error = ERROR_SUCCESS;
     if (state.enabled || state.started || state.result != static_cast<LONG>(ControlResult::Uninitialized)) {
@@ -472,13 +534,24 @@ ControlResult InitializeControl(ControlState& state, const wchar_t* executableDi
     else if (!AdministratorIdentity(&state.security, &localError)) result = ControlResult::SecurityRejected;
     else {
         char bytes[kControlFileBytes]{}; DWORD count{}; ControlConfig config{};
-        // INI is operational opt-in only; it cannot authorize an arbitrary
-        // caller. Actual process/client SID equality authenticates the command.
+        // Deliberately trusted-local configuration, including console opt-in.
+        // Pipe peers authenticate the Windows SID; console requests instead
+        // trust the game's existing WebAdmin authorization. File ownership is
+        // not proof of authorship when inherited grants permit byte writes.
         result = ReadBounded(configPath, state.security, true, bytes, &count,
             state.configAcl, std::size(state.configAcl), &localError, false);
         if (result == ControlResult::Ready) result = ParseControlConfig(bytes, count, &config);
         if (result == ControlResult::Ready) {
-            if (CompareStringOrdinal(executableDirectory, -1, kTrainingExecutableDirectory, -1, TRUE) != CSTR_EQUAL) {
+            wchar_t paths[4][kControlPathBytes]{};
+            paths[0][0]=config.scope.serverRoot[0];paths[0][1]=L':';paths[0][2]=L'\\';
+            const bool pathsReady=ValidScope(config.scope) &&
+                swprintf_s(paths[1],L"%ls",config.scope.serverRoot)>0 &&
+                swprintf_s(paths[2],L"%ls\\Binaries",config.scope.serverRoot)>0 &&
+                swprintf_s(paths[3],L"%ls\\Binaries\\Win64",config.scope.serverRoot)>0;
+            if(config.scope.schema==2 && !allowManualPilot) {
+                result=ControlResult::InvalidConfig;localError=ERROR_INVALID_STATE;
+            } else if(!pathsReady || GetDriveTypeW(paths[0])!=DRIVE_FIXED ||
+                CompareStringOrdinal(executableDirectory,-1,paths[3],-1,TRUE)!=CSTR_EQUAL) {
                 result = ControlResult::InvalidPath; localError = ERROR_INVALID_NAME;
             } else if (!state.security.administratorSidBytes) {
                 result = ControlResult::SecurityRejected; localError = ERROR_ACCESS_DENIED;
@@ -487,8 +560,8 @@ ControlResult InitializeControl(ControlState& state, const wchar_t* executableDi
             } else {
                 state.security.operatorSidBytes = config.operatorSidBytes;
                 std::memcpy(state.security.operatorSid, config.operatorSid, sizeof(config.operatorSid));
-                constexpr const wchar_t* paths[] = { L"E:\\", kTrainingRoot,
-                    L"E:\\rs2v_trainingsrv\\Binaries", kTrainingExecutableDirectory };
+                state.scope=config.scope;
+                state.consoleRequested=config.consoleRequested;
                 for (std::size_t i = 0; i < std::size(paths) && result == ControlResult::Ready; ++i) {
                     auto file = CreateFileW(paths[i], FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ,
                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -534,13 +607,95 @@ void StopControl(ControlState& state) noexcept {
     InterlockedExchange(&state.stop, 1);
     if (state.stopEvent) SetEvent(state.stopEvent);
 }
-bool ReadLatchedControl(const ControlState& state, ControlRequest* output) noexcept {
+namespace {
+bool ClaimControl(ControlState& state, RequestOrigin origin) noexcept {
+    if (!state.enabled || InterlockedCompareExchange(&state.started, 0, 0) != 1 ||
+        InterlockedCompareExchange(&state.stop, 0, 0) ||
+        InterlockedCompareExchange(&state.result, 0, 0) != static_cast<LONG>(ControlResult::Ready) ||
+        !ValidIdentity(state.identity) || !ValidScope(state.scope) ||
+        (origin != RequestOrigin::Pipe &&
+            (origin != RequestOrigin::ServerAdminConsole || !state.consoleRequested ||
+                ReadConsoleRegistration(state)!=ConsoleRegistration::Available || state.scope.schema!=2))) return false;
+    return InterlockedCompareExchange(&state.latched, static_cast<LONG>(origin), 0) == 0;
+}
+} // namespace
+bool ClaimConsoleControlRequest(ControlState& state) noexcept {
+    return ClaimControl(state, RequestOrigin::ServerAdminConsole);
+}
+bool ReleasePreflightClaim(ControlState& state) noexcept {
+    if (state.scope.schema != 2 || !state.enabled ||
+        InterlockedCompareExchange(&state.started, 0, 0) != 1 ||
+        InterlockedCompareExchange(&state.stop, 0, 0) ||
+        InterlockedCompareExchange(&state.result, 0, 0) != static_cast<LONG>(ControlResult::Ready)) return false;
+    const LONG origin = InterlockedCompareExchange(&state.latched, 0, 0);
+    return (origin == static_cast<LONG>(RequestOrigin::Pipe) || origin == static_cast<LONG>(RequestOrigin::ServerAdminConsole)) &&
+        InterlockedCompareExchange(&state.latched, 0, origin) == origin;
+}
+ConsoleRegistration ReadConsoleRegistration(const ControlState& state) noexcept {
+    return static_cast<ConsoleRegistration>(InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&state.consoleRegistration),0,0));
+}
+bool ReadLatchedControl(const ControlState& state, ControlRequest* output, RequestOrigin* origin) noexcept {
     if (output) *output = {};
-    if (!output || !InterlockedCompareExchange(const_cast<volatile LONG*>(&state.latched), 0, 0)) return false;
-    *output = state.request;
+    if (origin) *origin = RequestOrigin::None;
+    const auto selected = static_cast<RequestOrigin>(InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&state.latched), 0, 0));
+    if (!output || !ValidIdentity(state.identity) || !ValidScope(state.scope) || (selected != RequestOrigin::Pipe &&
+        (selected != RequestOrigin::ServerAdminConsole || !state.consoleRequested ||
+            ReadConsoleRegistration(state)!=ConsoleRegistration::Available || state.scope.schema!=2))) return false;
+    *output = state.identity;
+    if (origin) *origin = selected;
     return true;
 }
+void ConsoleConfirmation(const BYTE (&runId)[16],
+    char (&output)[kConsoleConfirmationCharacters + 1]) noexcept {
+    constexpr char hex[] = "0123456789abcdef";
+    for (std::size_t i = 0; i < kConsoleConfirmationCharacters / 2; ++i) {
+        output[2 * i] = hex[runId[i] >> 4];
+        output[2 * i + 1] = hex[runId[i] & 15];
+    }
+    output[kConsoleConfirmationCharacters] = 0;
+}
+ConsoleCommand ParseConsoleCommand(const wchar_t* text, std::size_t count,
+    const char (&confirmation)[kConsoleConfirmationCharacters + 1]) noexcept {
+    if (!text || !count || count > kConsoleCommandCharacters) return ConsoleCommand::Unrelated;
+    auto lower = [](wchar_t c) noexcept { return c >= L'A' && c <= L'Z' ? c + (L'a' - L'A') : c; };
+    constexpr wchar_t prefix[] = L"rs2leech";
+    std::size_t cursor{};
+    while (cursor < count && text[cursor] == L' ') ++cursor;
+    for (std::size_t i = 0; i < std::size(prefix) - 1; ++i, ++cursor)
+        if (cursor == count || lower(text[cursor]) != prefix[i]) return ConsoleCommand::Unrelated;
+    // Do not swallow another command with a shared prefix.
+    if (cursor < count && text[cursor] > L' ' && text[cursor] <= L'~') return ConsoleCommand::Unrelated;
+    for (std::size_t i = 0; i < count; ++i)
+        if (text[i] < L' ' || text[i] > L'~') return ConsoleCommand::Invalid;
+    auto word = [&](const wchar_t* expected, std::size_t length) noexcept {
+        while (cursor < count && text[cursor] == L' ') ++cursor;
+        for (std::size_t i = 0; i < length; ++i, ++cursor)
+            if (cursor == count || lower(text[cursor]) != expected[i]) return false;
+        return cursor == count || text[cursor] == L' ';
+    };
+    const auto argument = cursor;
+    if (word(L"status", 6)) {
+        while (cursor < count && text[cursor] == L' ') ++cursor;
+        return cursor == count ? ConsoleCommand::Status : ConsoleCommand::Invalid;
+    }
+    cursor = argument;
+    if (!word(L"recover", 7) || cursor == count || confirmation[kConsoleConfirmationCharacters])
+        return ConsoleCommand::Invalid;
+    while (cursor < count && text[cursor] == L' ') ++cursor;
+    for (std::size_t i = 0; i < kConsoleConfirmationCharacters; ++i, ++cursor) {
+        const auto expected = confirmation[i];
+        if (!((expected >= '0' && expected <= '9') || (expected >= 'a' && expected <= 'f')) ||
+            cursor == count || text[cursor] != static_cast<wchar_t>(expected)) return ConsoleCommand::Invalid;
+    }
+    while (cursor < count && text[cursor] == L' ') ++cursor;
+    return cursor == count ? ConsoleCommand::Recover : ConsoleCommand::Invalid;
+}
 #ifdef RS2_REPORTING_TESTING
+bool ClaimControlForTesting(ControlState& state, RequestOrigin origin) noexcept {
+    return ClaimControl(state, origin);
+}
 ControlResult PrepareControlPipeForTesting(ControlState& state, DWORD* error) noexcept {
     if (!error || !ValidIdentity(state.identity)) return ControlResult::InvalidIdentity;
     return PreparePipe(state, error);

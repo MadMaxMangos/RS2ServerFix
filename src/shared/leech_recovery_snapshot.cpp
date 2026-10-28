@@ -74,6 +74,19 @@ bool RecoveryPayloadValid(const ReportRecoveryPayload& p) noexcept {
         return false;
     if ((p.flags & RecoveryCreateForwardNormalCompleted) && !(p.flags & RecoveryCreateForwardEntered)) return false;
     if ((p.flags & RecoveryCreateForwardEntered) && !(p.flags & RecoveryCreateCallbackObserved)) return false;
+    constexpr auto metadata=RecoveryMetadataAttempted|RecoveryMetadataCoherent|RecoveryMetadataUnverified|RecoveryMetadataDirtyAfter;
+    if((p.flags&metadata) && !(p.flags&RecoveryPublishedLocally)) return false;
+    if((p.flags&RecoveryMetadataCoherent) && (p.flags&RecoveryMetadataUnverified)) return false;
+    if((p.flags&RecoveryMetadataDirtyAfter) && !(p.flags&RecoveryMetadataAttempted)) return false;
+    if((p.flags&RecoveryConsoleRequested) && !p.operationSequence) return false;
+    if(p.flags&RecoveryPreflightRetryable) {
+        constexpr auto allowed=RecoveryPermissionEnabled|RecoveryTerminal|RecoveryConsoleRequested|RecoveryPreflightRetryable;
+        if(p.phase!=static_cast<std::uint64_t>(RecoveryPhase::Rejected) || !p.operationSequence ||
+            (p.outcome!=static_cast<std::uint64_t>(RecoveryOutcome::MechanicsFailed) &&
+                p.outcome!=static_cast<std::uint64_t>(RecoveryOutcome::RecordingUnavailable)) ||
+            (p.flags&~allowed) || (p.flags&(RecoveryPermissionEnabled|RecoveryTerminal))!=(RecoveryPermissionEnabled|RecoveryTerminal) ||
+            p.nativeStage || p.resourcePhase || p.exceptionCode || p.requestId || p.callbackId || p.callbackResult || p.apiReturnedId) return false;
+    }
     return true;
 }
 

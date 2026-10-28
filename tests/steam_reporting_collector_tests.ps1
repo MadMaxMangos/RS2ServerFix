@@ -4,8 +4,12 @@ $ErrorActionPreference='Stop'
 Initialize-ReportFileReader
 $script:Checks=0
 function Check([bool]$Condition,[string]$Why) { ++$script:Checks; if (!$Condition) { throw $Why } }
-function Reject([scriptblock]$Action,[string]$Why) {
-    $rejected=$false; try { $null=& $Action } catch { $rejected=$true }
+function Reject([scriptblock]$Action,[string]$Why,[string]$ExpectedText='') {
+    $rejected=$false
+    try { $null=& $Action } catch {
+        if($ExpectedText -and !$_.Exception.Message.Contains($ExpectedText)){throw ('Wrong refusal: '+$_.Exception.Message)}
+        $rejected=$true
+    }
     Check $rejected $Why
 }
 $caseRoot=Join-Path ([IO.Path]::GetTempPath()) ('RS2ReportingCollectorTests-'+[Guid]::NewGuid().ToString('N'))
@@ -63,6 +67,7 @@ Check ((Read-ReportFields "reporting.lastOwnerQpc=10`r`n")['reporting.lastOwnerQ
 Check ((Read-ReportConfiguration "schema=3`r`nmode=repair`r`ndiagnostics=normal`r`n" $true).mode -ceq 'repair') 'Repair semantic configuration rejected.'
 Reject { Read-ReportConfiguration "schema=2`nmode=repair`n" $true } 'V2 configuration accepted by V3 collector.'
 Reject { Read-ReportConfiguration "schema=3`nmode=repair`n" $true } 'Missing diagnostics accepted.'
+Reject { Read-ReportConfiguration "schema=3`nmode=observe`ndiagnostics=operational`n" $true } 'Operational text was accepted as qualification evidence.' 'Operational logs are compact status, not qualification evidence.'
 Check ((Read-ReportConfiguration "enabled=1`r`nmax_log_mib=00016`r`n" $false).quota_mib -eq 16) 'Native-compatible leading-zero quota rejected.'
 Reject { Read-ReportConfiguration "schema=2`r`r`nmode=observe`n" $true } 'Extra CR differs from native parser.'
 Reject { Read-ReportConfiguration "schema=2`nmode=observe`nmode=repair`n" $true } 'Duplicate mode accepted.'
@@ -135,7 +140,7 @@ $run=Join-Path $caseRoot ('20260917T000000Z-PID123-'+$runId)
 $identity=@{pid='123';process_creation_filetime=[string]$created;'reporting.run_id'=$runId;'reporting.ownerThreadId'='4';
     'reporting.mode'='3';'reporting.qpc_frequency'='1000000'}
 $startup=[ordered]@{schema=3;type='startup';run_id=$runId;pid=123;sequence=0;qpc=1;
-    artifact='RS2ServerFix-steam-reporting';version='0.6.2.0';artifact_version=393728;
+    artifact='RS2ServerFix-steam-reporting';version='0.7.1.0';artifact_version=459008;
     process_start_filetime=$created;qpc_frequency=1000000;mode='repair';configured_mode=3;header_validity=31;
     diagnostics='normal';anchor_interval_seconds=10;host_sha256=$script:ReportHostHash;
     qualified_steam_api_sha256=$script:ReportSdkHash;qualified_steamclient_sha256=$script:ReportClientHash;
@@ -154,6 +159,11 @@ foreach($pair in @(@('volumeSerial','volume_serial'),@('file_id','file_id'),@('i
 }
 $identity['reporting.log.path']=$run
 
+$operationalStartup=@{}
+foreach($key in $startup.Keys){$operationalStartup[$key]=$startup[$key]}
+$operationalStartup['diagnostics']='operational';$operationalStartup['anchor_interval_seconds']=[uint64]60
+$operationalStartup['operational_fields_schema']=[uint64]1;$operationalStartup['qualification_evidence']=$false
+Reject {Assert-NativeReportStartup $operationalStartup $identity} 'Compact operational bootstrap was qualified.' 'Operational logs are compact status, not qualification evidence;'
 function Common([int]$Kind,[uint64]$Sequence,[uint64]$Qpc) {
     return [ordered]@{type=@('','state','request','witness','builder-enter','builder-return','builder-unwind','anchor')[$Kind];
         schema=3;run_id=$runId;pid=123;sequence=$Sequence;qpc=$Qpc;source_epoch=1;binding_epoch=1;kind=$Kind;reason=0;flags=0;thread_id=4}
@@ -219,6 +229,63 @@ $valid=LogFile 'valid.jsonl' $records
 $log=Read-ReportLog $valid $identity $run 16MB 0 100
 Check ($log.pairs.Count -eq 1 -and $log.pairs[0].selected -eq 1 -and $log.counters.selected_true -eq 1) 'Valid Return selection or event reconciliation failed.'
 Check ($log.population_samples -eq 2 -and $log.human_observed) 'Human population evidence lost.'
+# New numeric group remains optional for preserved old logs, but complete,
+# bounded and linked when present. Exercise the actual reader and strict shape.
+$diagnosticRecords=@($startup,(Request 2 1),(Request 3 2),(Build 4 3 1 3 0),(Build 5 4 1 3 1),(Anchor 5 5))
+$diagnosticStartup=[ordered]@{};foreach($key in $startup.Keys){$diagnosticStartup[$key]=$startup[$key]}
+$diagnosticStartup.prepared_counts_schema=1;$diagnosticRecords[0]=$diagnosticStartup
+foreach ($index in 3,4) {
+    $r=$diagnosticRecords[$index]
+    $r.prepared_valid=1;$r.prepared_mismatch_mask=0;$r.prepared_maximum=64;$r.prepared_members=1
+    $r.prepared_pi=1;$r.prepared_bots=0;$r.prepared_json_maximum=64;$r.prepared_json_bytes=150
+}
+$diagnosticLog=Read-ReportLog (LogFile 'prepared-diagnostic.jsonl' $diagnosticRecords) $identity $run 16MB 0 100
+Check ($diagnosticLog.pairs.Count -eq 1) 'Prepared diagnostic broke matched collector.'
+$diagnosticStartup.prepared_dirty_schema=1
+foreach($index in 3,4){$diagnosticRecords[$index].prepared_dirty_valid=1;$diagnosticRecords[$index].prepared_dirty_at_entry=1}
+$dirtyLog=Read-ReportLog (LogFile 'prepared-dirty.jsonl' $diagnosticRecords) $identity $run 16MB 0 100
+Check ($dirtyLog.pairs.Count -eq 1) 'Entry dirty evidence broke matched collector.'
+$diagnosticRecords[4].prepared_dirty_at_entry=0
+Reject {Read-ReportLog (LogFile 'prepared-dirty-linkage.jsonl' $diagnosticRecords) $identity $run 16MB 0 100} 'Dirty entry changed across a matched pair.'
+$diagnosticRecords[4].prepared_dirty_at_entry=2
+Reject {Read-ReportLog (LogFile 'prepared-dirty-invalid.jsonl' $diagnosticRecords) $identity $run 16MB 0 100} 'Nonboolean dirty bit accepted.'
+foreach($index in 3,4){$diagnosticRecords[$index].prepared_dirty_valid=0;$diagnosticRecords[$index].Remove('prepared_dirty_at_entry')}
+$null=Read-ReportLog (LogFile 'prepared-dirty-unknown.jsonl' $diagnosticRecords) $identity $run 16MB 0 100
+$diagnosticRecords[4].prepared_dirty_at_entry=0
+Reject {Read-ReportLog (LogFile 'prepared-dirty-stale.jsonl' $diagnosticRecords) $identity $run 16MB 0 100} 'Unavailable dirty observation carried a stale value.'
+foreach($index in 3,4){$diagnosticRecords[$index].Remove('prepared_dirty_valid');$diagnosticRecords[$index].Remove('prepared_dirty_at_entry')}
+$diagnosticStartup.Remove('prepared_dirty_schema')
+$unavailableRecords=@($diagnosticStartup,(Request 2 1),(Request 3 2),(Build 4 3 1 3 0),(Build 5 4 1 3 1),(Anchor 5 5))
+foreach($index in 3,4){$unavailableRecords[$index].prepared_valid=0}
+$unavailableLog=Read-ReportLog (LogFile 'prepared-unavailable.jsonl' $unavailableRecords) $identity $run 16MB 0 100
+Check ($unavailableLog.pairs.Count -eq 1) 'Unavailable diagnostic rejected instead of remaining unknown.'
+$mismatchRecords=@($diagnosticStartup,(Request 2 1),(Request 3 2),(Build 4 3 1 3 0),(Build 5 4 1 3 0),(Anchor 5 5))
+foreach($index in 3,4){
+    $r=$mismatchRecords[$index];$r.reason=48;$r.prepared_valid=1;$r.prepared_mismatch_mask=2
+    $r.prepared_maximum=64;$r.prepared_members=0;$r.prepared_pi=1;$r.prepared_bots=0
+    $r.prepared_json_maximum=64;$r.prepared_json_bytes=150
+}
+$mismatchRecords[5].full_selected=0;$mismatchRecords[5].selected_true=0;$mismatchRecords[5].distinct_selected_witnesses=0
+$mismatchLog=Read-ReportLog (LogFile 'prepared-mismatch-accepted.jsonl' $mismatchRecords) $identity $run 16MB 0 100
+Check ($mismatchLog.pairs.Count -eq 1 -and $mismatchLog.pairs[0].selected -eq 0) 'Coherent mismatch diagnostic rejected or promoted to selection.'
+$diagnosticRecords[0]=$startup
+Reject { Read-ReportLog (LogFile 'prepared-undeclared.jsonl' $diagnosticRecords) $identity $run 16MB 0 100 } 'Undeclared new shape accepted.'
+$diagnosticRecords[0]=$diagnosticStartup;$diagnosticStartup.prepared_counts_schema=2
+Reject { Read-ReportLog (LogFile 'prepared-unknown-schema.jsonl' $diagnosticRecords) $identity $run 16MB 0 100 } 'Unknown prepared schema accepted.'
+$diagnosticStartup.prepared_counts_schema=1
+$withoutDiagnostic=@($diagnosticStartup,(Request 2 1),(Request 3 2),(Build 4 3 1 3 0),(Build 5 4 1 3 1),(Anchor 5 5))
+Reject { Read-ReportLog (LogFile 'prepared-missing-declared.jsonl' $withoutDiagnostic) $identity $run 16MB 0 100 } 'Declared schema with missing diagnostic accepted.'
+$diagnosticRecords[4].prepared_json_bytes=151
+Reject { Read-ReportLog (LogFile 'prepared-linkage.jsonl' $diagnosticRecords) $identity $run 16MB 0 100 } 'Changed prepared snapshot accepted.'
+$diagnosticRecords[4].prepared_json_bytes=150
+$diagnosticRecords[4].prepared_members=0
+Reject { Read-ReportLog (LogFile 'prepared-mask.jsonl' $diagnosticRecords) $identity $run 16MB 0 100 } 'Wrong mismatch mask accepted.'
+$diagnosticRecords[4].prepared_members=1
+$diagnosticRecords[4].prepared_valid=0
+Reject { Read-ReportLog (LogFile 'prepared-invalid-stale.jsonl' $diagnosticRecords) $identity $run 16MB 0 100 } 'Unavailable prepared values accepted.'
+$diagnosticRecords[4].prepared_valid=1
+$diagnosticRecords[4].Remove('prepared_pi')
+Reject { Read-ReportLog (LogFile 'prepared-incomplete.jsonl' $diagnosticRecords) $identity $run 16MB 0 100 } 'Incomplete diagnostic accepted.'
 $pairBytes=[IO.File]::ReadAllText($valid)
 $withoutSummary=Join-Path $caseRoot 'partial-anchor-pair.jsonl'
 Save-ReportText $withoutSummary ((@([IO.File]::ReadLines($valid)|Where-Object{$_ -notmatch '"type":"transport-summary"'}) -join "`n")+"`n")
@@ -275,11 +342,21 @@ Check ($recovery.recovery_records.Count -eq 1 -and $recovery.recovery_records[0]
     $recovery.recovery_records[0]['recovery_old_cache_fingerprint'] -eq [uint64]9007199254740993) 'Recovery fingerprints lost exact unsigned64 values.'
 Check ($recovery.last_qpc -eq 8 -and $recovery.recovery_records[0]['recovery_qpc'] -eq 1 -and
     $recovery.recovery_callback_measurements.Count -eq 0) 'Fault observation QPC replaced emission QPC or unavailable timing became zero.'
+$originStartup=[ordered]@{};foreach($key in $startup.Keys){$originStartup[$key]=$startup[$key]}
+$originStartup.recovery_origin_schema=1
+$originRecord=RecoveryFixture;$originRecord.recovery_request_origin=1
+$null=Read-ReportLog (LogFile 'recovery-origin-pipe.jsonl' @($originStartup,$originRecord)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode
+$originRecord.recovery_flags=$originRecord.recovery_flags -bor 0x100000;$originRecord.recovery_request_origin=2
+$null=Read-ReportLog (LogFile 'recovery-origin-console.jsonl' @($originStartup,$originRecord)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode
+$originRecord.recovery_request_origin=1
+Reject {Read-ReportLog (LogFile 'recovery-origin-conflict.jsonl' @($originStartup,$originRecord)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Wrong request-origin accepted.'
+$originRecord.Remove('recovery_request_origin')
+Reject {Read-ReportLog (LogFile 'recovery-origin-missing.jsonl' @($originStartup,$originRecord)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Declared request-origin was missing.'
 $guardProbe=RecoveryFixture;$guardProbe.recovery_phase=10;$guardProbe.recovery_reason=63
 $guardProbe.recovery_outcome=9;$guardProbe.recovery_flags=513
 $guardRead=Read-ReportLog (LogFile 'recovery-guard-probe.jsonl' @($startup,$guardProbe)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode
 Check ($guardRead.recovery_records.Count -eq 1 -and $guardRead.recovery_records[0]['recovery_reason'] -eq 63) 'Read-only guard result was not accepted.'
-$guardProbe.recovery_reason=64
+$guardProbe.recovery_reason=83
 Reject {Read-ReportLog (LogFile 'recovery-guard-out-of-range.jsonl' @($startup,$guardProbe)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Out-of-range guard result accepted.'
 foreach($badField in @('recovery_phase','recovery_event','recovery_reason','recovery_outcome','recovery_resource_phase','recovery_native_stage','recovery_callback_result')) {
     $r=RecoveryFixture;$r[$badField]=99
@@ -289,7 +366,7 @@ foreach($badCase in @('missing','extra','old-quota','header-reason','flags','mis
     $r=RecoveryFixture
     switch($badCase) {
         missing {$r.Remove('recovery_qpc')};extra {$r.extra=0};old-quota {$r.recovery_unused_quota=0}
-        header-reason {$r.reason=18};flags {$r.recovery_flags=32768};missing-observed {$r.recovery_flags=16384}
+        header-reason {$r.reason=18};flags {$r.recovery_flags=2097152};missing-observed {$r.recovery_flags=16384}
         unavailable-nonzero {$r.recovery_callback_own_ticks=1};sequence {$r.recovery_record_sequence=1}
     }
     Reject {Read-ReportLog (LogFile ('recovery-'+$badCase+'.jsonl') @($startup,$r)) $identity $run 16MB 0 100 @() -TrainingRecoveryMode} "Malformed recovery $badCase accepted."
@@ -315,9 +392,9 @@ foreach($badCase in @('phase','event','restart','reason')) {
     Reject {Read-ReportLog $badPath $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Nonreserved recovery pause event accepted.'
 }
 $inventoryRecovery=@{pid='123';'reporting.pid'='123';'reporting.run_id'=$runId;'reporting.schema'='3';'reporting.bytes'='3896';
-    'reporting.artifact_version'='393728';'reporting.header_valid'='true';'reporting.identity_complete'='true';
+    'reporting.artifact_version'='459008';'reporting.header_valid'='true';'reporting.identity_complete'='true';
     'reporting.header_validity'='31';'reporting.qpc_frequency'='1000000';'recovery.snapshot_result'='Coherent';
-    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='393728';'recovery.pid'='123';
+    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459008';'recovery.pid'='123';
     'recovery.run_id'=$runId;'recovery.header_ready'='1';'recovery.owner_sequence'='2'}
 foreach($name in $script:RecoveryPayloadNames){$inventoryRecovery['recovery.'+$name]=[string]$recoveryRecord['recovery_'+$name]}
 $null=Assert-ReportRecoveryFields $inventoryRecovery
@@ -920,7 +997,7 @@ foreach($point in @(@($fixtureStart,0,1),@($fixtureEnd,3,9),@($fixtureFinal,4,13
         host_sha256=$script:ReportHostHash;sdk_sha256=$script:ReportSdkHash;steamclient_sha256=$script:ReportClientHash;
         observed_bootstrap_sha256=('B'*64);bootstrap_sha256=('B'*64);observed_companion_sha256=$artifact;companion_sha256=$artifact;
         'reporting.mode'='2';'reporting.qpc_frequency'=[string]$fixtureFrequency;'reporting.ownerThreadId'='4';
-        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='393728';'reporting.header_validity'='31';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';'reporting.header_validity'='31';
         'reporting.pid'='123';'reporting.process_creation'=[string]$created;
         'reporting.lastOwnerQpc'=[string]$point[0];'reporting.observed_qpc'=[string]$point[0];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -1175,6 +1252,16 @@ try {
         $trainingSamples.Add($sample)
     }
     Check (Test-ReportRecoveryActive $trainingSamples[1]) 'Matching active recovery NOTREADY window was not recognised.'
+    foreach($waitReason in 64,66) {
+        $waiting=@{}+$trainingSamples[1];$waiting.fields=@{}+$waiting.fields
+        $waiting.fields['recovery.phase']='7';$waiting.fields['recovery.reason']=[string]$waitReason
+        $waiting.fields['recovery.flags']='32769'
+        Check (Test-ReportRecoveryActive $waiting) 'Published metadata deferral lost the training window.'
+        foreach($notWaiting in @(@('recovery.phase','6'),@('recovery.flags','1'),@('recovery.reason','65'))) {
+            $bad=@{}+$waiting;$bad.fields=@{}+$bad.fields;$bad.fields[$notWaiting[0]]=$notWaiting[1]
+            Check (!(Test-ReportRecoveryActive $bad)) 'Non-published or terminal metadata fault gained readiness waiver.'
+        }
+    }
     foreach($badKey in @('reporting.loss_reasons','reporting.reason','reporting.fatal_transport_reason')) {
         $bad=@{}+$trainingSamples[1];$bad.fields=@{}+$bad.fields;$bad.fields[$badKey]='1'
         Check (!(Test-ReportRecoveryActive $bad)) 'Unrelated normal fault gained recovery readiness waiver.'

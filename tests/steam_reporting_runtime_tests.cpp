@@ -319,13 +319,34 @@ void RepairWitnessAndPreparedMismatch() {
     RS2_CHECK(selected.attempted && selected.eligible && selected.dirtyAddress==f.Base()+f.prepared.fullDirty);
     RS2_CHECK(selected.event.payload.builder.pi==65 && selected.event.payload.builder.bots==24 &&
         selected.event.payload.builder.maximum==64 && f.Dirty()==0);
+    RS2_CHECK(selected.event.payload.builder.preparedValid==1 &&
+        selected.event.payload.builder.preparedMismatchMask==0 &&
+        selected.event.payload.builder.preparedMembers==65 &&
+        selected.event.payload.builder.preparedDirtyValid==1 &&
+        selected.event.payload.builder.preparedDirtyAtEntry==0);
+    f.Put(f.Base()+f.prepared.fullDirty,std::uint8_t{1});
     f.Finish(selected,true,true,true);
+    ReportRecordV3 captured{}; bool returnSeen{};
+    while (DequeueReport(f.ring,&captured)==ReportReadResult::Record) {
+        if (captured.header.kind==static_cast<std::uint32_t>(RecordKindV3::BuilderReturn) &&
+            captured.payload.builder.buildSequence==selected.event.payload.builder.buildSequence) {
+            returnSeen=true;
+            RS2_CHECK(captured.payload.builder.preparedDirtyValid==1 && captured.payload.builder.preparedDirtyAtEntry==0);
+        }
+    }
+    RS2_CHECK(returnSeen);
     RS2_CHECK(f.runtime.counters.fullSelected==1 && f.runtime.counters.selectedTrue==1 &&
         f.runtime.counters.distinctSelectedWitnesses==1);
     f.SetJson(64);
     auto mismatch=f.Builder();
     RS2_CHECK(mismatch.attempted && !mismatch.eligible && mismatch.dirtyAddress==0 &&
         mismatch.event.header.reason==static_cast<unsigned>(Reason::PreparedMismatch));
+    RS2_CHECK(mismatch.event.payload.builder.preparedValid==1 &&
+        mismatch.event.payload.builder.preparedMismatchMask==PreparedPiDiffers &&
+        mismatch.event.payload.builder.preparedPi==64 && mismatch.event.payload.builder.pi==65 &&
+        mismatch.event.payload.builder.preparedDirtyValid==1 &&
+        mismatch.event.payload.builder.preparedDirtyAtEntry==1);
+    f.Put(f.Base()+f.prepared.fullDirty,std::uint8_t{0});
     f.Finish(mismatch,true,false,false);
     RS2_CHECK(f.runtime.counters.falseReturns==1 && !StatusRevoked(f.status) && f.Dirty()==0 && !f.forbiddenRead);
     RS2_CHECK(std::all_of(f.runtime.scratch,f.runtime.scratch+sizeof(f.runtime.scratch),[](char byte) { return byte==0; }));
@@ -645,6 +666,12 @@ void AnchorSummaryCadence() {
     PublishRuntimeStatus(f.runtime,f.Now(),true,&shortCredit);
     RS2_CHECK(shortCredit.remaining==1 && !StatusRevoked(f.status));
     ReleaseCapture(f.runtime,shortCredit); checkPair();
+    f.runtime.config.diagnostics=Diagnostics::Operational;
+    f.runtime.lastAnchor=f.Now()-f.frequency*59;
+    PublishRuntimeStatus(f.runtime,f.Now(),true);
+    RS2_CHECK(DequeueReport(f.ring,&discarded)==ReportReadResult::Empty);
+    f.runtime.lastAnchor=f.Now()-f.frequency*60;
+    PublishRuntimeStatus(f.runtime,f.Now(),true); checkPair();
 }
 
 } // namespace

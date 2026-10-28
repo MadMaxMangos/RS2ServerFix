@@ -10,4 +10,8 @@ namespace rs2fix::reporting {
 // Returns None only after validating the whole document and its required tuple.
 Reason ValidatePreparedJson(const char* bytes, std::size_t size,
     const NativeCounts& expected) noexcept;
+// Returns only the required numeric tuple after whole-document validation.
+// No raw JSON or unknown metadata escapes; output is zero on every failure.
+Reason ReadPreparedJsonCounts(const char* bytes, std::size_t size,
+    NativeCounts* output) noexcept;
 } // namespace rs2fix::reporting

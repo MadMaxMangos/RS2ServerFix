@@ -27,6 +27,16 @@ struct PreparedSnapshot {
 };
 static_assert(std::is_trivial_v<PreparedSnapshot> && std::is_standard_layout_v<PreparedSnapshot>);
 
+enum PreparedMismatchBits : std::uint32_t {
+    PreparedMaximumDiffers = 1, PreparedMembersDiffer = 2, PreparedPiDiffers = 4,
+    PreparedBotsDiffer = 8, PreparedJsonMaximumDiffers = 16
+};
+struct PreparedDiagnostic {
+    NativeCounts json;
+    std::uint32_t maximum, membersCount, jsonBytes, mismatchMask;
+    bool valid;
+};
+
 // Read-only; requires qualified immutable profile, owner, source/binding epochs
 // and expected source counts. Scratch must be owned, nonaliasing storage of
 // exactly kJsonBytes, valid throughout the call. Its bounded supplied region is
@@ -34,5 +44,9 @@ static_assert(std::is_trivial_v<PreparedSnapshot> && std::is_standard_layout_v<P
 // registration identity or Members element is copied; only GameMode is parsed.
 // Success proves local tuple/header coherence, not publication or remote ACK.
 Reason ReadPreparedState(const PreparedReadContext&, const NativeCounts& expected,
-    char* scratch, std::size_t scratchCapacity, PreparedSnapshot* output) noexcept;
+    char* scratch, std::size_t scratchCapacity, PreparedSnapshot* output,
+    PreparedDiagnostic* diagnostic = nullptr) noexcept;
+// Diagnostic is populated only for fully parsed JSON and stable validated
+// headers, including a coherent mismatch. It never changes admission or makes
+// the normal output usable on failure. No additional native reads are performed.
 } // namespace rs2fix::reporting

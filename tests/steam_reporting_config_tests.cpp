@@ -35,6 +35,8 @@ void ReportingConfigTests() {
     RS2_CHECK(native.mode == Mode::Observe && native.diagnostics == Diagnostics::Normal);
     RS2_CHECK(parseNative(" diagnostics = detailed \r\nmode = repair\r\nschema = 3") == Reason::None);
     RS2_CHECK(native.mode == Mode::Repair && native.diagnostics == Diagnostics::Detailed);
+    RS2_CHECK(parseNative("schema=3\nmode=observe\ndiagnostics=operational\n") == Reason::None);
+    RS2_CHECK(native.mode == Mode::Observe && native.diagnostics == Diagnostics::Operational);
     RS2_CHECK(parseNative("schema=3\nmode=disabled\ndiagnostics=normal") == Reason::ConfigDisabled);
     for (const auto* invalid : {"schema=3\nmode=repair", "schema=3\ndiagnostics=normal",
             "mode=repair\ndiagnostics=normal", "schema=2\nmode=repair\ndiagnostics=normal",

@@ -78,6 +78,19 @@ template<class Record> void CanonicalRecord(const Record& in, std::uint64_t sequ
         b.entryQpc=a.entryQpc; b.returnQpc=a.returnQpc;
         b.pi=a.pi; b.bots=a.bots; b.maximum=a.maximum; b.classification=a.classification;
         b.selected=a.selected; b.result=a.result; b.pending=a.pending; b.fresh=a.fresh;
+        if constexpr (std::is_same_v<Record, ReportRecordV3>) {
+            // No partially validated read or inactive/reserved words reach logs.
+            if (a.preparedValid==1 && a.preparedMismatchMask<=31 &&
+                a.preparedMembers<=4096 && a.preparedJsonBytes>0 && a.preparedJsonBytes<=kJsonBytes) {
+                b.preparedValid=1; b.preparedMismatchMask=a.preparedMismatchMask;
+                b.preparedMaximum=a.preparedMaximum; b.preparedMembers=a.preparedMembers;
+                b.preparedPi=a.preparedPi; b.preparedBots=a.preparedBots;
+                b.preparedJsonMaximum=a.preparedJsonMaximum; b.preparedJsonBytes=a.preparedJsonBytes;
+            }
+            if (a.preparedDirtyValid==1 && a.preparedDirtyAtEntry<=1) {
+                b.preparedDirtyValid=1; b.preparedDirtyAtEntry=a.preparedDirtyAtEntry;
+            }
+        }
         break;
     }
     case RecordKind::Anchor: {

@@ -356,7 +356,7 @@ bool ReportingLogEvidence(const Inputs& inputs,const Scenario& scenario,const Ch
                 !JsonUnsigned(line,"qpc_frequency",&recordedFrequency) || recordedFrequency!=frequency ||
                 !JsonUnsigned(line,"configured_mode",&mode) || mode!=static_cast<std::uint32_t>(expected.mode) ||
                 !JsonText(line,"version",&version) || version!=inputs.expectedVersion ||
-                !JsonUnsigned(line,"artifact_version",&artifact) || artifact!=0x00060200 ||
+                !JsonUnsigned(line,"artifact_version",&artifact) || artifact!=0x00070100 ||
                 !JsonText(line,"host_sha256",&host) || host!=LowerDigest(inputs.host.digest) ||
                 !JsonText(line,"qualified_steam_api_sha256",&sdk) || sdk!=LowerDigest(inputs.sdk.digest) ||
                 !JsonText(line,"qualified_steamclient_sha256",&client) || client!=LowerDigest(inputs.client.digest)) return false;

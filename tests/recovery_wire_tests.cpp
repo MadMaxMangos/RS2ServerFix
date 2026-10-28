@@ -40,6 +40,23 @@ ReportRecoveryPayload Evidence(std::uint64_t generation = 1) {
 }
 void PayloadAndPublication() {
     const auto identity = Identity();
+    {
+        RecoveryStatusWireV1 retryWire{};RS2_CHECK(InitializeRecoveryStatus(retryWire,identity));
+        ReportRecoveryPayload retry{};
+        retry.phase=static_cast<std::uint64_t>(RecoveryPhase::Rejected);retry.reason=static_cast<std::uint64_t>(RecoveryReason::GuardSnapshotChanged);
+        retry.outcome=static_cast<std::uint64_t>(RecoveryOutcome::MechanicsFailed);retry.operationSequence=1;
+        retry.flags=RecoveryPermissionEnabled|RecoveryTerminal|RecoveryPreflightRetryable;
+        RS2_CHECK(PublishRecoveryStatus(retryWire,retry));
+        const auto unchanged=retryWire.ownerSequence;
+        for(unsigned unsafe=0;unsafe<4;++unsafe) {
+            auto invalid=retry;
+            if(unsafe==0) invalid.nativeStage=static_cast<std::uint64_t>(NativeStage::Descriptor);
+            if(unsafe==1) invalid.flags|=RecoveryRecipeEntered;
+            if(unsafe==2) invalid.flags|=RecoveryRestartRequired;
+            if(unsafe==3) invalid.outcome=static_cast<std::uint64_t>(RecoveryOutcome::Inconclusive);
+            RS2_CHECK(!PublishRecoveryStatus(retryWire,invalid) && retryWire.ownerSequence==unchanged);
+        }
+    }
     RecoveryStatusWireV1 wire{};
     RecoveryStatusSnapshot snapshot{};
     RS2_CHECK(ReadRecoveryStatusSnapshot(wire, identity, &snapshot) == RecoverySnapshotResult::Unavailable);
@@ -62,7 +79,7 @@ void PayloadAndPublication() {
     RS2_CHECK(!PublishRecoveryStatus(wire, p) && wire.ownerSequence == before);
     p = Evidence(); p.flags &= ~RecoveryCreateCallbackObserved;
     RS2_CHECK(!PublishRecoveryStatus(wire, p));
-    p = Evidence(); p.flags |= 1ULL << 15;
+    p = Evidence(); p.flags |= 1ULL << 63;
     RS2_CHECK(!PublishRecoveryStatus(wire, p));
     for (const auto field : {&ReportRecoveryPayload::phase, &ReportRecoveryPayload::event, &ReportRecoveryPayload::reason,
         &ReportRecoveryPayload::outcome, &ReportRecoveryPayload::resourcePhase, &ReportRecoveryPayload::nativeStage,
@@ -199,7 +216,7 @@ void RecoveryRingEvidence() {
         if (kind == 0) invalid.header.reason = static_cast<std::uint32_t>(Reason::NativeUnwind);
         if (kind == 1) invalid.header.flags = 1;
         if (kind == 2) invalid.payload.recovery.recordSequence = 1;
-        if (kind == 3) invalid.payload.recovery.flags |= 1ULL << 15;
+        if (kind == 3) invalid.payload.recovery.flags |= 1ULL << 63;
         RS2_CHECK(EnqueueReport(invalidRing, invalid, &accepted) == ReportWriteResult::Lost && !accepted);
         RS2_CHECK(ReadStatusWord(invalidRing.reportWriteSequence) == 0 && StatusRevoked(invalidStatus));
     }

@@ -3,7 +3,7 @@
 
 namespace rs2fix::reporting {
 inline constexpr std::uint32_t kRecoveryStatusSchemaV1 = 1;
-inline constexpr std::uint32_t kRecoveryArtifactVersion = 0x00060200U;
+inline constexpr std::uint32_t kRecoveryArtifactVersion = 0x00070100U;
 enum class RecoveryPhase : std::uint64_t {
     Disabled = 0, Armed = 1, Requested = 2, Qualifying = 3, FinishSubmitted = 4,
     FinishAccepted = 5, Recreating = 6, Published = 7, Observed = 8, Failed = 9,
@@ -35,7 +35,15 @@ enum class RecoveryReason : std::uint64_t {
     GuardHeartbeatSlot = 57, GuardHeartbeatType = 58,
     GuardHeartbeatId = 59, GuardGenericId = 60,
     GuardGenericHolder = 61, GuardHeartbeatReferences = 62,
-    SnapshotGuardPassed = 63, Count = 64
+    SnapshotGuardPassed = 63, MetadataUnavailable = 64, MetadataTimeout = 65,
+    MetadataCountsNotReady = 66, MetadataUnsupportedState = 67,
+    MetadataRandomUnavailable = 68, MetadataUnverified = 69,
+    PublishedIdentityChanged = 70, MetadataCountLimit = 71,
+    PumpHeadroomUnavailable = 72, BotsUnsupported = 73, PopulationUnsupported = 74,
+    HeartbeatStateUnsupported = 75, HeartbeatScheduleInvalid = 76,
+    HeartbeatErrors = 77, HeartbeatThrottled = 78, HeartbeatExpedited = 79,
+    HeartbeatIntervalUnsupported = 80, HeartbeatOverridesUnsupported = 81,
+    HeartbeatRetryUnsupported = 82, Count = 83
 };
 enum class RecoveryOutcome : std::uint64_t {
     None = 0, MechanicsFailed = 1, ClearedCacheNoSession = 2, NativeUnwind = 3,
@@ -48,7 +56,9 @@ enum class ResourcePhase : std::uint64_t {
 enum class NativeStage : std::uint64_t {
     None = 0, Descriptor = 1, Allocate = 2, Bind = 3, Copy = 4, Retire = 5, Cancel = 6,
     Enqueue = 7, LocalRelease = 8, Cleanup = 9, Create = 10, Publish = 11, Rebind = 12,
-    Start = 13, GuardInstall = 14, CreateGuard = 15, CreateForward = 16, Count = 17
+    Start = 13, GuardInstall = 14, CreateGuard = 15, CreateForward = 16,
+    MetadataConstruct = 17, MetadataFill = 18, MetadataUpdate = 19,
+    MetadataDestroy = 20, MetadataVerify = 21, Count = 22
 };
 enum class CallbackResult : std::uint64_t {
     NotObserved = 0, True = 1, False = 2, Null = 3, Unreadable = 4, Invalid = 5, Count = 6
@@ -68,9 +78,18 @@ enum RecoveryFlags : std::uint64_t {
     RecoveryCreateCallbackObserved = 1ULL << 11,
     RecoveryCreateForwardEntered = 1ULL << 12,
     RecoveryCreateForwardNormalCompleted = 1ULL << 13,
-    RecoveryCallbackOwnTimingValid = 1ULL << 14
+    RecoveryCallbackOwnTimingValid = 1ULL << 14,
+    RecoveryPublishedLocally = 1ULL << 15,
+    RecoveryMetadataAttempted = 1ULL << 16,
+    RecoveryMetadataCoherent = 1ULL << 17,
+    RecoveryMetadataUnverified = 1ULL << 18,
+    RecoveryMetadataDirtyAfter = 1ULL << 19,
+    RecoveryConsoleRequested = 1ULL << 20,
+    // Owner released a fully recorded preflight-only rejection. No native
+    // recipe entry occurred; another explicit authenticated request is allowed.
+    RecoveryPreflightRetryable = 1ULL << 21
 };
-inline constexpr std::uint64_t kRecoveryKnownFlags = 0x7fff;
+inline constexpr std::uint64_t kRecoveryKnownFlags = 0x3fffff;
 struct ReportRecoveryPayload {
     std::uint64_t phase, event, reason, outcome, flags;
     std::uint64_t operationSequence, transitionSequence, qpc, sourceEpoch, sdkEpoch, ownerThreadId;
@@ -134,7 +153,7 @@ RS2_RECOVERY_VALUE(RecoveryReason, ControlIdentityMismatch, 33); RS2_RECOVERY_VA
 RS2_RECOVERY_VALUE(RecoveryReason, ControlSecurityRejected, 35); RS2_RECOVERY_VALUE(RecoveryReason, ControlReadFailure, 36);
 RS2_RECOVERY_VALUE(RecoveryReason, ControlEndpointUnavailable, 37);
 RS2_RECOVERY_VALUE(RecoveryReason, GuardSnapshotInvalidContext, 38);
-RS2_RECOVERY_VALUE(RecoveryReason, SnapshotGuardPassed, 63); RS2_RECOVERY_VALUE(RecoveryReason, Count, 64);
+RS2_RECOVERY_VALUE(RecoveryReason, SnapshotGuardPassed, 63); RS2_RECOVERY_VALUE(RecoveryReason, Count, 83);
 RS2_RECOVERY_VALUE(RecoveryOutcome, None, 0); RS2_RECOVERY_VALUE(RecoveryOutcome, MechanicsFailed, 1);
 RS2_RECOVERY_VALUE(RecoveryOutcome, ClearedCacheNoSession, 2); RS2_RECOVERY_VALUE(RecoveryOutcome, NativeUnwind, 3);
 RS2_RECOVERY_VALUE(RecoveryOutcome, RecordingUnavailable, 4); RS2_RECOVERY_VALUE(RecoveryOutcome, PublishedNotDelivered, 5);
@@ -152,7 +171,7 @@ RS2_RECOVERY_VALUE(NativeStage, LocalRelease, 8); RS2_RECOVERY_VALUE(NativeStage
 RS2_RECOVERY_VALUE(NativeStage, Create, 10); RS2_RECOVERY_VALUE(NativeStage, Publish, 11);
 RS2_RECOVERY_VALUE(NativeStage, Rebind, 12); RS2_RECOVERY_VALUE(NativeStage, Start, 13);
 RS2_RECOVERY_VALUE(NativeStage, GuardInstall, 14); RS2_RECOVERY_VALUE(NativeStage, CreateGuard, 15);
-RS2_RECOVERY_VALUE(NativeStage, CreateForward, 16); RS2_RECOVERY_VALUE(NativeStage, Count, 17);
+RS2_RECOVERY_VALUE(NativeStage, CreateForward, 16); RS2_RECOVERY_VALUE(NativeStage, Count, 22);
 RS2_RECOVERY_VALUE(CallbackResult, NotObserved, 0); RS2_RECOVERY_VALUE(CallbackResult, True, 1);
 RS2_RECOVERY_VALUE(CallbackResult, False, 2); RS2_RECOVERY_VALUE(CallbackResult, Null, 3);
 RS2_RECOVERY_VALUE(CallbackResult, Unreadable, 4); RS2_RECOVERY_VALUE(CallbackResult, Invalid, 5);
@@ -163,7 +182,7 @@ static_assert(RecoveryCallbackObserved == 8 && RecoveryAttributionValid == 16 &&
 static_assert(RecoveryRecipeEntered == 64 && RecoveryRecipeNormalCompleted == 128 && RecoveryExceptionObserved == 256);
 static_assert(RecoveryTerminal == 512 && RecoveryCreateGuardInstalled == 1024 && RecoveryCreateCallbackObserved == 2048);
 static_assert(RecoveryCreateForwardEntered == 4096 && RecoveryCreateForwardNormalCompleted == 8192);
-static_assert(RecoveryCallbackOwnTimingValid == 16384 && kRecoveryKnownFlags == 0x7fff);
+static_assert(RecoveryCallbackOwnTimingValid == 16384 && kRecoveryKnownFlags == 0x3fffff);
 #define RS2_RECOVERY_OFFSET(Field, Index) static_assert(offsetof(ReportRecoveryPayload, Field) == 8 * Index)
 RS2_RECOVERY_OFFSET(phase, 0); RS2_RECOVERY_OFFSET(event, 1); RS2_RECOVERY_OFFSET(reason, 2);
 RS2_RECOVERY_OFFSET(outcome, 3); RS2_RECOVERY_OFFSET(flags, 4); RS2_RECOVERY_OFFSET(operationSequence, 5);

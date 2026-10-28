@@ -60,8 +60,11 @@ def generate(document, digest):
     lines.append('};\nconstexpr PumpImportRecipe kNativeImports[] = {')
     for item in imports:
         slot, module, name = item['slot_rva'], item['module'], item['name']
-        if (slot & 7 or module.lower() not in ('kernel32.dll','advapi32.dll','msvcr110.dll') or
-                not name or any(not(c.isascii() and (c.isalnum() or c == '_')) for c in name) or
+        cpp_throw = module.lower() == 'msvcp110.dll' and name in (
+            '?_Xout_of_range@std@@YAXPEBD@Z', '?_Xlength_error@std@@YAXPEBD@Z', '?_Xbad_alloc@std@@YAXXZ')
+        plain_import = module.lower() in ('kernel32.dll','advapi32.dll','msvcr110.dll') and name and all(
+            c.isascii() and (c.isalnum() or c == '_') for c in name)
+        if (slot & 7 or not (cpp_throw or plain_import) or
                 any(a < slot+8 and slot < b for a, b in occupied)):
             raise ValueError('Invalid named import')
         occupied.append((slot,slot+8))

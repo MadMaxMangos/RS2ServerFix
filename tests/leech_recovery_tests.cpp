@@ -64,7 +64,8 @@ struct Fixture {
         r.value.flags=RecoveryPermissionEnabled;r.value.transitionSequence=1;r.value.qpc=Now();
         r.value.sourceEpoch=1;r.value.sdkEpoch=runtime.idleLifecycle;
         r.control.result=static_cast<LONG>(rs2fix::recovery::ControlResult::Ready);
-        r.control.identity.pid=header.pid;r.control.identity.runId[0]=1;r.control.request=r.control.identity;
+        r.control.identity.pid=header.pid;r.control.identity.runId[0]=1;
+        r.control.scope=rs2fix::recovery::kTrainingControlScope;
         RS2_CHECK(PublishRecoveryStatus(recoveryStatus,r.value));
     }
     ~Fixture() { SetLeechRecoveryCurrentForTest(nullptr); }
@@ -105,6 +106,151 @@ struct Fixture {
         return ServiceLeechRecovery(runtime,CallerClass::NormalPump,3,false,static_cast<std::int64_t>(qpc));
     }
 };
+// Console fixture calls ONLY these DLL-owned stubs. Byte/profile reads are
+// synthetic data; the EXE's constructor, allocator and reply leaf never run.
+struct ConsoleFixture : Fixture {
+    leech_fixture::NativeFixture native{true};
+    static ConsoleFixture* active;
+    unsigned constructors{},replies{},pins{};
+    bool failPin{},badPost{},throwConstruct{},throwReply{},reenter{};
+    std::wstring lastReply;
+    struct Exception {};
+    ConsoleFixture() {
+        ResetLeechConsoleForTest();active=this;native.LoadConsoleProfile();
+        auto& r=*recovery;r.native=native.Context();r.startup=native.host;
+        runtime.config.hostBase=native.base;runtime.config.hostSize=native.host.imageSize;
+        runtime.config.memory=native.Memory();runtime.config.mode=Mode::Observe;
+        r.control.enabled=true;r.control.started=1;r.control.consoleRequested=true;
+        r.control.scope={2,L"E:\\servertwo"};
+        PrepareLeechConsole(r.console,r,reinterpret_cast<HMODULE>(1));
+        r.console.calls={Construct,Reply,Pin};
+        native.Put(kLeechConsoleRegistryRva,native.heapBase+0x180000);
+        native.Put<std::int32_t>(kLeechConsoleRegistryRva+8,2);
+        native.Put<std::int32_t>(kLeechConsoleRegistryRva+12,8);
+        native.HeapPut(0x180000,native.heapBase+0x180100);
+        native.HeapPut(0x180008,native.heapBase+0x180108);
+        Output();
+    }
+    ~ConsoleFixture() {ResetLeechConsoleForTest();active=nullptr;}
+    void Output() {
+        std::memset(native.heap.data()+0x101000,0,0x24);
+        native.HeapPut(0x101000,native.base+kLeechConsoleReplyVtableRva);
+        native.HeapPut<std::int32_t>(0x101008,1);native.HeapPut<std::int32_t>(0x101010,1);
+    }
+    void* OutputAddress() {return reinterpret_cast<void*>(native.heapBase+0x101000);}
+    static bool Pin(HMODULE module) noexcept {++active->pins;return module==reinterpret_cast<HMODULE>(1) && !active->failPin;}
+    static void* Construct(void* object) {
+        auto& f=*active;++f.constructors;
+        RS2_CHECK(recovery::ReadConsoleRegistration(f.recovery->control)==recovery::ConsoleRegistration::NotRegistered);
+        if(f.throwConstruct) throw Exception{};
+        static_cast<LeechConsoleObject*>(object)->vtable=reinterpret_cast<const std::uintptr_t*>(f.native.base+0xEA40A8);
+        f.native.HeapPut(0x180010,reinterpret_cast<std::uintptr_t>(object));
+        f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+8,3);
+        if(f.badPost) f.native.HeapPut(0x180000,f.native.heapBase+0x180118);
+        return object;
+    }
+    static void Reply(void* output,const wchar_t* text,std::uint32_t category) {
+        auto& f=*active;++f.replies;
+        RS2_CHECK(output==f.OutputAddress() && category==0x2F8 && std::wcslen(text)<=kLeechConsoleReplyCharacters);
+        if(f.throwReply) throw Exception{};
+        f.lastReply=text;SetLastError(0x9876);
+        if(f.reenter) {f.reenter=false;RS2_CHECK(f.Command(L"rs2leech status")==1);}
+    }
+    void Register() {RegisterLeechConsole(runtime,CallerClass::NormalPump,3,false);}
+    std::int32_t Command(const wchar_t* text,std::uintptr_t returnRva=kLeechConsoleReturnRva) {
+        const auto bytes=(std::wcslen(text)+1)*sizeof(wchar_t);RS2_CHECK(bytes<=512);
+        std::memcpy(native.heap.data()+0x100000,text,bytes);
+        return ExecuteLeechConsoleForTest(recovery->console,&recovery->console.object,native.base+returnRva,
+            reinterpret_cast<const wchar_t*>(native.heapBase+0x100000),OutputAddress());
+    }
+};
+ConsoleFixture* ConsoleFixture::active{};
+void ConsoleRegistrationAndCommands() {
+    using Registration=recovery::ConsoleRegistration;
+#if defined(RS2_RECOVERY_GUARD_PROBE)
+    auto owner=std::make_unique<ConsoleFixture>();auto& f=*owner;
+    RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.Register();
+    RS2_CHECK(!f.constructors && !f.replies && !f.pins &&
+        recovery::ReadConsoleRegistration(f.recovery->control)==Registration::NotRegistered);
+#else
+    for(unsigned scenario=0;scenario<8;++scenario) {
+        auto owner=std::make_unique<ConsoleFixture>();auto& f=*owner;auto& a=f.recovery->console;
+        if(scenario==1) f.failPin=true;
+        if(scenario==2) f.badPost=true;
+        if(scenario==3) f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+12,2); // No growth branch.
+        if(scenario==4) f.native.image[0x4B710]^=1;
+        if(scenario==5) f.native.Put<std::uintptr_t>(f.native.layout.gmalloc,0);
+        if(scenario==6) f.throwConstruct=true;
+        if(scenario==7) f.recovery->control.consoleRequested=false;
+        SetLastError(0x1234);bool caught{};
+        try {f.Register();}catch(const ConsoleFixture::Exception&) {caught=true;}
+        RS2_CHECK(caught==(scenario==6) && GetLastError()==0x1234);
+        const auto state=recovery::ReadConsoleRegistration(f.recovery->control);
+        RS2_CHECK(state==(scenario==0 ? Registration::Available : scenario==7 ? Registration::NotRegistered : Registration::Unavailable));
+        const auto calls=f.constructors;f.Register();RS2_CHECK(f.constructors==calls);
+        RS2_CHECK(f.recovery->control.latched==0 && f.recovery->control.result==static_cast<LONG>(recovery::ControlResult::Ready));
+        if(scenario!=0) continue;
+        f.runtime.pumpDepth=0;f.runtime.timingDepth=0;
+        RS2_CHECK(f.Command(L"unrelated command")==0 && f.replies==0);
+        RS2_CHECK(f.Command(L"rs2leech status",kLeechConsoleReturnRva+1)==0 && f.replies==0);
+        RS2_CHECK(f.Command(L"rs2leech status")==1 && f.replies==1 && GetLastError()==0x1234);
+        RS2_CHECK(f.lastReply.find(L"phase=armed")!=std::wstring::npos && f.lastReply.find(L"confirm=0100000000000000")!=std::wstring::npos);
+        RS2_CHECK(f.Command(L"rs2leech recover 0000000000000000")==1 && !f.recovery->control.latched);
+        RS2_CHECK(f.Command(L"rs2leech recover")==1 && !f.recovery->control.latched);
+        const auto previous=f.replies;f.reenter=true;
+        RS2_CHECK(f.Command(L"rs2leech status")==1 && f.replies==previous+1);
+        f.native.HeapPut(0x101000,f.native.base+0xF04478); // In-game reply class: do not claim.
+        RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && !f.recovery->control.latched);
+        f.Output();f.runtime.pumpDepth=1;
+        RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && !f.recovery->control.latched);
+        f.runtime.pumpDepth=0;
+        RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && f.recovery->control.latched==2);
+    RS2_CHECK(!f.recovery->requested && !f.recovery->cancelEntered && f.lastReply.find(L"request queued")!=std::wstring::npos);
+        RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && f.lastReply.find(L"not queued")!=std::wstring::npos);
+        const auto replies=f.replies;
+        std::thread other([&] {RS2_CHECK(f.Command(L"rs2leech status")==0);});other.join();
+        RS2_CHECK(f.replies==replies && a.foreignObserved==1);
+        f.throwReply=true;caught=false;
+        try{f.Command(L"rs2leech status");}catch(const ConsoleFixture::Exception&){caught=true;}
+        RS2_CHECK(caught && recovery::ReadConsoleRegistration(f.recovery->control)==Registration::Unavailable && !a.replying);
+    }
+#endif
+}
+void ConsoleReadSelectors() {
+    auto fixture=std::make_unique<ConsoleFixture>();auto& f=*fixture;DWORD error{};
+#if !defined(RS2_RECOVERY_GUARD_PROBE)
+    RS2_CHECK(LeechConsoleRegistrationDue(f.runtime));
+    f.runtime.sourceReady=false;RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.runtime.sourceReady=true;
+    f.runtime.sdkReady=false;RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.runtime.sdkReady=true;
+    f.recovery->requested=true;RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.recovery->requested=false;
+#endif
+    RS2_CHECK(ValidateNativeLeechConsoleProfile(f.native.base,f.native.host,f.native.Memory(),f.native.imports,&error)==ProfileResult::Ready);
+    const auto& profile=leech_fixture::kConsoleProduction;
+    for(std::size_t i=0;i<profile.body.spanCount;++i) {
+        const auto at=profile.body.spans[i].span.rva;f.native.image[at]^=1;
+        RS2_CHECK(ValidateNativeLeechConsoleProfile(f.native.base,f.native.host,f.native.Memory(),f.native.imports,&error)==ProfileResult::BytesMismatch);
+        f.native.image[at]^=1;
+    }
+    LeechConsoleRegistry registry{};
+    RS2_CHECK(ReadLeechConsoleRegistry(f.native.Context(),&registry) && registry.count==2 && registry.capacity==8);
+    f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+8,-1);
+    RS2_CHECK(!ReadLeechConsoleRegistry(f.native.Context(),&registry) && !registry.data);
+    f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+8,2);
+    f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+12,1025);
+    RS2_CHECK(!ReadLeechConsoleRegistry(f.native.Context(),&registry));
+    f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+12,8);
+    const auto output=reinterpret_cast<std::uintptr_t>(f.OutputAddress());
+    RS2_CHECK(ReadLeechConsoleOutput(f.native.Context(),output));
+    f.native.HeapPut<std::int32_t>(0x101020,8); // Positive capacity, null Data, Num0 is unsafe.
+    RS2_CHECK(!ReadLeechConsoleOutput(f.native.Context(),output));
+    f.native.HeapPut(0x101014,f.native.heapBase+0x101100);
+    RS2_CHECK(ReadLeechConsoleOutput(f.native.Context(),output));
+    f.native.HeapPut<std::int32_t>(0x10101C,2);f.native.HeapPut<std::uint16_t>(0x101102,1);
+    RS2_CHECK(!ReadLeechConsoleOutput(f.native.Context(),output));
+    f.native.HeapPut<std::uint16_t>(0x101102,0);RS2_CHECK(ReadLeechConsoleOutput(f.native.Context(),output));
+    f.native.HeapPut<std::int32_t>(0x10101C,9);RS2_CHECK(!ReadLeechConsoleOutput(f.native.Context(),output));
+    f.Output();f.native.HeapPut<std::int32_t>(0x101008,0);RS2_CHECK(!ReadLeechConsoleOutput(f.native.Context(),output));
+}
 // Reuse the qualified native byte/descriptor fixture with owned addresses.
 // Only our counting stubs are executed. The PE bytes are never executable;
 // source/log objects are bounded inert metadata read by the production gates.
@@ -112,6 +258,9 @@ struct SequenceFixture : Fixture {
     leech_fixture::NativeFixture native{true};
     std::vector<const char*> order;
     unsigned holderReleases{},slotReleases{},forwardCalls{},finishDrains{};
+    unsigned metadataHeads{},metadataFills{},metadataUpdates{},metadataDestroys{},metadataRandomCalls{};
+    bool throwMetadataHead{},throwMetadataFill{},throwMetadataUpdate{},throwMetadataDestroy{};
+    bool metadataRandomFails{},metadataChangesCounts{},metadataLeavesMismatch{};
     bool throwCopy{},throwEnqueue{},throwForward{},changeOther{},twoCreates{},raceCas{},casRaced{},synchronousFinishError{};
     const bool* borrowedFinish{};
     RecoveryFinishSuccessFn finishSuccess{};
@@ -154,6 +303,7 @@ struct SequenceFixture : Fixture {
     static bool Builder(void*) {return true;}
     SequenceFixture() {
         active=this;auto& r=*recovery;
+        native.LoadMetadataProfile();
         runtime.config.hostBase=native.base;runtime.config.hostSize=native.host.imageSize;
         runtime.config.memory={this,QueryOwned,ReadOwned};r.startup=native.host;
         r.native={native.base,native.host.imageSize,runtime.config.memory,&native.imports,&native.layout};
@@ -216,7 +366,76 @@ struct SequenceFixture : Fixture {
         r.calls.initHolder=Init;r.calls.finishType=Type;r.calls.finishAllocate=Allocate;r.calls.bindHolder=Bind;
         r.calls.resolveHolder=Resolve;r.calls.copyString=Copy;r.calls.cancel=Cancel;r.calls.enqueueFinish=Enqueue;
         r.calls.releaseHolder=Release;r.calls.finishRelease=ReleaseSlot;r.calls.cleanup=Cleanup;r.calls.start=Start;r.calls.create=Create;r.calls.createSuccess=Forward;
+        runtime.config.prepared=ProductionPreparedLayout();
+        native.Put<std::uint32_t>(0x1798A00,2);native.Put<std::uint32_t>(0x17989F8,0);native.Put<std::uint32_t>(0x17989FC,64);
+        native.Put<std::uint32_t>(0x14AAD68,64);
+        MetadataJson(2);
+        r.metadataCalls={MetadataHead,MetadataFill,MetadataDestroy,MetadataUpdate};
+        r.metadataRandom={this,MetadataRandom};
         SetLeechRecoveryCurrentForTest(&r);Reserve();
+    }
+    void MetadataJson(unsigned count) {
+        const auto json=std::string("{\"ip\":\"192.0.2.123\",\"op\":[{\"k\":\"PI_COUNT\",\"v\":\"")+std::to_string(count)+
+            "\"},{\"k\":\"BotPlayerCount\",\"v\":\""+std::to_string(Get<std::uint32_t>(0x17989F8))+"\"},{\"k\":\"MaxPlayerCount\",\"v\":\"64\"}]}";
+        native.HeapString(0x14AAD48,0x1C0000,json.c_str(),4096);
+    }
+    void PilotScope() {
+        recovery->control.scope={2,L"E:\\servertwo"};
+        runtime.config.mode=Mode::Observe;status.header.configuredMode=static_cast<std::uint32_t>(Mode::Observe);
+    }
+    void Population(unsigned pi,unsigned humans=64) {
+        native.HeapPut<std::int32_t>(0x1042EC,static_cast<std::int32_t>(humans));
+        native.HeapPut<std::int32_t>(0x106098,static_cast<std::int32_t>(pi));
+        native.Put<std::uint32_t>(0x1798A00,pi);MetadataJson(pi);
+    }
+    static bool MetadataRandom(void* context,std::uint8_t* bytes,std::size_t count) noexcept {
+        auto& f=*static_cast<SequenceFixture*>(context);++f.metadataRandomCalls;
+        if(f.metadataRandomFails) return false;
+        for(std::size_t i=0;i<count;++i) bytes[i]=static_cast<std::uint8_t>(i);
+        return true;
+    }
+    static void* MetadataHead() {
+        auto& f=*active;++f.metadataHeads;
+        if(f.throwMetadataHead) throw Exception{};
+        return f.native.heap.data()+0x1D8000;
+    }
+    static void MetadataFill(void* properties) {
+        auto& f=*active;++f.metadataFills;
+        RS2_CHECK((reinterpret_cast<std::uintptr_t>(properties)&15)==0);
+        const auto* bytes=static_cast<const std::uint8_t*>(properties);
+        for(const auto offset:{0x18,0x58,0x78}) {std::uint64_t capacity{};std::memcpy(&capacity,bytes+offset,8);RS2_CHECK(capacity==15);}
+        void* head{};std::memcpy(&head,bytes+0xA8,8);RS2_CHECK(head==f.native.heap.data()+0x1D8000);
+        if(f.throwMetadataFill) throw Exception{};
+        // Native fill reads cached PP into properties; it does not write that
+        // global or the separate registration-changed byte at F0.
+        if(f.metadataChangesCounts) f.native.Put<std::uint32_t>(0x1798A00,3);
+    }
+    static void MetadataUpdate(const void* properties,const RecoveryBorrowedVector* members) {
+        auto& f=*active;++f.metadataUpdates;RS2_CHECK(properties && members);
+        const auto count=static_cast<std::uint32_t>((members->end-members->begin)/sizeof(RecoveryBorrowedString));
+        RS2_CHECK(count==f.recovery->metadataMembers.count && count==f.Get<std::uint32_t>(0x1798A00));
+        if(f.throwMetadataUpdate) throw Exception{};
+        if(f.metadataLeavesMismatch) return;
+        // Test-owned deep copy: borrowed buffers remain live/unchanged and are
+        // never freed. Production's BA9490 performs the qualified native copy.
+        const auto* strings=reinterpret_cast<const RecoveryBorrowedString*>(members->begin);
+        for(std::uint32_t i=0;i<count;++i) {
+            const auto text=reinterpret_cast<const char*>(strings[i].data);
+            RS2_CHECK(strings[i].size==36 && strings[i].capacity==36 && text[36]==0);
+            f.native.HeapPut(0x60000+i*32,f.native.heapBase+0x80000+i*128);
+            f.native.HeapPut<std::uint64_t>(0x60000+i*32+0x10,36);
+            f.native.HeapPut<std::uint64_t>(0x60000+i*32+0x18,47);
+            std::memcpy(f.native.heap.data()+0x80000+i*128,text,37);
+        }
+        f.native.Put(f.native.layout.kernelVector+8,f.native.heapBase+0x60000+count*32);
+        const auto capacity=f.Get<std::uintptr_t>(f.native.layout.kernelVector+16);
+        const auto end=f.native.heapBase+0x60000+count*32;
+        if(capacity<end) f.native.Put(f.native.layout.kernelVector+16,end); // Fake native vector growth.
+        f.native.Put<std::uint8_t>(0x14AAD88,1);f.MetadataJson(count);
+    }
+    static void MetadataDestroy(void* properties) {
+        auto& f=*active;++f.metadataDestroys;RS2_CHECK(properties!=nullptr);
+        if(f.throwMetadataDestroy) throw Exception{};
     }
     ~SequenceFixture() {SetLeechCreateCaptureForTest(nullptr,0,false,false);active=nullptr;}
     template<class T> T Get(std::uint32_t rva) {T value{};std::memcpy(&value,native.image.data()+rva,sizeof(value));return value;}
@@ -463,7 +682,7 @@ void ActiveGuardReasonCompatibility() {
     f->native.Put<std::uint32_t>(f->native.layout.issuedId,UINT32_MAX);
     RS2_CHECK(f->Service(Now()));
     RS2_CHECK(r.terminal && r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Rejected));
-    RS2_CHECK(r.value.reason==static_cast<std::uint64_t>(RecoveryReason::NativeProfileMismatch) &&
+    RS2_CHECK(r.value.reason==static_cast<std::uint64_t>(RecoveryReason::GuardIssuedId) &&
         r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::MechanicsFailed));
     RS2_CHECK(nativeCalls==0 && f->order.empty());
 }
@@ -498,8 +717,24 @@ void FinishSequence(SequenceFixture& f,bool rotateAuthorization=false,bool reloc
     RS2_CHECK(r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::FinishAccepted) && f.order.size()==9);
 }
 void IrreversibleSequenceSuccess() {
-  for(unsigned scenario=0;scenario<5;++scenario) {
+  for(unsigned scenario=0;scenario<8;++scenario) {
     auto f=std::make_unique<SequenceFixture>();auto& r=*f->recovery;
+    if(scenario==5 || scenario==6) {
+        f->PilotScope();
+        const unsigned bots=scenario==5 ? 1u : 32u;
+        f->Population(scenario==5 ? 2u : 65u,scenario==5 ? 1u : 33u);
+        f->native.HeapPut<std::int32_t>(0x1042F0,static_cast<std::int32_t>(bots));
+        f->native.HeapPut<std::int32_t>(0x106094,static_cast<std::int32_t>(bots));
+        f->native.Put<std::uint32_t>(0x17989F8,bots);f->MetadataJson(scenario==5 ? 2u : 65u);
+        RS2_CHECK(RecoveryRuntimeSource(f->runtime,&r.source)==Reason::None);
+    }
+    if(scenario==7) {
+        f->PilotScope();
+        f->native.Put<std::int32_t>(f->native.layout.genericPool+0x68,12);
+        f->native.Put<std::int32_t>(f->native.layout.genericPool+0x6C,6);
+        f->native.Put<std::uint8_t>(f->native.layout.genericPool+0x70,1);
+        RS2_CHECK(RecoveryRuntimeTask(f->runtime,&r.oldHeartbeat)==Reason::None);
+    }
     if(scenario==4) {
         f->native.HeapString(f->native.finishObject+0x28,0x190000,"retained-previous-finish-session");
         RS2_CHECK(f->native.Snapshot(r.before)==RecoveryNativeResult::Ready);
@@ -538,8 +773,13 @@ void IrreversibleSequenceSuccess() {
     RS2_CHECK(r.value.newSdkFingerprint!=0 && r.value.newCacheFingerprint==r.value.newSdkFingerprint);
     TaskSnapshot newBinding{};
     RS2_CHECK(InstallTaskBinding(f->runtime.task,f->Access(),f->runtime.config.task,{1,2},&newBinding)==Reason::None);
+    f->runtime.counters.bindingEpoch=2;
     RS2_CHECK(f->Service(Now()));
     RS2_CHECK(r.terminal && r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Observed) && !f->runtime.transport.reservedCredits);
+    RS2_CHECK(f->metadataHeads==1 && f->metadataFills==1 && f->metadataUpdates==1 && f->metadataDestroys==1);
+    RS2_CHECK((r.value.flags&(RecoveryPublishedLocally|RecoveryMetadataAttempted|RecoveryMetadataCoherent))==
+        (RecoveryPublishedLocally|RecoveryMetadataAttempted|RecoveryMetadataCoherent));
+    if(scenario==5 || scenario==6) RS2_CHECK(f->Get<std::uint32_t>(0x17989F8)==(scenario==5 ? 1u : 32u));
     RS2_CHECK(r.value.callbackOwnTicks==ticks && (r.value.flags&RecoveryCallbackOwnTimingValid));
     InvokeLeechCreateSuccessForTest(r,reinterpret_cast<const void*>(f->native.base+SequenceFixture::kResult),79);
     RS2_CHECK(f->forwardCalls==1 && r.callbackTiming.ticks==ticks && r.value.callbackOwnTicks==ticks);
@@ -554,6 +794,264 @@ void SynchronousFinishError() {
     RS2_CHECK((r.value.flags&RecoveryRestartRequired) && !r.createInstalled && f->holderReleases==1 && !f->slotReleases);
     RS2_CHECK(f->Get<std::uint32_t>(f->native.layout.genericPool)==0 &&
         f->Get<std::int32_t>(f->native.finishObject+0x20)==-1);
+}
+void PreparePublished(SequenceFixture& f) {
+    FinishSequence(f);RecreateLeechForTest(f.runtime,*f.recovery);f.Callback();f.PublishCache();
+    RS2_CHECK(f.Service(Now()) && f.recovery->value.phase==static_cast<std::uint64_t>(RecoveryPhase::Published));
+    TaskSnapshot bound{};RS2_CHECK(InstallTaskBinding(f.runtime.task,f.Access(),f.runtime.config.task,{1,2},&bound)==Reason::None);
+    f.runtime.counters.bindingEpoch=2;
+}
+void PreflightRetryAndNativeBoundary() {
+    for(bool foreign:{false,true}) {
+        auto fault=std::make_unique<SequenceFixture>();fault->PilotScope();auto& ended=*fault->recovery;
+        ended.control.enabled=true;ended.control.started=1;ended.control.latched=1;
+        ended.qualifyingRecordSequence=1;StoreStatusWord(fault->status.worker.observedSequence,1);
+        fault->native.HeapPut<std::int32_t>(0x1042E0,1);
+        RS2_CHECK(fault->Service(Now()) && (ended.value.flags&RecoveryPreflightRetryable));
+        if(foreign) InterlockedExchange(&ended.foreignFault,1);
+        else ended.control.result=static_cast<LONG>(recovery::ControlResult::WorkerFailure);
+        RS2_CHECK(RecoveryServiceDue(fault->runtime) && fault->Service(Now()));
+        RS2_CHECK(!(ended.value.flags&RecoveryPreflightRetryable) && ended.value.operationSequence==1 &&
+            ended.value.reason==static_cast<std::uint64_t>(foreign ? RecoveryReason::CallbackInvalid : RecoveryReason::ControlWorkerUnavailable) &&
+            !ended.recipeEntered && fault->order.empty() && !RecoveryServiceDue(fault->runtime));
+        const auto exported=fault->Scalar();
+        RS2_CHECK(exported.wire.payload.flags==ended.value.flags && exported.wire.payload.reason==ended.value.reason);
+    }
+    {
+        auto idle=std::make_unique<SequenceFixture>();idle->PilotScope();idle->Population(65,33);
+        idle->native.HeapPut<std::int32_t>(0x1042F0,32);idle->native.HeapPut<std::int32_t>(0x106094,32);
+        idle->native.Put<std::int32_t>(idle->native.layout.genericPool+0x68,12);
+        idle->native.Put<std::int32_t>(idle->native.layout.genericPool+0x6C,6);
+        idle->native.Put<std::uint8_t>(idle->native.layout.genericPool+0x70,1);
+        auto& admitted=*idle->recovery;admitted.qualifyingRecordSequence=1;StoreStatusWord(idle->status.worker.observedSequence,1);
+        RS2_CHECK(idle->Service(Now()) && !admitted.terminal && admitted.oldHeartbeat.schedule.errors==12 &&
+            admitted.oldHeartbeat.schedule.throttles==6 && admitted.source.outer.bots==32 && admitted.source.outer.pi==65 &&
+            !admitted.recipeEntered && idle->order.empty()); // Still awaiting the real transport quiescence witness.
+    }
+    for(unsigned invalid=0;invalid<3;++invalid) {
+        auto bad=std::make_unique<SequenceFixture>();bad->PilotScope();auto& q=*bad->recovery;
+        if(invalid==0) bad->native.Put<std::int32_t>(bad->native.layout.genericPool+0x68,-1);
+        if(invalid==1) bad->native.Put<std::int32_t>(bad->native.layout.genericPool+0x6C,-1);
+        if(invalid==2) bad->native.Put<std::uint8_t>(bad->native.layout.genericPool+0x70,2);
+        q.qualifyingRecordSequence=1;StoreStatusWord(bad->status.worker.observedSequence,1);
+        RS2_CHECK(bad->Service(Now()) && q.terminal && q.value.reason==77+invalid && !q.recipeEntered && bad->order.empty());
+    }
+    auto f=std::make_unique<SequenceFixture>();f->PilotScope();auto& r=*f->recovery;
+    r.control.enabled=true;r.control.started=1;r.control.latched=1;
+    r.qualifyingRecordSequence=1;StoreStatusWord(f->status.worker.observedSequence,1);
+    f->native.HeapPut<std::int32_t>(0x1042E0,1); // Qualified source reads real spectators.
+    RS2_CHECK(f->Service(Now()) && r.terminal && r.value.reason==static_cast<std::uint64_t>(RecoveryReason::SpectatorsPresent));
+    RS2_CHECK((r.value.flags&RecoveryPreflightRetryable) && !r.control.latched && !r.recipeEntered && f->order.empty());
+    RS2_CHECK(!RecoveryServiceDue(f->runtime));
+    const auto firstOperation=r.value.operationSequence,firstTransition=r.value.transitionSequence;
+    const auto records=f->Records();bool finalFound=false;
+    for(const auto& record:records) if(record.header.kind==static_cast<std::uint64_t>(RecordKindV3::Recovery) &&
+        record.payload.recovery.event==static_cast<std::uint64_t>(RecoveryEvent::Final) &&
+        record.payload.recovery.reason==static_cast<std::uint64_t>(RecoveryReason::SpectatorsPresent)) finalFound=true;
+    RS2_CHECK(finalFound); // The incident's missing terminal log must regress.
+    f->native.HeapPut<std::int32_t>(0x1042E0,0);
+    RS2_CHECK(recovery::ClaimControlForTesting(r.control,recovery::RequestOrigin::Pipe));
+    RS2_CHECK(RecoveryServiceDue(f->runtime) && f->Service(Now()));
+    RS2_CHECK(!r.terminal && r.value.operationSequence==firstOperation+1 && r.value.transitionSequence>firstTransition &&
+        r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Qualifying) && !(r.value.flags&RecoveryPreflightRetryable));
+    RS2_CHECK(!recovery::ClaimControlForTesting(r.control,recovery::RequestOrigin::Pipe));
+    // A changing read-only native snapshot is also safely retryable; the
+    // eligibility policy must not be another hand-picked diagnostic whitelist.
+    r.terminal=true;r.finalPending=true;r.value.reason=static_cast<std::uint64_t>(RecoveryReason::GuardSnapshotChanged);
+    r.value.outcome=static_cast<std::uint64_t>(RecoveryOutcome::MechanicsFailed);
+    FinishLeechTerminalForTest(f->runtime,r,Now());
+    RS2_CHECK((r.value.flags&RecoveryPreflightRetryable) && !r.control.latched && !r.recipeEntered);
+    r.control.consoleRequested=true;r.control.consoleRegistration=static_cast<LONG>(recovery::ConsoleRegistration::Available);
+    RS2_CHECK(recovery::ClaimConsoleControlRequest(r.control) && f->Service(Now()) && !r.terminal && r.value.operationSequence==firstOperation+2);
+    // A later refusal after ANY native entry must stay spent, even when Cancel
+    // was never reached. Exercise the same terminal publication function.
+    r.recipeEntered=true;r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::Descriptor);
+    r.terminal=true;r.finalPending=true;r.value.reason=static_cast<std::uint64_t>(RecoveryReason::HeartbeatUnavailable);
+    FinishLeechTerminalForTest(f->runtime,r,Now());
+    RS2_CHECK(!(r.value.flags&RecoveryPreflightRetryable) && r.control.latched==2 && !r.cancelEntered);
+}
+void RevokedPreflightDoesNotStarveCleanup() {
+    for(const auto phase:{RecoveryPhase::Requested,RecoveryPhase::Qualifying}) {
+        auto f=std::make_unique<SequenceFixture>();auto& r=*f->recovery;
+        r.value.phase=static_cast<std::uint64_t>(phase);
+        RevokeStatus(f->status,Reason::RecordLoss);
+        RS2_CHECK(f->Service(Now()) && r.terminal && !r.pendingCount && !r.finalPending);
+        RS2_CHECK(!RecoveryServiceDue(f->runtime) && !f->runtime.recoveryQuota.active && !f->runtime.transport.reservedCredits);
+        CleanupRevokedRuntime(f->runtime,CallerClass::NormalPump);
+        RS2_CHECK(f->runtime.task.inverseAttempted && !f->runtime.task.stranded && ReadTaskPhase(f->runtime.task)==TaskPhase::Inert &&
+            f->Get<std::uintptr_t>(f->native.layout.genericPool+0x40)==f->runtime.task.original && !r.recipeEntered);
+    }
+    // No records/native work are allowed on an unsupported capture. A later
+    // qualified normal owner may finish a pure preflight timeout instead of
+    // leaving it permanently spent with no terminal explanation.
+    auto f=std::make_unique<SequenceFixture>();f->PilotScope();auto& r=*f->recovery;
+    r.control.enabled=true;r.control.started=1;r.control.latched=1;
+    const auto now=Now();r.value.finishDeadlineQpc=now-1;
+    RS2_CHECK(!ServiceLeechRecovery(f->runtime,CallerClass::Unknown,3,false,static_cast<std::int64_t>(now)));
+    RS2_CHECK(r.terminal && r.finalPending && !r.recipeEntered && f->Records().empty());
+    RS2_CHECK(RecoveryServiceDue(f->runtime) && f->Service(Now()));
+    RS2_CHECK((r.value.flags&RecoveryPreflightRetryable) && !r.control.latched && !RecoveryServiceDue(f->runtime));
+}
+void PilotPopulationBounds() {
+    // Exercise the real owner admission path, not only UUID-view construction.
+    for(const auto pi:{0u,2u,65u,256u,257u}) {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope();f->Population(pi);
+        auto& r=*f->recovery;r.qualifyingRecordSequence=1;
+        StoreStatusWord(f->status.worker.observedSequence,1);
+        RS2_CHECK(f->Service(Now()));
+        if(pi>kRecoveryMetadataMemberLimit) {
+            RS2_CHECK(r.terminal && !r.cancelEntered && f->order.empty() &&
+                r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataCountLimit));
+        } else {
+            // Population and native guards pass, but this fixture deliberately
+            // has no native-log quiescence witness. Never bypass that separate
+            // gate merely to make a successful admission test invoke Cancel.
+            RS2_CHECK(!r.cancelEntered && !r.terminal && f->order.empty() && r.source.outer.pi==pi &&
+                r.source.maximum==64 && r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Qualifying));
+            RS2_CHECK(r.value.oldSdkFingerprint && r.value.oldSdkFingerprint==r.value.oldCacheFingerprint);
+        }
+    }
+    for(unsigned scenario=0;scenario<4;++scenario) {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope();f->Population(2);
+        if(scenario==0) {f->recovery->control.scope=rs2fix::recovery::kTrainingControlScope;f->Population(2,1);}
+        if(scenario==1) f->runtime.config.mode=Mode::Repair;
+        if(scenario==2) {f->native.HeapPut<std::int32_t>(0x1042E4,65);f->native.HeapPut<std::int32_t>(0x10609C,65);}
+        if(scenario==3) {f->recovery->control.scope=rs2fix::recovery::kTrainingControlScope;f->native.HeapPut<std::int32_t>(0x1042F0,1);}
+        auto& r=*f->recovery;r.qualifyingRecordSequence=1;StoreStatusWord(f->status.worker.observedSequence,1);
+        RS2_CHECK(f->Service(Now()) && r.terminal && !r.cancelEntered && f->order.empty());
+    }
+    // Population changes AFTER recreation must use the latest qualified native
+    // PI, including values above human maximum, and refuse 257 without truncation.
+    for(const auto pi:{0u,2u,65u,256u,257u}) {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope();PreparePublished(*f);f->Population(pi);
+        auto& r=*f->recovery;RS2_CHECK(f->Service(Now()));
+        RS2_CHECK(r.terminal && r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Observed) &&
+            !(r.value.flags&RecoveryRestartRequired));
+        if(pi==0) RS2_CHECK(!f->metadataHeads && !f->metadataRandomCalls && (r.value.flags&RecoveryMetadataCoherent));
+        else if(pi<=kRecoveryMetadataMemberLimit) {
+            RS2_CHECK(f->metadataUpdates==1 && f->metadataDestroys==1 && r.metadataMembers.count==pi);
+            RS2_CHECK(f->Get<std::uintptr_t>(f->native.layout.kernelVector+8)-f->Get<std::uintptr_t>(f->native.layout.kernelVector)==pi*32);
+        } else RS2_CHECK(!f->metadataHeads && !f->metadataRandomCalls &&
+            r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataCountLimit));
+    }
+}
+void MetadataObservationWindow() {
+    for(bool coherent : {false,true}) {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope();
+        auto& r=*f->recovery;
+        f->Population(32,2);
+        f->native.HeapPut<std::int32_t>(0x1042F0,30);f->native.HeapPut<std::int32_t>(0x106094,30);
+        f->native.HeapPut<std::int32_t>(0x1042E4,32);f->native.HeapPut<std::int32_t>(0x10609C,32);
+        f->native.Put<std::uint32_t>(0x17989F8,30);f->native.Put<std::uint32_t>(0x17989FC,32);
+        f->native.Put<std::uint32_t>(0x14AAD68,32);
+        f->native.HeapString(0x14AAD48,0x1C0000,
+            R"({"ip":"192.0.2.123","op":[{"k":"PI_COUNT","v":"32"},{"k":"BotPlayerCount","v":"30"},{"k":"MaxPlayerCount","v":"32"}]})",4096);
+        RS2_CHECK(RecoveryRuntimeSource(f->runtime,&r.source)==Reason::None);
+        f->runtime.source=r.source;
+        RS2_CHECK(f->native.Snapshot(r.before)==RecoveryNativeResult::Ready);r.current=r.before;
+        PreparePublished(*f);
+        f->native.Put<std::uint8_t>(0x17989F0,1); // Let the stock update finish; no explicit repair admitted.
+        const auto publication=r.value.qpc;
+        RS2_CHECK(r.metadataDeadlineQpc==publication+f->frequency*45 && r.metadataDeadlineQpc<r.value.overallDeadlineQpc);
+        // Replay the observed >30s native cadence without sleeping or changing
+        // the real monotonic clock: consume 32s of the two remaining budgets.
+        const auto elapsed=f->frequency*32;
+        r.metadataDeadlineQpc=r.metadataDeadlineQpc>elapsed ? r.metadataDeadlineQpc-elapsed : 0;
+        r.value.overallDeadlineQpc-=elapsed;
+        if(coherent) {
+            const auto end=f->Get<std::uintptr_t>(f->native.layout.kernelVector)+32*32;
+            f->native.Put(f->native.layout.kernelVector+8,end);
+            f->native.Put(f->native.layout.kernelVector+16,end);
+        }
+        const auto nativeOrder=f->order.size();
+        RS2_CHECK(f->Service(Now())==coherent);
+        RS2_CHECK(!f->metadataHeads && !f->metadataUpdates && f->order.size()==nativeOrder &&
+            r.value.operationSequence==1 && !(r.value.flags&(RecoveryRestartRequired|RecoveryPreflightRetryable|RecoveryMetadataAttempted)));
+        if(coherent) {
+            RS2_CHECK(r.terminal && r.value.reason==0 && (r.value.flags&RecoveryMetadataCoherent));
+            RS2_CHECK(r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Observed));
+        } else {
+            RS2_CHECK(!r.terminal && r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Published) &&
+                r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataCountsNotReady));
+            RS2_CHECK(f->Service(r.metadataDeadlineQpc));
+            RS2_CHECK(r.terminal && r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataTimeout) &&
+                (r.value.flags&RecoveryMetadataUnverified) && !(r.value.flags&RecoveryMetadataCoherent));
+        }
+        RS2_CHECK(r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::PublishedNotDelivered) &&
+            !f->metadataHeads && !f->metadataUpdates && !f->runtime.transport.reservedCredits);
+    }
+}
+void MetadataRefusalsAndCleanup() {
+    for(unsigned scenario=0;scenario<5;++scenario) {
+        auto f=std::make_unique<SequenceFixture>();PreparePublished(*f);auto& r=*f->recovery;
+        if(scenario==0) f->metadataRandomFails=true;
+        if(scenario==1) f->native.Put<std::uint8_t>(0x17989F0,1); // Stock update pending.
+        if(scenario==2) f->metadataChangesCounts=true; // Changes after fill, before update.
+        if(scenario==3) f->metadataLeavesMismatch=true;
+        if(scenario==4) f->native.Put(f->native.layout.kernelVector+8,f->native.heapBase+0x60000+2*32); // Already coherent.
+        const auto completed=f->Service(Now());
+        if(scenario==1 || scenario==2) {
+            RS2_CHECK(!completed && !r.terminal && f->metadataUpdates==0 && !r.metadataHeadOwned);
+            RS2_CHECK(f->metadataHeads==(scenario==2 ? 1u : 0u) && f->metadataDestroys==f->metadataHeads);
+            r.metadataDeadlineQpc=Now()-1;RS2_CHECK(f->Service(Now()));
+            RS2_CHECK(r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataTimeout));
+        } else RS2_CHECK(completed && r.terminal);
+        RS2_CHECK(r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Observed) && !(r.value.flags&RecoveryRestartRequired));
+        RS2_CHECK(r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::PublishedNotDelivered));
+        if(scenario==0) RS2_CHECK(f->metadataHeads==0 && f->metadataRandomCalls==1 &&
+            r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataRandomUnavailable));
+        if(scenario==3) RS2_CHECK(f->metadataUpdates==1 && f->metadataDestroys==1 &&
+            (r.value.flags&RecoveryMetadataAttempted) && !(r.value.flags&RecoveryMetadataCoherent));
+        if(scenario==4) RS2_CHECK(f->metadataHeads==0 && f->metadataRandomCalls==0 &&
+            (r.value.flags&RecoveryMetadataCoherent) && !(r.value.flags&RecoveryMetadataAttempted));
+    }
+    for(unsigned stage=0;stage<4;++stage) {
+        auto f=std::make_unique<SequenceFixture>();PreparePublished(*f);auto& r=*f->recovery;
+        f->throwMetadataHead=stage==0;f->throwMetadataFill=stage==1;
+        f->throwMetadataUpdate=stage==2;f->throwMetadataDestroy=stage==3;
+        bool propagated{};try {f->Service(Now());} catch(const SequenceFixture::Exception&) {propagated=true;}
+        RS2_CHECK(propagated && r.terminal && (r.value.flags&RecoveryExceptionObserved) && (r.value.flags&RecoveryRestartRequired));
+        RS2_CHECK(f->metadataHeads==1 && f->metadataDestroys==(stage==0 ? 0u : 1u));
+        FinishLeechTerminalForTest(f->runtime,r,Now());
+        RS2_CHECK(r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Failed));
+        const auto destroys=f->metadataDestroys;
+        FinishLeechTerminalForTest(f->runtime,r,Now());RS2_CHECK(f->metadataDestroys==destroys);
+    }
+    {
+        auto f=std::make_unique<SequenceFixture>();PreparePublished(*f);auto& r=*f->recovery;
+        const auto value=f->StringValue(f->native.layout.sdkSession);
+        f->native.HeapString(f->native.layout.sdkSession,0x1B8000,value.c_str(),63); // Same ID, new owned buffer.
+        RS2_CHECK(f->Service(Now()) && (r.value.flags&RecoveryMetadataCoherent) && !(r.value.flags&RecoveryRestartRequired));
+    }
+    {
+        auto f=std::make_unique<SequenceFixture>();PreparePublished(*f);auto& r=*f->recovery;
+        f->StringData(f->native.layout.sdkSession)[0]='X';f->StringData(f->native.layout.cacheSession)[0]='X';
+        RS2_CHECK(f->Service(Now()) && r.terminal && (r.value.flags&RecoveryRestartRequired) && !f->metadataHeads);
+        RS2_CHECK(r.value.reason==static_cast<std::uint64_t>(RecoveryReason::PublishedIdentityChanged));
+    }
+}
+void PublishedObservationFaults() {
+    for(unsigned scenario=0;scenario<5;++scenario) {
+        Fixture f;f.FinishPhase(RecoveryPhase::Published);f.Reserve();auto& r=*f.recovery;
+        r.value.flags|=RecoveryPublishedLocally;
+        if(scenario<2) {
+            r.value.overallDeadlineQpc=Now()-1;r.metadataDeadlineQpc=r.value.overallDeadlineQpc-1;
+            if(!scenario) RS2_CHECK(f.Service(Now()));
+            else RS2_CHECK(!ServiceLeechRecovery(f.runtime,CallerClass::Unknown,0,true,static_cast<std::int64_t>(Now())));
+        } else if(scenario==2) {
+            RecoveryOwnerClockFault(f.runtime);FinishLeechTerminalForTest(f.runtime,r,Now());
+        } else if(scenario==3) {
+            f.runtime.transport.state=static_cast<std::uint64_t>(TransportState::Paused);RS2_CHECK(f.Service(Now()));
+        } else {
+            r.metadataDeadlineQpc=Now()+f.frequency*30;++f.runtime.counters.sourceEpoch;RS2_CHECK(f.Service(Now()));
+        }
+        RS2_CHECK(r.terminal && r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Observed));
+        RS2_CHECK(!(r.value.flags&RecoveryRestartRequired) && (r.value.flags&RecoveryMetadataUnverified));
+        RS2_CHECK(r.value.outcome==static_cast<std::uint64_t>(RecoveryOutcome::PublishedNotDelivered));
+        RS2_CHECK(f.memoryReads==0 && f.memoryQueries==0 && nativeCalls==0 && !f.runtime.transport.reservedCredits);
+        if(scenario<2) RS2_CHECK(r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataTimeout));
+        const auto scalar=f.Scalar();RS2_CHECK(scalar.wire.payload.phase==r.value.phase);
+    }
 }
 void ActualLifetimeChangesRefuse() {
     {
@@ -656,6 +1154,21 @@ void RequestAdmission() {
     RS2_CHECK(rejected.terminal && !rejected.cancelEntered &&
         rejected.value.reason==static_cast<std::uint64_t>(RecoveryReason::QuotaUnavailable));
     RS2_CHECK(unavailable.runtime.transport.reservedCredits==256 && !unavailable.runtime.recoveryQuota.active && nativeCalls==0);
+    // Nonzero claims cannot become invisible to the owner: opted-in console
+    // is accepted, but unsupported origin/opt-in state is consumed as a visible
+    // clean refusal with no native mutation and no later retry in this process.
+    for (unsigned scenario=0;scenario<3;++scenario) {
+        Fixture claim;auto& selected=*claim.recovery;
+        selected.control.consoleRequested=scenario==0;
+        selected.control.consoleRegistration=static_cast<LONG>(recovery::ConsoleRegistration::Available);
+        selected.control.scope.schema=2;
+        InterlockedExchange(&selected.control.latched,scenario==2 ? 3 : 2);
+        RS2_CHECK(RecoveryServiceDue(claim.runtime));
+        RS2_CHECK(claim.Service(Now()) && selected.requested && !selected.cancelEntered && nativeCalls==0);
+        if(scenario==0) RS2_CHECK(!selected.terminal && selected.value.operationSequence==1);
+        else RS2_CHECK(selected.terminal && selected.value.reason==static_cast<std::uint64_t>(RecoveryReason::InvalidRequest) &&
+            !(selected.value.flags&RecoveryRestartRequired) && !RecoveryServiceDue(claim.runtime));
+    }
 }
 void FinishCallbacks() {
     for(unsigned scenario=0;scenario<5;++scenario) {
@@ -895,12 +1408,13 @@ void TerminalQuotaAndEvidence() {
 }
 } // namespace
 void LeechRecoveryTests() {
+    ConsoleReadSelectors();ConsoleRegistrationAndCommands();
 #if defined(RS2_RECOVERY_GUARD_PROBE)
     NativeGuardReasons();ReadOnlyGuardProbe();
 #else
     NativeGuardReasons();ActiveGuardReasonCompatibility();
     RequestAdmission();FinishCallbacks();DeadlinesAndUnknownInverse();UnsupportedServicePreservesManagement();UnsupportedTerminalKeepsSuspension();TerminalQuotaAndEvidence();
-    IrreversibleSequenceSuccess();SynchronousFinishError();ActualLifetimeChangesRefuse();
+    IrreversibleSequenceSuccess();MetadataObservationWindow();MetadataRefusalsAndCleanup();PilotPopulationBounds();PreflightRetryAndNativeBoundary();RevokedPreflightDoesNotStarveCleanup();PublishedObservationFaults();SynchronousFinishError();ActualLifetimeChangesRefuse();
     IrreversibleOwnershipUnwind();InstanceGuardRefusals();GuardedCallbackRefusalAndUnwind();
 #endif
 }

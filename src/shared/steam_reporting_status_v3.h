@@ -7,7 +7,7 @@
 // shapes are shared; offsets, publication protocol and artifact identity differ.
 namespace rs2fix::reporting {
 inline constexpr std::uint32_t kStatusSchemaV3 = 3;
-inline constexpr std::uint32_t kReportingArtifactVersionV3 = 0x00060200U;
+inline constexpr std::uint32_t kReportingArtifactVersionV3 = 0x00070100U;
 inline constexpr std::uint64_t kRuntimeReasonCountV3 = 59;
 
 // A separate domain: temporary transport refusals must never become bits in

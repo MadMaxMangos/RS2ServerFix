@@ -16,6 +16,41 @@ bool LedgerValid(NativePipeline& p) noexcept {
     return p.ledgerRead<=p.nextFormat && p.nextFormat<=p.ledgerWrite &&
         p.ledgerWrite-p.ledgerRead<=kNativeLedgerCapacity;
 }
+bool RecoveryDetail(NativePipeline& p,const ReportRecordV3& record) noexcept {
+    if (p.format.config.diagnostics!=Diagnostics::Operational) return false;
+    const auto kind=static_cast<RecordKindV3>(record.header.kind);
+    if (kind==RecordKindV3::Recovery) {
+        const auto& r=record.payload.recovery;
+        if (r.phase==static_cast<std::uint64_t>(RecoveryPhase::Requested)) {
+            p.recoveryDetail=true;p.terminalDetailSeen=false;p.detailBoundaryPairs=0;
+            p.detailOverallDeadlineQpc=r.overallDeadlineQpc;p.builderPostBoundary=false;
+        }
+        if (p.recoveryDetail && (r.flags & RecoveryTerminal)) p.terminalDetailSeen=true;
+        return true;
+    }
+    if (kind==RecordKindV3::BuilderEnter) {
+        p.builderDetailActive=true;p.builderDetail=p.recoveryDetail;
+        // Pre-cancel refusals can publish final STATUS without a terminal log
+        // record. The already formatted request's owner deadline bounds text
+        // verbosity only: do not fabricate a terminal event or inspect live state.
+        const bool pastDeadline=p.detailOverallDeadlineQpc && record.header.qpc>=p.detailOverallDeadlineQpc;
+        p.builderPostBoundary=p.recoveryDetail && (p.terminalDetailSeen || pastDeadline);
+        p.detailBuildSequence=record.payload.builder.buildSequence;
+        p.detailSourceEpoch=record.header.sourceEpoch;p.detailBindingEpoch=record.header.bindingEpoch;
+        return p.builderDetail;
+    }
+    if (kind==RecordKindV3::BuilderReturn || kind==RecordKindV3::BuilderUnwind) {
+        const bool matching=p.builderDetailActive && p.detailBuildSequence==record.payload.builder.buildSequence &&
+            p.detailSourceEpoch==record.header.sourceEpoch && p.detailBindingEpoch==record.header.bindingEpoch;
+        const bool detail=matching && p.builderDetail;
+        if (matching) {
+            p.builderDetailActive=false;
+            if (p.builderPostBoundary && ++p.detailBoundaryPairs>=4) p.recoveryDetail=false;
+        }
+        return detail;
+    }
+    return p.recoveryDetail;
+}
 }
 TransportReason InitializeNativePipeline(NativePipeline& p,StatusWireV3& status,
     ReportRingV3& ring,const NativeFormatContext& context,const NativeHashOps& hash,
@@ -68,7 +103,8 @@ bool PrepareNativeFrames(NativePipeline& p,std::uint64_t qpc) noexcept {
         if (entry.state!=LedgerState::Scalar || p.preparedSequence==UINT64_MAX ||
             entry.sequence!=p.preparedSequence+1) return Loss(p);
         std::size_t bytes{};
-        if (!FormatNativeRecord(p.format,entry.body.scalar,p.scratch,sizeof(p.scratch),&bytes))
+        const bool detail=RecoveryDetail(p,entry.body.scalar);
+        if (!FormatNativeRecord(p.format,entry.body.scalar,p.scratch,sizeof(p.scratch),&bytes,detail))
             return Loss(p);
         Sha256Digest digest{};
         if (!p.hash.digest(p.hash.context,p.scratch,bytes,&digest)) return Loss(p);

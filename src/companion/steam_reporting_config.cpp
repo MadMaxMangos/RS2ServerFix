@@ -52,6 +52,7 @@ template<class Configuration> Reason Parse(const char* bytes, std::size_t size, 
             if (!Equal(bytes + first, keyEnd - first, "diagnostics") || diagnostics) return Reason::ConfigInvalid;
             if (Equal(bytes + value, last - value, "normal")) detail = Diagnostics::Normal;
             else if (Equal(bytes + value, last - value, "detailed")) detail = Diagnostics::Detailed;
+            else if (Equal(bytes + value, last - value, "operational")) detail = Diagnostics::Operational;
             else return Reason::ConfigInvalid;
             diagnostics = true;
         } else return Reason::ConfigInvalid;

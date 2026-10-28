@@ -55,7 +55,7 @@ bool ContextValid(const NativeFormatContext& c) noexcept {
         h.validity==CompleteHeaderIdentity && h.pid && h.processCreation && h.qpcFrequency &&
         h.configuredMode==static_cast<std::uint32_t>(c.config.mode) &&
         c.config.mode>=Mode::Disabled && c.config.mode<=Mode::Repair &&
-        c.config.diagnostics>=Diagnostics::Normal && c.config.diagnostics<=Diagnostics::Detailed &&
+        c.config.diagnostics>=Diagnostics::Normal && c.config.diagnostics<=Diagnostics::Operational &&
         l.pathChars>0 && l.pathChars<1024 && l.path[l.pathChars]==0 &&
         l.prefixMode<=1 && l.transportKind==1 && l.durability==0 &&
         l.initialAtLineBoundary<=1 &&
@@ -116,7 +116,7 @@ bool FormatNativeBootstrap(const NativeFormatContext& c,char* output,
     Hex(c.identities.steamApiDigest.data(),32,sdk);
     Hex(c.identities.steamClientDigest.data(),32,client);
     Hex(c.log.fileId,16,fileId);
-    json.Append(",\"artifact\":\"RS2ServerFix-steam-reporting\",\"version\":\"0.6.2.0\","
+    json.Append(",\"artifact\":\"RS2ServerFix-steam-reporting\",\"version\":\"0.7.1.0\","
         "\"artifact_version\":%u,\"process_start_filetime\":%llu,\"qpc_frequency\":%llu,"
         "\"mode\":\"%s\",\"configured_mode\":%u,\"header_validity\":%u,"
         "\"diagnostics\":\"%s\",\"anchor_interval_seconds\":%u,"
@@ -129,15 +129,20 @@ bool FormatNativeBootstrap(const NativeFormatContext& c,char* output,
         "\"record_bytes\":256,\"ring_capacity\":256,\"batch_limit\":32,"
         "\"ledger_capacity\":256,\"ready_capacity\":8,\"message_limit\":8192,"
         "\"native_service_hz\":4,\"native_frames_per_opportunity\":2,"
-        "\"native_frames_per_second\":8,\"request_floor_seconds\":20,"
+        "\"native_frames_per_second\":8,\"request_floor_seconds\":20,\"prepared_counts_schema\":1,"
+        "\"prepared_dirty_schema\":1,\"recovery_origin_schema\":1,"
         "\"authentication_changed\":false,\"native_counting_preserved\":true,"
         "\"termination_may_lose_tail\":true,\"log_path\":",
         c.header.artifactVersion,c.header.processCreation,c.header.qpcFrequency,
         ModeName(c.config.mode),c.header.configuredMode,c.header.validity,
-        DiagnosticsName(c.config.diagnostics),c.config.diagnostics==Diagnostics::Normal ? 10U : 1U,
+        DiagnosticsName(c.config.diagnostics),c.config.diagnostics==Diagnostics::Operational ? 60U :
+            c.config.diagnostics==Diagnostics::Detailed ? 1U : 10U,
         host,sdk,client,c.log.utcFiletime,c.log.calibrationQpcBefore,c.log.calibrationQpcAfter,
         c.log.volumeSerial,fileId,c.log.initialEOF,c.log.initialAtLineBoundary,c.log.prefixMode);
     json.Path(c.log);
+    if (c.config.diagnostics==Diagnostics::Operational)
+        json.Append(",\"operational_fields_schema\":1,\"qualification_evidence\":false,"
+            "\"recovery_detail_post_terminal_pairs\":4,\"recovery_detail_deadline_fallback\":true");
     const auto& s=c.startup;
     json.Append(",\"startup\":{\"build_identity\":%u,\"recon_mode\":%u,"
         "\"recon_outcome\":%u,\"recon_reason\":%u,\"recon_qualified\":%u,"
@@ -157,7 +162,7 @@ TransportReason PrepareNativeBootstrap(const NativeFormatContext& c,char* ascii,
     return TransportReason::None;
 }
 bool FormatNativeRecord(const NativeFormatContext& c,const ReportRecordV3& record,
-    char* output,std::size_t capacity,std::size_t* bytes) noexcept {
+    char* output,std::size_t capacity,std::size_t* bytes,bool recoveryDetail) noexcept {
     Clear(output,capacity,bytes);
     if (!output || !capacity || !bytes || !record.header.sequence ||
         record.header.kind<1 || record.header.kind>=static_cast<std::uint32_t>(RecordKindV3::Count))
@@ -178,6 +183,38 @@ bool FormatNativeRecord(const NativeFormatContext& c,const ReportRecordV3& recor
         json.Append(",\"%s\":%llu",name,value);
     };
     const auto kind=static_cast<RecordKindV3>(record.header.kind);
+    if (c.config.diagnostics==Diagnostics::Operational) {
+        const bool compactKind=kind==RecordKindV3::State || kind==RecordKindV3::BuilderEnter ||
+            kind==RecordKindV3::BuilderReturn || kind==RecordKindV3::BuilderUnwind ||
+            kind==RecordKindV3::Anchor || kind==RecordKindV3::TransportSummary;
+        json.Append(",\"detail\":\"%s\"",!recoveryDetail && compactKind ? "operational" : "full");
+        if (!recoveryDetail && compactKind) {
+            // Text-only projection: the scalar record, sequence, digest and
+            // native receipt remain intact. Never use this subset to qualify timing.
+            if (kind==RecordKindV3::State) {
+                const auto& p=record.payload.state;
+                scalar("phase",p.phase);scalar("mode",p.mode);scalar("bound",p.bound);
+                scalar("pi",p.pi);scalar("bots",p.bots);scalar("maximum",p.maximum);
+            } else if (kind==RecordKindV3::Anchor) {
+                const auto& p=record.payload.anchor;
+                scalar("normal_attempts",p.normalAttempts);scalar("normal_returns",p.normalReturns);
+                scalar("native_unwinds",p.nativeUnwinds);scalar("build_sequence",p.buildSequence);
+            } else if (kind==RecordKindV3::TransportSummary) {
+                const auto& p=record.payload.transport;
+                scalar("transport_state",p.transportState);scalar("transport_reason",p.transportReason);
+                scalar("generated_sequence",p.generatedSequence);scalar("submitted_sequence",p.submittedSequence);
+                scalar("observed_sequence",p.observedSequence);
+            } else {
+                const auto& p=record.payload.builder;
+                scalar("build_sequence",p.buildSequence);scalar("pi",p.pi);scalar("bots",p.bots);
+                scalar("maximum",p.maximum);scalar("classification",p.classification);
+                scalar("selected",p.selected);scalar("result",p.result);
+                scalar("prepared_valid",p.preparedValid);
+                if (p.preparedValid==1) scalar("prepared_mismatch_mask",p.preparedMismatchMask);
+            }
+            return json.Finish(bytes);
+        }
+    }
     switch (kind) {
     case RecordKindV3::State: {
         const auto& p = record.payload.state;
@@ -221,6 +258,15 @@ bool FormatNativeRecord(const NativeFormatContext& c,const ReportRecordV3& recor
         scalar("pi",p.pi); scalar("bots",p.bots); scalar("maximum",p.maximum);
         scalar("classification",p.classification); scalar("selected",p.selected);
         scalar("result",p.result); scalar("pending",p.pending); scalar("fresh",p.fresh);
+        scalar("prepared_valid",p.preparedValid);
+        if (p.preparedValid==1) {
+            scalar("prepared_mismatch_mask",p.preparedMismatchMask);
+            scalar("prepared_maximum",p.preparedMaximum); scalar("prepared_members",p.preparedMembers);
+            scalar("prepared_pi",p.preparedPi); scalar("prepared_bots",p.preparedBots);
+            scalar("prepared_json_maximum",p.preparedJsonMaximum); scalar("prepared_json_bytes",p.preparedJsonBytes);
+        }
+        scalar("prepared_dirty_valid",p.preparedDirtyValid);
+        if (p.preparedDirtyValid==1) scalar("prepared_dirty_at_entry",p.preparedDirtyAtEntry);
         break;
     }
     case RecordKindV3::Anchor: {
@@ -275,6 +321,8 @@ bool FormatNativeRecord(const NativeFormatContext& c,const ReportRecordV3& recor
         const auto& p = record.payload.recovery;
         scalar("recovery_phase", p.phase); scalar("recovery_event", p.event);
         scalar("recovery_reason", p.reason); scalar("recovery_outcome", p.outcome); scalar("recovery_flags", p.flags);
+        scalar("recovery_request_origin", !p.operationSequence ? 0ULL :
+            ((p.flags & RecoveryConsoleRequested) ? 2ULL : 1ULL));
         scalar("recovery_operation_sequence", p.operationSequence); scalar("recovery_transition_sequence", p.transitionSequence);
         scalar("recovery_qpc", p.qpc); scalar("recovery_source_epoch", p.sourceEpoch); scalar("recovery_sdk_epoch", p.sdkEpoch);
         scalar("recovery_owner_thread_id", p.ownerThreadId); scalar("recovery_resource_phase", p.resourcePhase);

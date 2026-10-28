@@ -1,5 +1,6 @@
 #pragma once
 #include "companion/steam_reporting_native_profile.h"
+#include "companion/steam_reporting_types.h"
 #include <array>
 
 namespace rs2fix::reporting {
@@ -17,6 +18,51 @@ inline constexpr std::size_t kRecoveryVectorCapacity = 8192;
 inline constexpr std::size_t kRecoverySessionBytes = 1024;
 inline constexpr std::size_t kRecoveryCacheChars = 1024;
 inline constexpr std::size_t kRecoveryGuidBytes = 37; // Native 36-byte UUID text plus NUL.
+
+// Read-only BA9490 input ABI, NOT plugin std::string/std::vector objects. The
+// qualified native routine copies the source strings and retains no pointer.
+// These initialized owner-private views must never be passed to a native
+// destructor. Keep their address stable from preparation until the call returns.
+inline constexpr std::uint32_t kRecoveryMetadataMemberLimit = 256;
+struct RecoveryBorrowedString {
+    std::uintptr_t data;
+    std::uint64_t unused;
+    std::uint64_t size, capacity;
+};
+struct RecoveryBorrowedVector { std::uintptr_t begin, end, capacity; };
+struct RecoveryMetadataMembers {
+    RecoveryBorrowedVector vector;
+    RecoveryBorrowedString strings[kRecoveryMetadataMemberLimit];
+    char text[kRecoveryMetadataMemberLimit][kRecoveryGuidBytes];
+    std::uint32_t count;
+};
+struct RecoveryRandomOps {
+    void* context;
+    bool (*fill)(void*, std::uint8_t*, std::size_t) noexcept;
+};
+static_assert(sizeof(RecoveryBorrowedString)==32 &&
+    offsetof(RecoveryBorrowedString,size)==16 && offsetof(RecoveryBorrowedString,capacity)==24);
+static_assert(sizeof(RecoveryBorrowedVector)==24 && sizeof(std::uintptr_t)==8);
+static_assert(std::is_trivial_v<RecoveryMetadataMembers> &&
+    std::is_standard_layout_v<RecoveryMetadataMembers>);
+// Inert argument preparation only: no host/SDK call or admission is implied.
+// Uses one RNG operation before any native mutation, refuses rather than clamps,
+// and clears all output on failure. No callers may copy/move a prepared view.
+bool PrepareRecoveryMetadataMembers(RecoveryMetadataMembers&, std::uint32_t count,
+    const RecoveryRandomOps&) noexcept;
+const RecoveryRandomOps& ProductionRecoveryRandomOps() noexcept;
+
+// Reproduces the stock A53560 local object's ABI. A real native tree head must
+// be stored at+A8 before this object may be filled or destroyed. Byte storage
+// is deliberately not a plugin STL object; its address stays owner-resident.
+struct alignas(16) RecoveryMetadataProperties { std::uint8_t bytes[0xC0]; };
+struct RecoveryMetadataCache {
+    NativeCounts counts;
+    std::uint32_t countdownBits;
+    std::uint8_t registrationChanged, fullDirty;
+    std::uint16_t reserved;
+};
+static_assert(alignof(RecoveryMetadataProperties)==16 && sizeof(RecoveryMetadataProperties)>=0xB8);
 
 enum class RecoveryNativeResult : std::uint32_t {
     Ready, InvalidContext, Unreadable, Changed, Budget, Shape, Alias,
@@ -106,6 +152,17 @@ static_assert(std::is_trivial_v<RecoveryNativeSnapshot> && std::is_standard_layo
 ProfileResult ValidateNativeRecoveryProfile(std::uintptr_t hostBase,
     const StartupProfile&, const MemoryOps&, const NativeImportOps&, DWORD*) noexcept;
 const char* NativeRecoveryInventorySha256() noexcept;
+ProfileResult ValidateNativeRecoveryMetadataProfile(std::uintptr_t hostBase,
+    const StartupProfile&, const MemoryOps&, const NativeImportOps&, DWORD*) noexcept;
+const char* NativeRecoveryMetadataInventorySha256() noexcept;
+// Two-pass read of the stock cached tuple, pending-update gates and dirty byte.
+// Readiness/caller/session/source and profile leases remain separate authority.
+RecoveryNativeResult ReadRecoveryMetadataCache(const RecoveryNativeContext&,
+    RecoveryMetadataCache*, DWORD*) noexcept;
+// Allocator-only inverse lease: no source/SDK continuation is inferred. The
+// caller separately validates both immutable profiles and current owner.
+RecoveryNativeResult RequireRecoveryMetadataAllocator(const RecoveryNativeContext&,
+    std::uintptr_t expectedAllocator,DWORD*) noexcept;
 // Fresh, two-observation read-only gate. Owner/source/SDK/lifetime, loaded profile
 // and closed native-writer provenance are independently REQUIRED by the caller.
 // Ready is a coherent shape/type/target observation, never a call permission or
@@ -165,4 +222,14 @@ struct RecoveryNativeCalls {
     RecoverySlotReleaseFn finishRelease;
 };
 RecoveryNativeCalls NativeRecoveryCallAddresses(std::uintptr_t qualifiedHostBase) noexcept;
+using RecoveryMetadataHeadFn = void* (*)();
+using RecoveryMetadataObjectFn = void (*)(void* nativeProperties);
+using RecoveryMetadataUpdateFn = void (*)(const void* nativeProperties, const RecoveryBorrowedVector*);
+struct RecoveryMetadataCalls {
+    RecoveryMetadataHeadFn head;
+    RecoveryMetadataObjectFn fill, destroy;
+    RecoveryMetadataUpdateFn update;
+};
+// Potential native exceptions MUST propagate; these boundaries are not noexcept.
+RecoveryMetadataCalls NativeRecoveryMetadataCallAddresses(std::uintptr_t qualifiedHostBase) noexcept;
 } // namespace rs2fix::reporting

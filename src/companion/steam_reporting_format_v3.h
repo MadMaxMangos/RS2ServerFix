@@ -35,5 +35,5 @@ bool FormatNativeBootstrap(const NativeFormatContext&, char*, std::size_t capaci
 TransportReason PrepareNativeBootstrap(const NativeFormatContext&,char*,std::size_t,
     wchar_t*,std::size_t,std::size_t* bytes) noexcept;
 bool FormatNativeRecord(const NativeFormatContext&, const ReportRecordV3&,
-    char*, std::size_t capacity, std::size_t* bytes) noexcept;
+    char*, std::size_t capacity, std::size_t* bytes, bool recoveryDetail = false) noexcept;
 } // namespace rs2fix::reporting

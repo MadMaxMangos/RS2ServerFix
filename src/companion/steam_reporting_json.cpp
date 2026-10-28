@@ -60,7 +60,7 @@ class Reader {
 public:
     Reader(const char* bytes, std::size_t size) noexcept : bytes_(bytes), size_(size) {}
 
-    Reason Run(const NativeCounts& expected) noexcept {
+    Reason Run(NativeCounts* output) noexcept {
         Space();
         if (!Take('{') || !Token() || !Push(true, Role::Root)) return Failure();
         while (depth_ && error_ == Reason::None) {
@@ -112,7 +112,8 @@ public:
         if (error_ != Reason::None) return error_;
         Space();
         if (cursor_ != size_ || seen_ != 7) return Reason::PreparedMalformed;
-        return EqualCounts(counts_, expected) ? Reason::None : Reason::PreparedMismatch;
+        *output = counts_;
+        return Reason::None;
     }
 
 private:
@@ -325,9 +326,18 @@ private:
 
 Reason ValidatePreparedJson(const char* bytes, std::size_t size,
     const NativeCounts& expected) noexcept {
+    NativeCounts actual{};
+    const auto reason = ReadPreparedJsonCounts(bytes, size, &actual);
+    if (reason != Reason::None) return reason;
+    return EqualCounts(actual, expected) ? Reason::None : Reason::PreparedMismatch;
+}
+Reason ReadPreparedJsonCounts(const char* bytes, std::size_t size,
+    NativeCounts* output) noexcept {
+    if (!output) return Reason::PreparedUnavailable;
+    *output = {};
     if (!bytes || !size) return Reason::PreparedUnavailable;
     if (size > kJsonBytes) return Reason::PreparedLimit;
     Reader reader(bytes, size);
-    return reader.Run(expected);
+    return reader.Run(output);
 }
 } // namespace rs2fix::reporting

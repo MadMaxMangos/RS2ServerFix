@@ -95,12 +95,14 @@ void CanonicalVariantsAndSink() {
         input.payload.builder.probeElapsedTicks=2; input.payload.builder.classificationElapsedTicks=1;
         input.payload.builder.originalElapsedTicks=18;
         input.payload.builder.selected=1; input.payload.builder.result=1;
+        input.payload.builder.preparedValid=1; input.payload.builder.preparedPi=123;
         for (auto& word:input.payload.builder.reserved) word=UINT64_MAX;
         RS2_CHECK(EnqueueReport(f.ring,input,&accepted)==ReportWriteResult::Accepted);
         RS2_CHECK(DequeueReport(f.ring,&output)==ReportReadResult::Record);
         RS2_CHECK(output.header.sequence==accepted && output.payload.builder.buildSequence==31);
         RS2_CHECK(output.payload.builder.probeElapsedTicks==2 && output.payload.builder.classificationElapsedTicks==1);
         RS2_CHECK(output.payload.builder.originalElapsedTicks==18 && output.payload.builder.selected==1);
+        RS2_CHECK(output.payload.builder.preparedValid==0 && output.payload.builder.preparedPi==0);
         RS2_CHECK(AllZero(output.payload.builder.reserved));
     }
     input={}; input.header.kind=static_cast<std::uint32_t>(RecordKind::Anchor);
@@ -298,6 +300,45 @@ void ConcurrentSpscOrdering() {
     RS2_CHECK(ReadStatusWord(status.lossReasons)==0 && ReadStatusWord(status.revokeReasons)==0);
     RS2_CHECK(AllZero(ring.slots));
 }
+void V3PreparedDiagnostic() {
+    StatusWireV3 status{}; ReportRingV3 ring{};
+    RS2_CHECK(InitializeReportRing(ring, status, GetCurrentThreadId()));
+    for (const auto kind : {RecordKindV3::BuilderEnter, RecordKindV3::BuilderReturn, RecordKindV3::BuilderUnwind}) {
+        for (unsigned invalid = 0; invalid < 5; ++invalid) {
+            ReportRecordV3 input{}, output{};
+            input.header.kind=static_cast<std::uint32_t>(kind);
+            auto& p=input.payload.builder;
+            p.preparedValid=1; p.preparedMismatchMask=2; p.preparedMaximum=32;
+            p.preparedMembers=0; p.preparedPi=2; p.preparedBots=0;
+            p.preparedJsonMaximum=32; p.preparedJsonBytes=150;
+            p.preparedDirtyValid=1; p.preparedDirtyAtEntry=1;
+            if (invalid==1) p.preparedValid=2;
+            if (invalid==2) p.preparedMismatchMask=32;
+            if (invalid==3) p.preparedMembers=4097;
+            if (invalid==4) p.preparedJsonBytes=kJsonBytes+1;
+            for (auto& word:p.reserved) word=UINT64_MAX;
+            std::uint64_t sequence{};
+            RS2_CHECK(EnqueueReport(ring,input,&sequence)==ReportWriteResult::Accepted);
+            RS2_CHECK(DequeueReport(ring,&output)==ReportReadResult::Record);
+            const auto& q=output.payload.builder;
+            RS2_CHECK(q.preparedValid==(invalid ? 0U : 1U));
+            RS2_CHECK(q.preparedPi==(invalid ? 0U : 2U) && q.preparedMembers==0);
+            RS2_CHECK(q.preparedJsonBytes==(invalid ? 0U : 150U));
+            RS2_CHECK(q.preparedDirtyValid==1 && q.preparedDirtyAtEntry==1);
+            RS2_CHECK(AllZero(q.reserved));
+        }
+        for (unsigned invalid=0;invalid<3;++invalid) {
+            ReportRecordV3 input{},output{}; input.header.kind=static_cast<std::uint32_t>(kind);
+            input.payload.builder.preparedDirtyValid=invalid==1 ? 2U : 0U;
+            input.payload.builder.preparedDirtyAtEntry=1;
+            if (invalid==2) { input.payload.builder.preparedDirtyValid=1; input.payload.builder.preparedDirtyAtEntry=2; }
+            std::uint64_t sequence{};
+            RS2_CHECK(EnqueueReport(ring,input,&sequence)==ReportWriteResult::Accepted);
+            RS2_CHECK(DequeueReport(ring,&output)==ReportReadResult::Record);
+            RS2_CHECK(!output.payload.builder.preparedDirtyValid && !output.payload.builder.preparedDirtyAtEntry);
+        }
+    }
+}
 void V3CanonicalControlsAndDrain() {
     StatusWireV3 status{};
     ReportRingV3 ring{};
@@ -352,5 +393,6 @@ void ReportingRecordTests() {
     CanonicalVariantsAndSink(); CapacityLossAndDrain(); ScrubBeforeReuse();
     OverflowAndInvalidSequence(); ForeignAndNormalStop(); ConcurrentSpscOrdering();
     V3CanonicalControlsAndDrain();
+    V3PreparedDiagnostic();
 }
 } // namespace rs2fix::testcases

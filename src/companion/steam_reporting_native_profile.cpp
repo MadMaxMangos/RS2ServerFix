@@ -13,7 +13,7 @@ bool ResolveSystemImport(void*, const char* moduleName, const char* name,
     if (error) *error = ERROR_INVALID_PARAMETER;
     if (!address || !moduleName || !name ||
         (_stricmp(moduleName,"KERNEL32.dll") && _stricmp(moduleName,"ADVAPI32.dll") &&
-         _stricmp(moduleName,"MSVCR110.dll"))) return false;
+         _stricmp(moduleName,"MSVCR110.dll") && _stricmp(moduleName,"MSVCP110.dll"))) return false;
     HMODULE module = GetModuleHandleA(moduleName); // Existing static dependency only.
     if (!module) { if (error) *error = GetLastError(); return false; }
     wchar_t loaded[512]{}, expected[512]{};

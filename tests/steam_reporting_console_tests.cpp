@@ -217,7 +217,7 @@ void RecoveryIndependenceAndCadence() {
         f.Recover(RecoveryPhase::Failed,RecoveryReason::ClockFault,3,true);
         f.wire.owner.phase=UINT64_MAX; // Immutable header remains qualified; ordinary CORE is invalid.
         f.StartConsole(true);
-        RS2_CHECK(f.Step() && f.Has("[RS2LeechRecovery] v0.6.2.0") && f.Has("phase=failed"));
+        RS2_CHECK(f.Step() && f.Has("[RS2LeechRecovery] v0.7.1.0") && f.Has("phase=failed"));
         RS2_CHECK(f.Has("reason=clock-fault") && f.Has("transition=3") && f.Has("last_valid_qpc=1000"));
         RS2_CHECK(f.Has("restart_required=1") && f.Has("pid=17") && f.inFlightEven);
         RS2_CHECK(f.console.diagnostics.written==1 && f.console.diagnostics.lastNoticeEpoch==3);
@@ -238,7 +238,7 @@ void RecoveryIndependenceAndCadence() {
         f.StartConsole(true);
         RS2_CHECK(f.Step() && f.Has("[RS2LeechRecovery]")); // Recovery terminal has priority over ordinary ready.
         RS2_CHECK(f.Step(999) && f.writes==1);
-        RS2_CHECK(f.Step(1) && f.writes==2 && f.Has("[RS2SteamReport] v0.6.2.0") && f.Has("status=ready"));
+        RS2_CHECK(f.Step(1) && f.writes==2 && f.Has("[RS2SteamReport] v0.7.1.0") && f.Has("status=ready"));
         f.Recover(RecoveryPhase::Failed,RecoveryReason::CreateFailed,6,true);
         RS2_CHECK(f.Step(100) && f.writes==2);
         f.Recover(RecoveryPhase::Failed,RecoveryReason::ClockFault,7,true);

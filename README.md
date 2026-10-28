@@ -17,15 +17,17 @@ The update distinguishes prepared trial kits from published source and releases.
 
 Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
 companion is **0.3.0.0** and requires its own qualified trial package.
-Steam reporting and manual Leech recovery use the **0.6.2.0 experimental target**.
-The current source includes the r5 guard corrections and remains intended for
-controlled training-server trials. It retains the 0.4.2 admission correction for
-negative-spectator and over-capacity human accounting drift without replacing
-the game's native advertised counts or changing authentication. Bot/capacity,
-memory and lifecycle safeguards remain in force. The default configuration observes reporting
-and disables manual recovery. A controlled two-player healthy-server trial has
-completed native Leech session recreation and subsequent browser-count convergence
-without player reconnects. Recovery after an actual Steam outage remains unproven;
+Steam reporting and manual Leech recovery use the **0.7.1.0 experimental target**.
+The source includes manual WebAdmin control, compact operational diagnostics,
+schema-2 bot-tolerant admission, valid idle-heartbeat error-history acceptance
+and the r3 metadata observation window of 45 seconds.
+It retains the earlier recon and native reporting admission corrections, without
+replacing advertised counts or changing authentication. Memory, ownership and
+lifecycle safeguards remain in force. The default configuration observes reporting
+and disables manual recovery. Healthy training trials have completed native Leech
+session replacement while players remained connected. The latest bot-inclusive
+trial exposed a metadata deadline/cadence mismatch; the r3 correction still needs
+its own runtime trial. Recovery after an actual Steam outage remains unproven;
 this is not a generally qualified production release.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
@@ -208,7 +210,10 @@ directory, quota, private key, rotation or retention subsystem. This does not
 move the game's logger off the engine thread: native logging and its console
 mirror remain synchronous. Normal diagnostics use a ten-second anchor/summary
 cadence plus state, request and builder events; detailed diagnostics use one
-second. Output is limited to eight native frames per second, not one per tick.
+second. `diagnostics=operational` uses compact records and 60-second anchors,
+with full detail around recovery. Operational logs are status evidence, not
+performance/coverage qualification evidence; the collector rejects that mode for
+qualification. Output is limited to eight native frames per second, not one per tick.
 
 A read-only receipt worker verifies that submitted events reached the same log
 file. Missing logger qualification or temporary receipt/credit pressure visibly
@@ -249,7 +254,7 @@ for a different session ID, publication into the game's session cache, and a fre
 heartbeat binding. It does not restart the server, disconnect players, reset
 Steam authentication, or implement an automatic Tuesday-outage recovery loop.
 
-The 0.6.2.0 r5 source corrects four native guard contracts: the cached session ID
+The retained 0.6.2.0 r5 corrections establish four native guard contracts: the cached session ID
 is a narrow `std::string`; a stable core GUID supplies lifetime identity while
 authorization tokens may rotate; valid retained Finish slots can be reused by
 the native allocator; and an unchanged public-IP value may move allocations.
@@ -259,13 +264,60 @@ UTF-16 cache fingerprints are not comparable across revisions.
 Manual recovery is separate from the reporting `mode=repair` setting above. It
 defaults to disabled in [RS2LeechRecovery.ini](config/RS2LeechRecovery.ini), which
 must be placed beside the EXE, not in a `config` subfolder. The current
-implementation is restricted to `E:\rs2v_trainingsrv\Binaries\Win64` under the
-training root `E:\rs2v_trainingsrv`. A one-shot request uses the matched
+schema-1 configuration retains the original `E:\rs2v_trainingsrv` restriction.
+Schema 2 binds an explicitly configured fixed-drive server root and operator SID;
+it requires reporting `mode=observe`. It permits a manual pilot without changing
+native counting or authentication. Each explicit pipe request uses the matched
 [Request-LeechRecovery.ps1](tools/Request-LeechRecovery.ps1) helper and authenticates
 the configured operator SID through the named pipe. The server and helper must
 run as that same elevated administrator account. File permission changes are
-not required by this control mechanism. A request transmission alone does not
+not required by this control mechanism. The INI is trusted local configuration;
+the root and SID checks identify this server and account, not the file's author.
+A request transmission alone does not
 establish admission, native completion or browser repair.
+
+The optional schema-2 `console_trigger=server-admin` registers
+`rs2leech status` and `rs2leech recover <run token>` for WebAdmin's management
+console. It ships disabled. The console route trusts existing WebAdmin admin
+privileges and local configuration; **it does not authenticate the Windows
+operator and does not protect against local file writers**. The visible run token
+checks deliberate, current-process intent; it is not an authentication credential.
+Only the qualified WebAdmin reply path can claim recovery. Local and in-game
+console output classes are not supported by this adapter. Pipe and console share
+one request at a time and one native recovery recipe per process. Schema 2 may
+release the claim after a fully recorded preflight rejection that entered no
+native recipe or resource operation. Status retains the rejection reason and
+shows `retry=yes`; a later explicit request may use either route and gets a new
+operation number. **Do not resend a request while it is pending.** No automatic
+retry occurs, and a rejection after any native recipe entry stays spent. A bad
+pipe request can close that opportunity even without claiming the latch. A wrong
+console token does not claim it. Disable the opt-in after the pilot window.
+
+`diagnostics=operational` keeps compact structured records in the existing
+`Launch.log`, uses 60-second routine anchors, and temporarily retains full detail
+around recovery. Normal and detailed diagnostics remain available for controlled
+captures. Operational logs are not collector qualification evidence: the collector
+refuses that mode even with archive or training-recovery options. Preserve the raw
+log and use a fresh normal/detailed run for qualification.
+
+The pilot preserves native counts, including PI counts above capacity and the
+native bot count. Schema 2 supports bots; schema 1 retains its original two-human,
+zero-bot training policy. Both require zero spectators and retain exact
+source/lifetime guards. Joins or actor-array changes during recovery can cause a
+refusal requiring restart. Start with a low-population affected server. A successful
+native callback, publication or metadata check is not proof of browser repair.
+
+An inactive schema-2 configuration is shown below. The repository's supplied
+schema-1 default also disables recovery. SID-free hosting support remains a
+separate follow-up; the SID is configuration, not a hard-coded account identity.
+
+```ini
+schema=2
+permission=disabled
+server_root=E:\rs2v_trainingsrv
+operator_sid=none
+console_trigger=disabled
+```
 
 For a controlled trial, use the reviewed, checksum-bound kit. To build the
 read-only guard variant from source, use a separate directory and supply the
@@ -284,13 +336,13 @@ Replace the example evidence path with your preserved input. The probe DLL is
 under `build-leech-probe/diagnostic/guard-probe/Release`; its recovery native call
 sites are compiled out. A build with `RS2_RECOVERY_GUARD_PROBE=OFF` uses
 `production/reporting/Release` and can perform the native sequence only after
-explicit configuration and an authenticated manual request. Both variants retain
-FileVersion 0.6.2.0; distinguish them by their build setting and artifact hashes.
+explicit configuration and its authorized pipe or WebAdmin request route. Both variants retain
+FileVersion 0.7.1.0; distinguish them by their build setting and artifact hashes.
 Use tools and configuration from the same verified trial package. A local rebuild
 does not reproduce the kit's artifact hashes or inherit its package qualification.
 Public prereleases remain recon-only or read-only guard-probe variants.
-Native-enabled recovery is restricted to separately authorized training trials,
-not populated public-server deployment.
+Native-enabled recovery requires a separately authorized operator trial; building
+or publishing its source does not qualify it for populated public-server deployment.
 
 #### Controlled healthy-server result (22 October 2026)
 
@@ -323,6 +375,26 @@ assertions, zero failures) and both companion PE contracts. The r4-to-r5 guard
 correction review and source-custody checks closed with no blocking or important
 findings; that was not a fresh review of the entire source tree. These local
 results do not establish live recovery or production qualification.
+
+#### Bot-inclusive trial and metadata window (28 October 2026)
+
+The 0.7.1.0 r2 healthy training trial retained two Steam players with native
+PI=32, bots=30 and maximum=32. Raw records confirm successful Finish/Create,
+changed SDK/cache session fingerprints, local publication about 0.94 seconds
+after request pickup and a fresh heartbeat binding. The operator reported correct
+browser/WebAdmin counts. This did not reproduce maintenance-outage damage.
+
+The local metadata follow-up timed out at about publication+30 seconds, before
+the first recorded normal builder at +30.17 seconds. A coherent prepared snapshot
+was observed at about +31.6 seconds. The explicit follow-up metadata Update was
+not attempted. The source now includes r3's **45-second metadata window**, still
+capped by the **120-second overall attempt deadline** and its existing margin.
+Late publication can shorten the available window. The correction preserves the
+existing native Update gates and one native recovery opportunity per process.
+The changed native recipe and WebAdmin route require operator-run training
+qualification before an outage pilot. The r3 window needs a new bot-inclusive
+training trial; local coherence, backend delivery
+and client/browser adoption remain separate observations.
 
 Full qualification testing also requires locally supplied, preserved executable
 inputs. Set the CMake cache paths `RS2_PR1_BASELINE_PATH`,

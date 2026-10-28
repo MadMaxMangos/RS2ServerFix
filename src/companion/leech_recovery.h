@@ -1,5 +1,6 @@
 #pragma once
 #include "companion/leech_recovery_control.h"
+#include "companion/leech_recovery_console.h"
 #include "companion/leech_recovery_native.h"
 #include "companion/leech_recovery_policy.h"
 #include "companion/leech_recovery_wire.h"
@@ -16,9 +17,16 @@ struct LeechRecovery {
     Runtime* runtime;
     RecoveryStatusWireV1* status;
     recovery::ControlState control;
+    LeechConsoleAdapter console;
     StartupProfile startup;
     RecoveryNativeContext native;
     RecoveryNativeCalls calls;
+    RecoveryMetadataCalls metadataCalls;
+    RecoveryRandomOps metadataRandom;
+    // Opaque storage permits an explicitly aligned16 view without changing
+    // this process-private POD's natural alignment or relying on tail padding.
+    std::uint8_t metadataPropertiesStorage[sizeof(RecoveryMetadataProperties)+15];
+    RecoveryMetadataMembers metadataMembers;
     CaptureProfile createCapture;
     ReportRecoveryPayload value;
     ReportRecoveryPayload pendingRecords[9];
@@ -36,11 +44,13 @@ struct LeechRecovery {
     std::uint32_t pendingCount, pendingRead;
     std::uint32_t beforeCreateIssued, beforeCreateRequestSlot;
     std::uint64_t callbackQpc, lastEmissionQpc, qualifyingRecordSequence;
+    std::uint64_t metadataDeadlineQpc, metadataLastProbeQpc;
     volatile LONG foreignFault;
     bool prepared, controlStarted, requested, terminal, finalPending;
     bool finishObserved, finishTrue, enqueueReturned, cancelEntered;
     bool createInstalled, createForwarded, createReturned, exceptionPending;
     bool resourceReleaseAttempted, bindEntered, bindCompleted, recipeEntered, recipeReturned;
+    bool metadataHeadOwned, metadataDestructorEntered, metadataUpdateReturned, haveMetadataProbe;
 };
 static_assert(std::is_trivially_copyable_v<LeechRecovery> &&
     std::is_standard_layout_v<LeechRecovery> && std::is_trivially_destructible_v<LeechRecovery>);
