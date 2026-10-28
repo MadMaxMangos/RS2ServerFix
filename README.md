@@ -9,6 +9,10 @@ the existing server launch command and does not rewrite the executable on disk.
 This is an independent community project, not an official Tripwire Interactive
 release. It is not a general performance patch or a fix for every server crash.
 
+For the dated operator-trial status and outstanding investigations, see the
+[28 October update for Tripwire Interactive](reference/TWI-STATUS-2026-10-28.md).
+The update distinguishes prepared trial kits from published source and releases.
+
 ## What is implemented
 
 Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
