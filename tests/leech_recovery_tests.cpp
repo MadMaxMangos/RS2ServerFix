@@ -952,10 +952,10 @@ void MetadataObservationWindow() {
         PreparePublished(*f);
         f->native.Put<std::uint8_t>(0x17989F0,1); // Let the stock update finish; no explicit repair admitted.
         const auto publication=r.value.qpc;
-        RS2_CHECK(r.metadataDeadlineQpc==publication+f->frequency*45 && r.metadataDeadlineQpc<r.value.overallDeadlineQpc);
-        // Replay the observed >30s native cadence without sleeping or changing
-        // the real monotonic clock: consume 32s of the two remaining budgets.
-        const auto elapsed=f->frequency*32;
+        RS2_CHECK(r.metadataDeadlineQpc==publication+f->frequency*65 && r.metadataDeadlineQpc<r.value.overallDeadlineQpc);
+        // Cover the observed ~60s cadence beyond the former 45s window without
+        // sleeping or changing the real clock: consume 62s of both budgets.
+        const auto elapsed=f->frequency*62;
         r.metadataDeadlineQpc=r.metadataDeadlineQpc>elapsed ? r.metadataDeadlineQpc-elapsed : 0;
         r.value.overallDeadlineQpc-=elapsed;
         if(coherent) {

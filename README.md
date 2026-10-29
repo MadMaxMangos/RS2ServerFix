@@ -20,14 +20,15 @@ companion is **0.3.0.0** and requires its own qualified trial package.
 Steam reporting and manual Leech recovery use the **0.7.1.0 experimental target**.
 The source includes manual WebAdmin control, compact operational diagnostics,
 schema-2 bot-tolerant admission, valid idle-heartbeat error-history acceptance
-and the r3 metadata observation window of 45 seconds.
+and a 65-second metadata observation window.
 It retains the earlier recon and native reporting admission corrections, without
 replacing advertised counts or changing authentication. Memory, ownership and
 lifecycle safeguards remain in force. The default configuration observes reporting
 and disables manual recovery. Healthy training trials have completed native Leech
 session replacement while players remained connected. The latest bot-inclusive
-trial exposed a metadata deadline/cadence mismatch; the r3 correction still needs
-its own runtime trial. Recovery after an actual Steam outage remains unproven;
+trial reached local coherence within r3's 45-second window, but showed an observed
+roughly 60-second dirty-build cadence. The timing-only extension to 65 seconds is
+not a new runtime qualification. Recovery after an actual Steam outage remains unproven;
 this is not a generally qualified production release.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
@@ -376,7 +377,7 @@ correction review and source-custody checks closed with no blocking or important
 findings; that was not a fresh review of the entire source tree. These local
 results do not establish live recovery or production qualification.
 
-#### Bot-inclusive trial and metadata window (28 October 2026)
+#### Bot-inclusive trials and metadata window (29 October 2026)
 
 The 0.7.1.0 r2 healthy training trial retained two Steam players with native
 PI=32, bots=30 and maximum=32. Raw records confirm successful Finish/Create,
@@ -387,14 +388,21 @@ browser/WebAdmin counts. This did not reproduce maintenance-outage damage.
 The local metadata follow-up timed out at about publication+30 seconds, before
 the first recorded normal builder at +30.17 seconds. A coherent prepared snapshot
 was observed at about +31.6 seconds. The explicit follow-up metadata Update was
-not attempted. The source now includes r3's **45-second metadata window**, still
-capped by the **120-second overall attempt deadline** and its existing margin.
-Late publication can shorten the available window. The correction preserves the
-existing native Update gates and one native recovery opportunity per process.
-The changed native recipe and WebAdmin route require operator-run training
-qualification before an outage pilot. The r3 window needs a new bot-inclusive
-training trial; local coherence, backend delivery
-and client/browser adoption remain separate observations.
+not attempted. A subsequent healthy r3 trial reached local coherence at about
+publication +39.5 seconds within its 45-second window. Later dirty builder reads
+were approximately 60 seconds apart; the first post-publication heartbeat still
+had a membership mismatch. The operator reported browser recovery to two players
+without rejoining, approximately 90-120 seconds after the request.
+
+The source now uses a **65-second maximum metadata window**, allowing a small
+margin over that observed cadence. It still completes early on coherence and is
+capped by the **120-second overall attempt deadline** and its existing margin;
+late publication can shorten the window. No native Update gates or recovery
+opportunities are changed. The explicit metadata Update was not exercised by
+those trials, and its unmet gate remains unidentified. This timing-only revision
+has not had a new runtime trial; it does not accelerate browser propagation or
+establish real-outage efficacy. Local coherence, backend delivery and
+client/browser adoption remain separate observations.
 
 Full qualification testing also requires locally supplied, preserved executable
 inputs. Set the CMake cache paths `RS2_PR1_BASELINE_PATH`,

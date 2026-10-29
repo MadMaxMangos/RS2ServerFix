@@ -12,9 +12,9 @@ struct CaptureFixture {std::uint32_t frames[kCaptureFrames];std::size_t count;bo
 CaptureFixture g_captureFixture{};
 #endif
 constexpr std::uint64_t kFinishSeconds=60, kAttemptSeconds=120;
-// The native heartbeat runs every 30 seconds; leave scheduling margin for its
-// first post-publication build. The overall attempt deadline still caps this.
-constexpr std::uint64_t kMetadataSeconds=45;
+// Dirty metadata builds were observed about 60 seconds apart; leave a small
+// scheduling margin. The overall attempt deadline still caps this window.
+constexpr std::uint64_t kMetadataSeconds=65;
 bool PureClock(std::uint64_t* output) noexcept {
     const DWORD error=GetLastError(); LARGE_INTEGER qpc{};
     const bool ok=output && QueryPerformanceCounter(&qpc) && qpc.QuadPart>0;
