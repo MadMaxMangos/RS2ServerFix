@@ -9,8 +9,10 @@ inline constexpr wchar_t kTrainingExecutableDirectory[] = L"E:\\rs2v_trainingsrv
 inline constexpr std::size_t kControlPathBytes = 512;
 inline constexpr std::size_t kControlFileBytes = 512;
 inline constexpr std::size_t kControlAclCharacters = 8192;
-// First pilot: one fixed-drive path component, not a discovered arbitrary tree.
-inline constexpr std::size_t kControlRootCharacters = 36;
+// Keep legacy pilot syntax independent of the portable, EXE-derived root.
+inline constexpr std::size_t kLegacyControlRootCharacters = 36;
+inline constexpr std::size_t kControlRootCharacters = kControlPathBytes;
+inline constexpr std::size_t kControlDirectoryPins = kControlPathBytes / 2;
 struct ControlScope { DWORD schema; wchar_t serverRoot[kControlRootCharacters]; };
 inline constexpr ControlScope kTrainingControlScope{1,L"E:\\rs2v_trainingsrv"};
 enum class ControlResult : LONG {
@@ -19,6 +21,7 @@ enum class ControlResult : LONG {
     Stopped, WorkerFailure, PendingWrite, EndpointUnavailable, AlreadyClaimed
 };
 enum class RequestOrigin : LONG { None, Pipe, ServerAdminConsole };
+enum class ControlTransport : unsigned { None, AuthenticatedPipe, WebAdminOnly };
 enum class ConsoleRegistration : LONG { NotRegistered, Available, Unavailable };
 enum class ConsoleCommand : unsigned { Unrelated, Invalid, Status, Recover };
 inline constexpr std::size_t kConsoleCommandCharacters = 96;
@@ -26,6 +29,8 @@ inline constexpr std::size_t kConsoleConfirmationCharacters = 16;
 struct ControlConfig {
     bool enabled;
     bool consoleRequested;
+    bool autoRoot;
+    ControlTransport transport;
     ControlScope scope;
     BYTE operatorSid[SECURITY_MAX_SID_SIZE];
     DWORD operatorSidBytes;
@@ -51,6 +56,7 @@ struct ControlState {
     bool enabled;
     // Requested opt-in is not authority: the native adapter must qualify first.
     bool consoleRequested;
+    ControlTransport transport;
     // One-way owner publication AFTER native registration, read interlocked.
     // Requested intent above is startup-immutable and is never call authority.
     volatile LONG consoleRegistration;
@@ -58,7 +64,7 @@ struct ControlState {
     ControlScope scope;
     ControlRequest identity;
     ControlSecurity security;
-    HANDLE directories[4];
+    HANDLE directories[kControlDirectoryPins];
     HANDLE thread;
     HANDLE pipe;
     HANDLE ioEvent;
@@ -73,7 +79,13 @@ ControlResult ParseControlConfig(const char*, std::size_t, ControlConfig*) noexc
 ControlResult ParseControlRequest(const char*, std::size_t,
     const ControlRequest& identity, ControlRequest*, const ControlScope* = nullptr) noexcept;
 ControlResult InitializeControl(ControlState&, const wchar_t* executableDirectory,
-    DWORD pid, const BYTE (&runId)[16], DWORD* error, bool allowManualPilot = false) noexcept;
+    DWORD pid, const BYTE (&runId)[16], DWORD* error, bool allowManualPilot = false,
+    bool allowWebAdminOnly = false) noexcept;
+bool ManualPilotScope(const ControlScope&) noexcept;
+bool LegacyPipeScope(const ControlScope&, ControlTransport) noexcept;
+bool WebAdminOnlyScope(const ControlScope&, ControlTransport) noexcept;
+bool ConsoleControlScope(const ControlState&) noexcept;
+// Activated does not imply a worker exists: WebAdmin-only is owner-serviced.
 bool StartControl(ControlState&, DWORD* error) noexcept;
 void StopControl(ControlState&) noexcept;
 // Call only from the qualified owner WebAdmin route after intent-token checks.
@@ -92,6 +104,16 @@ void ConsoleConfirmation(const BYTE (&runId)[16],
 ConsoleCommand ParseConsoleCommand(const wchar_t*, std::size_t characters,
     const char (&confirmation)[kConsoleConfirmationCharacters + 1]) noexcept;
 #ifdef RS2_REPORTING_TESTING
+// Private startup dispatch seam; production never accepts caller-supplied calls.
+struct ControlPlatformCalls {
+    bool (*administratorIdentity)(ControlSecurity*, DWORD*) noexcept;
+    ControlResult (*preparePipe)(ControlState&, DWORD*) noexcept;
+    HANDLE (*startWorker)(ControlState&, DWORD*) noexcept;
+};
+ControlResult PrepareControlTransportForTesting(ControlState&, const ControlConfig&,
+    bool allowWebAdminOnly, const ControlPlatformCalls&, DWORD*) noexcept;
+bool StartControlForTesting(ControlState&, const ControlPlatformCalls&, DWORD*) noexcept;
+bool StartupThreadUnimpersonatedForTesting(DWORD (*presence)() noexcept, DWORD*) noexcept;
 bool ClaimControlForTesting(ControlState&, RequestOrigin) noexcept;
 ControlResult PrepareControlPipeForTesting(ControlState&, DWORD*) noexcept;
 bool ControlPeerMatchesForTesting(const ControlSecurity&, PSID) noexcept;

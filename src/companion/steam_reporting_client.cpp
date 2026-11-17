@@ -262,6 +262,12 @@ ClientQualification QualifyLoadedSteamClient() noexcept {
         expected.steamClientImageSize, expected.steamClientTimestamp, expected.steamClientChecksum};
     return Qualify(identity, kModules, ProductionMemoryOps(), ProductionHostHashOps());
 }
+ClientQualification QualifyLoadedDepotSteamClient() noexcept {
+    const auto& expected=DepotReportingIdentities();
+    const Identity identity{kSelectedSteamClientLeaf,expected.steamClientDigest,
+        expected.steamClientImageSize,expected.steamClientTimestamp,expected.steamClientChecksum};
+    return Qualify(identity,kModules,ProductionMemoryOps(),ProductionHostHashOps());
+}
 #if defined(RS2_REPORTING_TESTING)
 ClientQualification QualifyLoadedSteamClientForTest(const ClientTestIdentity& expected,
     const ClientModuleTestOps& modules, const MemoryOps& memory, const HostHashOps& hashOps) noexcept {

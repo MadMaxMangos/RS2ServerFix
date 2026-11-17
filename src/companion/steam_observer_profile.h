@@ -27,6 +27,11 @@ struct Profile {
 inline constexpr char kInterfaceVersion[] = "SteamGameServer013";
 static_assert(sizeof(kInterfaceVersion) == 19);
 const Profile& ProductionObserverProfile() noexcept;
+// Used only by the exact-hash selector of the new reporting companion. The
+// separate observer artifact still selects ProductionObserverProfile directly.
+const Profile& StockReportingObserverProfile() noexcept;
+const Profile& DepotReportingObserverProfile() noexcept;
+const Profile& StockDepotReportingObserverProfile() noexcept;
 
 // No mutation or SDK call. Re-read the cold object caches after all fallible
 // preparation and immediately before the atomic installation commit.

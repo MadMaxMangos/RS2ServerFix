@@ -1,5 +1,7 @@
 #include "companion/steam_reporting_profile.h"
 #include "companion/steam_reporting_native_profile.h"
+#include "companion/build_identity.h"
+#include "shared/steam_sdk_cohort.h"
 
 #include <algorithm>
 #include <cstring>
@@ -15,6 +17,25 @@ constexpr ReportingIdentities kIdentities{
     {0x81,0x65,0xd2,0xa8,0xe8,0x27,0x53,0xe5,0xcd,0x5a,0xd9,0x85,0xd6,0xd0,0x8c,0x23,0x79,0xe0,0xaa,0x8d,0x03,0x40,0x66,0x9b,0xcf,0x05,0x89,0x05,0x84,0xf5,0x1a,0xce},
     0x1766000,0x685F401F,0x17153E7
 };
+constexpr ReportingIdentities kStockIdentities=[]() constexpr {
+    auto identities=kIdentities;
+    identities.hostDigest=kCurrentStockDigest;
+    return identities;
+}();
+constexpr ReportingIdentities kDepotIdentities=[]() constexpr {
+    auto identities=kIdentities;
+    identities.steamApiDigest=kDepotSteam20260827.apiDigest;
+    identities.steamClientDigest=kDepotSteam20260827.clientDigest;
+    identities.steamClientImageSize=kDepotSteam20260827.clientImageSize;
+    identities.steamClientTimestamp=kDepotSteam20260827.clientTimestamp;
+    identities.steamClientChecksum=kDepotSteam20260827.clientChecksum;
+    return identities;
+}();
+constexpr ReportingIdentities kStockDepotIdentities=[]() constexpr {
+    auto identities=kDepotIdentities;
+    identities.hostDigest=kCurrentStockDigest;
+    return identities;
+}();
 
 struct ImageContext {
     std::uintptr_t base;
@@ -275,6 +296,9 @@ ProfileResult ValidateProfile(std::uintptr_t base, const StartupProfile& host,
 
 const ReportingProfile& ProductionReportingProfile() noexcept { return kReportingProduction; }
 const ReportingIdentities& ProductionReportingIdentities() noexcept { return kIdentities; }
+const ReportingIdentities& StockReportingIdentities() noexcept { return kStockIdentities; }
+const ReportingIdentities& DepotReportingIdentities() noexcept { return kDepotIdentities; }
+const ReportingIdentities& StockDepotReportingIdentities() noexcept { return kStockDepotIdentities; }
 const char* ReportingProfileInventorySha256() noexcept { return kInventorySha256; }
 
 ProfileResult ValidateReportingProfile(std::uintptr_t base, const StartupProfile& host,

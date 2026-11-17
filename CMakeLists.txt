@@ -22,6 +22,8 @@ set(RS2_CURRENT_STOCK_PATH "" CACHE FILEPATH "Preserved PR3 stock input; never e
 set(RS2_CURRENT_FULLDUMP_PATH "" CACHE FILEPATH "Preserved approved PR3 full-dump input; never executed")
 set(RS2_DOCUMENTATION_ROOT "" CACHE PATH "Optional external archive root containing docs/evidence for qualification audits")
 set(RS2_OBSERVER_SDK_BASELINE_PATH "" CACHE FILEPATH "Operator-matched SDK 1.57 input; read as data, never executed")
+set(RS2_DEPOT_STEAM_API_PATH "" CACHE FILEPATH "Preserved qualified depot Steam API; read as data, never executed")
+set(RS2_DEPOT_STEAM_CLIENT_PATH "" CACHE FILEPATH "Preserved qualified depot Steam client; read as data, never executed")
 
 function(rs2_configure_target target)
   target_compile_definitions(${target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -198,7 +200,7 @@ add_executable(rs2_runtime_inventory tools/runtime_inventory_main.cpp tools/runt
   tools/deployment_preflight.cpp src/shared/path_identity.cpp src/companion/build_identity.cpp)
 rs2_configure_target(rs2_runtime_inventory)
 rs2_resource(rs2_runtime_inventory "RS2ServerFix Runtime Inventory Tool"
-  "rs2_runtime_inventory.exe" VFT_APP "0.7.1.0" "0,7,1,0")
+  "rs2_runtime_inventory.exe" VFT_APP "0.7.4.0" "0,7,4,0")
 target_compile_definitions(rs2_runtime_inventory PRIVATE RS2_PREFLIGHT_NO_MAIN)
 target_link_libraries(rs2_runtime_inventory PRIVATE rs2_evidence advapi32)
 
@@ -207,11 +209,13 @@ add_executable(rs2_preflight_fixture_test tests/preflight_fixture_test.cpp
 rs2_configure_target(rs2_preflight_fixture_test)
 target_compile_definitions(rs2_preflight_fixture_test PRIVATE RS2_PREFLIGHT_NO_MAIN)
 target_link_libraries(rs2_preflight_fixture_test PRIVATE rs2_evidence advapi32)
-add_dependencies(rs2_preflight_fixture_test rs2_deployment_preflight rs2_x3daudio_bootstrap rs2_server_fix_companion)
+add_dependencies(rs2_preflight_fixture_test rs2_deployment_preflight rs2_x3daudio_bootstrap rs2_server_fix_companion
+  rs2_server_fix_companion_reporting)
 add_test(NAME preflight_fixture COMMAND rs2_preflight_fixture_test
   $<TARGET_FILE:rs2_deployment_preflight> "${RS2_CURRENT_STOCK_PATH}"
   $<TARGET_FILE:rs2_x3daudio_bootstrap> $<TARGET_FILE:rs2_server_fix_companion>
-  "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest")
+  "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest"
+  $<TARGET_FILE:rs2_server_fix_companion_reporting>)
 
 add_executable(rs2_core_tests tests/core_tests.cpp tests/resolver_tests.cpp tests/loader_tests.cpp
   tests/path_tests.cpp tests/companion_tests.cpp tests/host_hash_tests.cpp
@@ -279,6 +283,8 @@ target_compile_definitions(rs2_profile_evidence_tests PRIVATE
   RS2_OBSERVER_FILES_ONLY
   RS2_OBSERVER_HOST_PATH=L"${RS2_CURRENT_FULLDUMP_PATH}"
   RS2_OBSERVER_SDK_PATH=L"${RS2_OBSERVER_SDK_BASELINE_PATH}"
+  RS2_DEPOT_STEAM_API_PATH=L"${RS2_DEPOT_STEAM_API_PATH}"
+  RS2_DEPOT_STEAM_CLIENT_PATH=L"${RS2_DEPOT_STEAM_CLIENT_PATH}"
   RS2_CURRENT_FULLDUMP_PATH=L"${RS2_CURRENT_FULLDUMP_PATH}"
   RS2_CURRENT_STOCK_PATH=L"${RS2_CURRENT_STOCK_PATH}"
   RS2_SOURCE_DIR=L"${CMAKE_CURRENT_SOURCE_DIR}")
@@ -426,7 +432,8 @@ add_executable(rs2_reporting_tests tests/steam_reporting_test_main.cpp
 rs2_configure_target(rs2_reporting_tests)
 target_compile_definitions(rs2_reporting_tests PRIVATE
   RS2_REPORTING_TESTING RS2_REPORTING_LEGACY_WRITER RS2_STEAM_REPORTING RS2_OBSERVER_TESTING
-  RS2_CURRENT_FULLDUMP_PATH=L\"${RS2_CURRENT_FULLDUMP_PATH}\")
+  RS2_CURRENT_FULLDUMP_PATH=L\"${RS2_CURRENT_FULLDUMP_PATH}\"
+  RS2_CURRENT_STOCK_PATH=L\"${RS2_CURRENT_STOCK_PATH}\")
 if(RS2_RECOVERY_GUARD_PROBE)
   target_compile_definitions(rs2_reporting_tests PRIVATE RS2_RECOVERY_GUARD_PROBE)
 endif()
@@ -465,7 +472,7 @@ if(RS2_RECOVERY_GUARD_PROBE)
   set(RS2_REPORTING_VARIANT_DIR diagnostic/guard-probe)
 endif()
 rs2_companion(rs2_server_fix_companion_reporting ${RS2_REPORTING_VARIANT_DIR}
-  "RS2ServerFix Active Recon Steam Reporting Companion" "0.7.1.0" "0,7,1,0"
+  "RS2ServerFix Active Recon Steam Reporting Companion" "0.7.4.0" "0,7,4,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_server_fix_companion_reporting PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
 target_compile_definitions(rs2_server_fix_companion_reporting PRIVATE
@@ -531,7 +538,7 @@ add_custom_command(OUTPUT "${RS2_REPORTING_FIXTURE_PROFILE}"
 add_custom_target(rs2_reporting_fixture_profiles DEPENDS "${RS2_REPORTING_FIXTURE_PROFILE}")
 rs2_bootstrap(rs2_reporting_fixture_bootstrap test-reporting/bootstrap "RS2ServerFix Test Fixture Bootstrap")
 rs2_companion(rs2_reporting_fixture_companion test-reporting/companion
-  "RS2ServerFix Test Fixture Steam Reporting Companion" "0.7.1.0" "0,7,1,0"
+  "RS2ServerFix Test Fixture Steam Reporting Companion" "0.7.4.0" "0,7,4,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_reporting_fixture_companion PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
 target_compile_definitions(rs2_reporting_fixture_companion PRIVATE RS2_RECON_ACTIVE RS2_STEAM_OBSERVER RS2_STEAM_REPORTING)
@@ -554,14 +561,14 @@ add_test(NAME reporting_startup_cases COMMAND rs2_reporting_startup_runner
   --bootstrap $<TARGET_FILE:rs2_reporting_fixture_bootstrap>
   --companion $<TARGET_FILE:rs2_reporting_fixture_companion>
   --sdk $<TARGET_FILE:rs2_reporting_test_api> --client $<TARGET_FILE:rs2_reporting_test_client>
-  --expected-companion-version 0.7.1.0
+  --expected-companion-version 0.7.4.0
   --genuine-manifest "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest")
 add_test(NAME reporting_timing_calibration COMMAND rs2_reporting_startup_runner
   --host $<TARGET_FILE:rs2_reporting_startup_fixture>
   --bootstrap $<TARGET_FILE:rs2_reporting_fixture_bootstrap>
   --companion $<TARGET_FILE:rs2_reporting_fixture_companion>
   --sdk $<TARGET_FILE:rs2_reporting_test_api> --client $<TARGET_FILE:rs2_reporting_test_client>
-  --expected-companion-version 0.7.1.0
+  --expected-companion-version 0.7.4.0
   --genuine-manifest "${CMAKE_CURRENT_SOURCE_DIR}/config/qualified_x3audio_genuine.manifest"
   --calibration-only)
 # The runner's 900-second owned-child timeout must precede the enclosing test.

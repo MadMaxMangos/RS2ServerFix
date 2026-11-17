@@ -4,6 +4,7 @@
 #include "companion/build_identity.h"
 #include "companion/sha256.h"
 #include "companion/steam_reporting_types.h"
+#include "shared/steam_sdk_cohort.h"
 #include <TlHelp32.h>
 #include <algorithm>
 #include <array>
@@ -596,7 +597,9 @@ bool ValidateRuntimeInventoryWithOps(const RuntimeInventory& inventory, const Ru
         else result->moduleDigests.emplace_back(host->base, result->hostSha256);
         const auto build = ClassifyBuild(result->hostSha256, true);
         if (build != BuildIdentity::CurrentStock && build != BuildIdentity::CurrentFullDump) finding("unapproved-host-hash");
-        if (inputs.mode == DeploymentMode::Active && build != BuildIdentity::CurrentFullDump) finding("active-requires-current-full-dump");
+        if (inputs.mode == DeploymentMode::Active && build != BuildIdentity::CurrentFullDump &&
+            !(inputs.reportingCompanion && build == BuildIdentity::CurrentStock))
+            finding("active-requires-current-full-dump");
         if (host->image.tlsDirectoryRva || host->image.tlsDirectorySize || !HasRequiredHostImports(host->image)) finding("host-startup-contract-mismatch");
     }
     auto artifact = [&](const RuntimeModule* module, const Sha256Digest& wanted, ArtifactKind kind, Sha256Digest* actual) {
@@ -616,14 +619,16 @@ bool ValidateRuntimeInventoryWithOps(const RuntimeInventory& inventory, const Ru
     artifact(bootstrap, inputs.bootstrapSha256, ArtifactKind::Bootstrap, &result->bootstrapSha256);
     artifact(companion, inputs.companionSha256, inputs.reportingCompanion ? ArtifactKind::CompanionReporting :
         inputs.observerCompanion ? ArtifactKind::CompanionObserver : inputs.mode == DeploymentMode::Passive ? ArtifactKind::CompanionPassive : ArtifactKind::CompanionActive, &result->companionSha256);
+    const SteamSdkCohort* reportingSdk=nullptr;
     if (inputs.observerCompanion || inputs.reportingCompanion) {
         const RuntimeModule* sdk = nullptr;
         std::size_t sdkCount = 0;
         for (const auto& module : inventory.modules) if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"steam_api64.dll")) { sdk = &module; ++sdkCount; }
-        Sha256Digest expectedSdk{};
-        ParseSha256Upper("A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9", &expectedSdk);
-        if (sdkCount != 1 || !sdk || !EqualEvidencePath(sdk->fullPath, directory + L"\\steam_api64.dll") ||
-            !ops.hashModule(ops.context, *sdk, &result->sdkSha256) || result->sdkSha256 != expectedSdk)
+        const bool sdkHashed=sdkCount==1 && sdk &&
+            EqualEvidencePath(sdk->fullPath,directory+L"\\steam_api64.dll") &&
+            ops.hashModule(ops.context,*sdk,&result->sdkSha256);
+        if (sdkHashed && inputs.reportingCompanion) reportingSdk=ReportingSdkCohort(result->sdkSha256);
+        if (!sdkHashed || (inputs.reportingCompanion ? reportingSdk==nullptr : result->sdkSha256!=kQualifiedSteam157.apiDigest))
             finding(inputs.reportingCompanion ? "reporting-sdk-disk-identity-mismatch" : "observer-sdk-disk-identity-mismatch");
         else result->moduleDigests.emplace_back(sdk->base, result->sdkSha256);
     }
@@ -632,12 +637,11 @@ bool ValidateRuntimeInventoryWithOps(const RuntimeInventory& inventory, const Ru
         for (const auto& module:inventory.modules) if (EqualEvidencePath(EvidenceLeaf(module.fullPath),L"steamclient64.dll")) {
             client=&module; ++clients;
         }
-        Sha256Digest expectedClient{};
-        ParseSha256Upper("8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE",&expectedClient);
-        if (clients!=1 || !client || client->imageSize!=0x1766000 ||
-            client->image.coffTimestamp!=0x685F401F || client->image.checksum!=0x17153E7 ||
+        if (clients!=1 || !client || !reportingSdk || client->imageSize!=reportingSdk->clientImageSize ||
+            client->image.sizeOfImage!=reportingSdk->clientImageSize ||
+            client->image.coffTimestamp!=reportingSdk->clientTimestamp || client->image.checksum!=reportingSdk->clientChecksum ||
             !ops.hashModule(ops.context,*client,&result->steamClientSha256) ||
-            result->steamClientSha256!=expectedClient) finding("reporting-loaded-steamclient-identity-mismatch");
+            !ReportingSdkPair(result->sdkSha256,result->steamClientSha256)) finding("reporting-loaded-steamclient-identity-mismatch");
         else result->moduleDigests.emplace_back(client->base,result->steamClientSha256);
         // DATA capture is a separate result: an absent/uninitialized/rejected
         // reporting surface must not falsely label an intact recon patch failed.

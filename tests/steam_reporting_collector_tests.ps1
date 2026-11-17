@@ -138,9 +138,9 @@ $runId='0123456789abcdef0123456789abcdef'
 $created=[uint64]134000000000000000
 $run=Join-Path $caseRoot ('20260917T000000Z-PID123-'+$runId)
 $identity=@{pid='123';process_creation_filetime=[string]$created;'reporting.run_id'=$runId;'reporting.ownerThreadId'='4';
-    'reporting.mode'='3';'reporting.qpc_frequency'='1000000'}
+    'reporting.mode'='3';'reporting.qpc_frequency'='1000000';host_sha256=$script:ReportHostHash}
 $startup=[ordered]@{schema=3;type='startup';run_id=$runId;pid=123;sequence=0;qpc=1;
-    artifact='RS2ServerFix-steam-reporting';version='0.7.1.0';artifact_version=459008;
+    artifact='RS2ServerFix-steam-reporting';version='0.7.4.0';artifact_version=459776;
     process_start_filetime=$created;qpc_frequency=1000000;mode='repair';configured_mode=3;header_validity=31;
     diagnostics='normal';anchor_interval_seconds=10;host_sha256=$script:ReportHostHash;
     qualified_steam_api_sha256=$script:ReportSdkHash;qualified_steamclient_sha256=$script:ReportClientHash;
@@ -150,7 +150,7 @@ $startup=[ordered]@{schema=3;type='startup';run_id=$runId;pid=123;sequence=0;qpc
     ledger_capacity=256;ready_capacity=8;message_limit=8192;native_service_hz=4;native_frames_per_opportunity=2;
     native_frames_per_second=8;request_floor_seconds=20;authentication_changed=$false;native_counting_preserved=$true;
     termination_may_lose_tail=$true;log_path=$run;
-    startup=[ordered]@{build_identity=1;recon_mode=1;recon_outcome=1;recon_reason=0;recon_qualified=1;
+    startup=[ordered]@{build_identity=3;recon_mode=1;recon_outcome=1;recon_reason=0;recon_qualified=1;
         initialize_result=0;marker_complete=1;marker_error=0;startup_accepted=1}}
 foreach($pair in @(@('volumeSerial','volume_serial'),@('file_id','file_id'),@('initialEOF','initial_eof'),
     @('initialAtLineBoundary','initial_at_line_boundary'),@('prefixMode','prefix_mode'),@('utcFiletime','utc_calibration_filetime'),
@@ -158,6 +158,48 @@ foreach($pair in @(@('volumeSerial','volume_serial'),@('file_id','file_id'),@('i
     $identity['reporting.log.'+$pair[0]]=[string]$startup[$pair[1]]
 }
 $identity['reporting.log.path']=$run
+
+$fullDumpHost=$script:ReportHostHash
+$stockHost='F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3'
+$qualifiedSdk=$script:ReportSdkHash;$qualifiedClient=$script:ReportClientHash
+$depotSdk='473F5A312B56519F347741B63F3DEA590946B96EA40EF3803D5F452C39AF2F1E'
+$depotClient='0F2B9F92F8FF709C328F4FF8D12E4C36459597D2A65791CBDAA9D45E793221E5'
+Check ((Get-ReportHostIdentity $fullDumpHost).name -ceq 'current-full-dump') 'Full-dump label changed.'
+Set-ReportRunIdentity @{host_sha256=$stockHost;sdk_sha256=$qualifiedSdk;steamclient_sha256=$qualifiedClient}
+Check ((Get-ReportHostIdentity $script:ReportHostHash).name -ceq 'current-stock') 'Stock label was replaced with full-dump.'
+$fullStartup=Read-ReportJson (FixtureJson $startup);$fullStartup['utc_derived_filetime']=[uint64]$created
+$stockStartup=Read-ReportJson (FixtureJson $startup);$stockStartup['utc_derived_filetime']=[uint64]$created
+$stockStartup['host_sha256']=$stockHost
+$stockStartup['startup']['build_identity']=[uint64]2
+$stockIdentity=@{};foreach($key in $identity.Keys){$stockIdentity[$key]=$identity[$key]};$stockIdentity['host_sha256']=$stockHost
+Assert-NativeReportStartup $stockStartup $stockIdentity;++$script:Checks
+Reject {Assert-NativeReportStartup $fullStartup $stockIdentity} 'Mixed full-dump bootstrap entered stock run.' 'Native bootstrap identity/semantics mismatch.'
+$stockStartup['startup']['build_identity']=[uint64]3
+Reject {Assert-NativeReportStartup $stockStartup $stockIdentity} 'Stock digest accepted full-dump build label.'
+Reject {Set-ReportRunIdentity @{host_sha256=($stockHost.Substring(0,63)+'2');sdk_sha256=$qualifiedSdk;steamclient_sha256=$qualifiedClient}} 'Unknown near-stock hash accepted.'
+Check ($script:ReportHostHash -ceq $stockHost) 'Rejected host changed selected identity.'
+Set-ReportRunIdentity @{host_sha256=$fullDumpHost;sdk_sha256=$depotSdk;steamclient_sha256=$depotClient}
+$depotStartup=Read-ReportJson (FixtureJson $startup);$depotStartup['utc_derived_filetime']=[uint64]$created
+$depotStartup['qualified_steam_api_sha256']=$depotSdk;$depotStartup['qualified_steamclient_sha256']=$depotClient
+Assert-NativeReportStartup $depotStartup $identity;++$script:Checks
+Reject {Assert-NativeReportStartup $fullStartup $identity} 'Old pair bootstrap entered depot run.' 'Native bootstrap identity/semantics mismatch.'
+foreach($pair in @(@($qualifiedSdk,$depotClient),@($depotSdk,$qualifiedClient),
+    @(($depotSdk.Substring(0,63)+'F'),$depotClient),@($depotSdk,($depotClient.Substring(0,63)+'F')))) {
+    Reject {Set-ReportRunIdentity @{host_sha256=$stockHost;sdk_sha256=$pair[0];steamclient_sha256=$pair[1]}} 'Mixed or unknown SDK pair accepted.' 'Unsupported exact reporting Steam API/client pair.'
+    Check ($script:ReportHostHash -ceq $fullDumpHost -and $script:ReportSdkHash -ceq $depotSdk -and
+        $script:ReportClientHash -ceq $depotClient) 'Rejected pair partially changed selected run identity.'
+}
+foreach($field in @('qualified_steam_api_sha256','qualified_steamclient_sha256')) {
+    $old=$depotStartup[$field]
+    $depotStartup[$field]=if($field -ceq 'qualified_steam_api_sha256'){$qualifiedSdk}else{$qualifiedClient}
+    Reject {Assert-NativeReportStartup $depotStartup $identity} 'Cross-pair bootstrap accepted.' 'Native bootstrap identity/semantics mismatch.'
+    $depotStartup[$field]=$old
+}
+Set-ReportRunIdentity @{host_sha256=$stockHost;sdk_sha256=$depotSdk;steamclient_sha256=$depotClient}
+$depotStartup['host_sha256']=$stockHost;$depotStartup['startup']['build_identity']=[uint64]2
+Assert-NativeReportStartup $depotStartup $stockIdentity;++$script:Checks
+Set-ReportRunIdentity @{host_sha256=$fullDumpHost;sdk_sha256=$qualifiedSdk;steamclient_sha256=$qualifiedClient}
+Reject {Assert-NativeReportStartup $depotStartup $identity} 'Depot pair bootstrap entered old pair run.' 'Native bootstrap identity/semantics mismatch.'
 
 $operationalStartup=@{}
 foreach($key in $startup.Keys){$operationalStartup[$key]=$startup[$key]}
@@ -392,9 +434,9 @@ foreach($badCase in @('phase','event','restart','reason')) {
     Reject {Read-ReportLog $badPath $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Nonreserved recovery pause event accepted.'
 }
 $inventoryRecovery=@{pid='123';'reporting.pid'='123';'reporting.run_id'=$runId;'reporting.schema'='3';'reporting.bytes'='3896';
-    'reporting.artifact_version'='459008';'reporting.header_valid'='true';'reporting.identity_complete'='true';
+    'reporting.artifact_version'='459776';'reporting.header_valid'='true';'reporting.identity_complete'='true';
     'reporting.header_validity'='31';'reporting.qpc_frequency'='1000000';'recovery.snapshot_result'='Coherent';
-    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459008';'recovery.pid'='123';
+    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459776';'recovery.pid'='123';
     'recovery.run_id'=$runId;'recovery.header_ready'='1';'recovery.owner_sequence'='2'}
 foreach($name in $script:RecoveryPayloadNames){$inventoryRecovery['recovery.'+$name]=[string]$recoveryRecord['recovery_'+$name]}
 $null=Assert-ReportRecoveryFields $inventoryRecovery
@@ -997,7 +1039,7 @@ foreach($point in @(@($fixtureStart,0,1),@($fixtureEnd,3,9),@($fixtureFinal,4,13
         host_sha256=$script:ReportHostHash;sdk_sha256=$script:ReportSdkHash;steamclient_sha256=$script:ReportClientHash;
         observed_bootstrap_sha256=('B'*64);bootstrap_sha256=('B'*64);observed_companion_sha256=$artifact;companion_sha256=$artifact;
         'reporting.mode'='2';'reporting.qpc_frequency'=[string]$fixtureFrequency;'reporting.ownerThreadId'='4';
-        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';'reporting.header_validity'='31';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';'reporting.header_validity'='31';
         'reporting.pid'='123';'reporting.process_creation'=[string]$created;
         'reporting.lastOwnerQpc'=[string]$point[0];'reporting.observed_qpc'=[string]$point[0];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -1023,6 +1065,11 @@ $expectedBrackets=@($script:FinalizeInputs|ForEach-Object{
     @{start=$_.command_start_qpc;end=$_.command_end_qpc;lower=$_.coverage_range.lower;upper=$_.coverage_range.upper}
 })
 $boundProbe=$script:FinalizeInputs[1]
+foreach($pair in @(@('sdk_sha256',$depotSdk),@('steamclient_sha256',$depotClient))) {
+    $old=$boundProbe.fields[$pair[0]];$boundProbe.fields[$pair[0]]=$pair[1]
+    Reject {Assert-ReportSnapshot $boundProbe $script:FinalizeInputs[0]} 'Changed SDK identity accepted after initial selection.' 'Current process/run identity changed:'
+    $boundProbe.fields[$pair[0]]=$old
+}
 $oldWatermark=$boundProbe.fields['reporting.timingAccountedThroughQpc']
 $boundProbe.fields['reporting.timingAccountedThroughQpc']='0'
 $bounds=Assert-ReportSnapshot $boundProbe $script:FinalizeInputs[0]

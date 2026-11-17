@@ -186,7 +186,11 @@ void ScanFile(const std::wstring& path, const std::wstring& relative, Scan& scan
         if (identity == BuildIdentity::CurrentStock || identity == BuildIdentity::CurrentFullDump) {
             ++scan.selected; scan.target = relative; scan.identity = identity;
             if (image.machine != IMAGE_FILE_MACHINE_AMD64 || image.optionalMagic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || image.tlsDirectoryRva != 0 || image.tlsDirectorySize != 0 || !HasRequiredHostImports(image)) scan.Event("UNSAFE", relative, image.machine, "target-startup-contract-failed", true);
-            if (scan.inputs.mode == DeploymentMode::Active && identity != BuildIdentity::CurrentFullDump) scan.Event("UNSAFE", relative, image.machine, "active-requires-current-full-dump", true);
+            // Stock support belongs to the matched reporting cohort only. Its
+            // artifact contract is checked independently before scanning hosts.
+            if (scan.inputs.mode == DeploymentMode::Active && identity != BuildIdentity::CurrentFullDump &&
+                !(scan.inputs.reportingCompanion && identity == BuildIdentity::CurrentStock))
+                scan.Event("UNSAFE", relative, image.machine, "active-requires-current-full-dump", true);
         }
     }
     if (!guard.Unchanged() || !scan.ops.queryFileIdentity(scan.ops.context, path.c_str(), &after, &code) || !SameFileIdentity(before, after)) scan.Event("UNSAFE", relative, image.machine, "file-identity-changed", true);

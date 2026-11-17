@@ -116,7 +116,7 @@ bool FormatNativeBootstrap(const NativeFormatContext& c,char* output,
     Hex(c.identities.steamApiDigest.data(),32,sdk);
     Hex(c.identities.steamClientDigest.data(),32,client);
     Hex(c.log.fileId,16,fileId);
-    json.Append(",\"artifact\":\"RS2ServerFix-steam-reporting\",\"version\":\"0.7.1.0\","
+    json.Append(",\"artifact\":\"RS2ServerFix-steam-reporting\",\"version\":\"0.7.4.0\","
         "\"artifact_version\":%u,\"process_start_filetime\":%llu,\"qpc_frequency\":%llu,"
         "\"mode\":\"%s\",\"configured_mode\":%u,\"header_validity\":%u,"
         "\"diagnostics\":\"%s\",\"anchor_interval_seconds\":%u,"

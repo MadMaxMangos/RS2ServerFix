@@ -53,6 +53,9 @@ enum class ProfileResult : std::uint32_t {
 
 const ReportingProfile& ProductionReportingProfile() noexcept;
 const ReportingIdentities& ProductionReportingIdentities() noexcept;
+const ReportingIdentities& StockReportingIdentities() noexcept;
+const ReportingIdentities& DepotReportingIdentities() noexcept;
+const ReportingIdentities& StockDepotReportingIdentities() noexcept;
 const char* ReportingProfileInventorySha256() noexcept;
 
 // Startup-only and read-only. Caller owns the already-qualified host hash/lease

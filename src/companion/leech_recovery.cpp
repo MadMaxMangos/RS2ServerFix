@@ -143,7 +143,7 @@ RecoveryReason PopulationReason(const Runtime& state,const LeechRecovery& r) noe
         r.source.humans==2 ? RecoveryReason::None : RecoveryReason::PopulationUnsupported;
     // H is not the advertised native PI. Preserve the source reader's accounting
     // rules: in particular do not clamp PI (or H) to the human slot capacity.
-    return r.control.scope.schema==2 && state.config.mode==Mode::Observe &&
+    return recovery::ManualPilotScope(r.control.scope) && state.config.mode==Mode::Observe &&
         r.source.maximum && r.source.maximum<=64 ? RecoveryReason::None : RecoveryReason::PopulationUnsupported;
 }
 RecoveryReason Preflight(Runtime& state,LeechRecovery& r,CallerClass classification,std::size_t count,bool truncated) noexcept {
@@ -178,7 +178,7 @@ bool Lease(Runtime& state,LeechRecovery& r,std::uint32_t standalone,bool oldSess
         !EqualSourceIdentity(r.scratchSource.identity,r.source.identity) ||
         r.scratchSource.maximum!=r.source.maximum || r.scratchSource.realTimeSeconds<r.source.realTimeSeconds ||
         (r.control.scope.schema==1 && r.scratchSource.bots) ||
-        (r.control.scope.schema==2 && state.config.mode!=Mode::Observe) ||
+        (recovery::ManualPilotScope(r.control.scope) && state.config.mode!=Mode::Observe) ||
         ReadNativeRecoverySnapshot(r.native,&r.current,&error)!=RecoveryNativeResult::Ready ||
         RequireNativeRecoveryReady(r.current)!=RecoveryNativeResult::Ready ||
         r.current.standalone!=standalone || !Lifetime(r,r.current)) return false;
@@ -590,7 +590,7 @@ void RestoreMetadata(Runtime& state,LeechRecovery& r,const NativeCounts& expecte
             r.metadataCalls.fill(properties);
             NativeCounts current{};PreparedDiagnostic prepared{};RecoveryMetadataCache cached{};
             if(!MetadataInputs(state,r,&current,&prepared,&cached) || !EqualCounts(current,expected) ||
-                !StableMetadataGate(current,prepared,cached,r.control.scope.schema==2) || r.value.qpc>=r.metadataDeadlineQpc) return;
+                !StableMetadataGate(current,prepared,cached,recovery::ManualPilotScope(r.control.scope)) || r.value.qpc>=r.metadataDeadlineQpc) return;
             r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::MetadataUpdate);
             r.value.flags|=RecoveryMetadataAttempted;
             r.metadataCalls.update(properties,&r.metadataMembers.vector);
@@ -623,7 +623,7 @@ bool ServiceMetadata(Runtime& state,LeechRecovery& r,CallerClass classification,
     }
     if(!prepared.mismatchMask) {CompleteMetadata(r,now,RecoveryReason::None,true);return true;}
     if(source.pi>kRecoveryMetadataMemberLimit) {CompleteMetadata(r,now,RecoveryReason::MetadataCountLimit,false);return true;}
-    if(!StableMetadataGate(source,prepared,cached,r.control.scope.schema==2) || !RecoveryPumpHeadroomAvailable(classification,frameCount,false)) {
+    if(!StableMetadataGate(source,prepared,cached,recovery::ManualPilotScope(r.control.scope)) || !RecoveryPumpHeadroomAvailable(classification,frameCount,false)) {
         r.value.reason=static_cast<std::uint64_t>(RecoveryReason::MetadataCountsNotReady);Publish(r);return false;
     }
     if(r.value.qpc>=r.metadataDeadlineQpc) {CompleteMetadata(r,r.value.qpc,RecoveryReason::MetadataTimeout,false);return true;}
@@ -652,7 +652,7 @@ bool ServiceMetadata(Runtime& state,LeechRecovery& r,CallerClass classification,
 bool RetryablePreflight(const LeechRecovery& r) noexcept {
     // No reset based merely on Cancel not having run: descriptor/allocator and
     // holder operations precede it. ANY native recipe entry is non-retryable.
-    if(r.control.scope.schema!=2 || r.recipeEntered || r.cancelEntered || r.bindEntered || r.bindCompleted ||
+    if(!recovery::ManualPilotScope(r.control.scope) || r.recipeEntered || r.cancelEntered || r.bindEntered || r.bindCompleted ||
         r.createInstalled || r.callbackDepth || r.metadataHeadOwned || r.holder ||
         r.value.nativeStage || r.value.resourcePhase || r.value.exceptionCode ||
         InterlockedCompareExchange(const_cast<volatile LONG*>(&r.foreignFault),0,0) ||
@@ -707,8 +707,13 @@ bool PrepareLeechRecovery(LeechRecovery& r,Runtime& state,const StartupProfile& 
     r.value.ownerThreadId=state.config.ownerThreadId;r.value.reason=static_cast<std::uint64_t>(RecoveryReason::PermissionDisabled);
     if(ReadStatusWord(r.status->headerReady)!=1) InitializeRecoveryStatus(*r.status,state.config.status->header);
     DWORD error{};
+#if defined(RS2_RECOVERY_GUARD_PROBE)
+    constexpr bool allowWebAdminOnly=false;
+#else
+    constexpr bool allowWebAdminOnly=true;
+#endif
     const auto control=recovery::InitializeControl(r.control,directory,state.config.status->header.pid,state.config.status->header.runId,&error,
-        state.config.mode==Mode::Observe);
+        state.config.mode==Mode::Observe,allowWebAdminOnly);
     if(control!=recovery::ControlResult::Ready) {
         using C=recovery::ControlResult;
         const auto reason=control==C::Disabled ? RecoveryReason::PermissionDisabled :
@@ -754,7 +759,9 @@ bool RecoveryServiceDue(const Runtime& state) noexcept {
     const auto* r=state.config.recovery;
     if(!r || !r->prepared || !r->controlStarted) return false;
     if((r->value.flags&RecoveryPreflightRetryable) &&
-        InterlockedCompareExchange(const_cast<volatile LONG*>(&r->foreignFault),0,0)) return true;
+        (InterlockedCompareExchange(const_cast<volatile LONG*>(&r->foreignFault),0,0) ||
+            (recovery::WebAdminOnlyScope(r->control.scope,r->control.transport) &&
+                recovery::ReadConsoleRegistration(r->control)!=recovery::ConsoleRegistration::Available))) return true;
     if(r->requested && !(r->value.flags&RecoveryPreflightRetryable)) return !r->terminal || r->finalPending || r->pendingCount!=0;
     const auto result=static_cast<recovery::ControlResult>(InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.result),0,0));
     const auto latch=InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.latched),0,0);
@@ -824,10 +831,12 @@ bool ServiceLeechRecovery(Runtime& state,CallerClass classification,std::size_t 
             Fault(r,RecoveryReason::CallbackInvalid,RecoveryOutcome::MechanicsFailed,true);
             FinishTerminal(state,r,now);SetLastError(incoming);return true;
         }
-        if(InterlockedCompareExchange(&r.control.stop,0,0) ||
+        const bool soleRouteLost=recovery::WebAdminOnlyScope(r.control.scope,r.control.transport) &&
+            recovery::ReadConsoleRegistration(r.control)!=recovery::ConsoleRegistration::Available;
+        if(soleRouteLost || InterlockedCompareExchange(&r.control.stop,0,0) ||
             InterlockedCompareExchange(&r.control.result,0,0)!=static_cast<LONG>(recovery::ControlResult::Ready)) {
             r.value.flags&=~RecoveryPreflightRetryable;
-            r.value.reason=static_cast<std::uint64_t>(RecoveryReason::ControlWorkerUnavailable);
+            r.value.reason=static_cast<std::uint64_t>(soleRouteLost ? RecoveryReason::ControlEndpointUnavailable : RecoveryReason::ControlWorkerUnavailable);
             r.finalPending=true;FinishTerminal(state,r,now);SetLastError(incoming);return true;
         }
         // Only the owner starts a NEW request. Keep process-resident native,
@@ -845,7 +854,13 @@ bool ServiceLeechRecovery(Runtime& state,CallerClass classification,std::size_t 
     if(InterlockedCompareExchange(&r.foreignFault,0,0)) Fault(r,RecoveryReason::CallbackInvalid,RecoveryOutcome::MechanicsFailed,true);
     if(!r.requested) {
         recovery::ControlRequest request{};recovery::RequestOrigin origin{};
-        if(!recovery::ReadLatchedControl(r.control,&request,&origin)) {
+        if(recovery::WebAdminOnlyScope(r.control.scope,r.control.transport) &&
+            !InterlockedCompareExchange(&r.control.latched,0,0) &&
+            recovery::ReadConsoleRegistration(r.control)==recovery::ConsoleRegistration::Unavailable &&
+            InterlockedCompareExchange(&r.control.result,0,0)==static_cast<LONG>(recovery::ControlResult::EndpointUnavailable)) {
+            r.requested=true;r.value.qpc=now;
+            Fault(r,RecoveryReason::ControlEndpointUnavailable,RecoveryOutcome::MechanicsFailed,false);
+        } else if(!recovery::ReadLatchedControl(r.control,&request,&origin)) {
             r.requested=true;Fault(r,RecoveryReason::InvalidRequest,RecoveryOutcome::MechanicsFailed,false);
         } else {
             r.requested=true;

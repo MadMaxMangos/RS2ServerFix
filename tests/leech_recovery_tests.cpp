@@ -66,6 +66,7 @@ struct Fixture {
         r.control.result=static_cast<LONG>(rs2fix::recovery::ControlResult::Ready);
         r.control.identity.pid=header.pid;r.control.identity.runId[0]=1;
         r.control.scope=rs2fix::recovery::kTrainingControlScope;
+        r.control.transport=rs2fix::recovery::ControlTransport::AuthenticatedPipe;
         RS2_CHECK(PublishRecoveryStatus(recoveryStatus,r.value));
     }
     ~Fixture() { SetLeechRecoveryCurrentForTest(nullptr); }
@@ -173,8 +174,9 @@ void ConsoleRegistrationAndCommands() {
     RS2_CHECK(!f.constructors && !f.replies && !f.pins &&
         recovery::ReadConsoleRegistration(f.recovery->control)==Registration::NotRegistered);
 #else
-    for(unsigned scenario=0;scenario<8;++scenario) {
+    for(bool webAdmin:{false,true}) for(unsigned scenario=0;scenario<8;++scenario) {
         auto owner=std::make_unique<ConsoleFixture>();auto& f=*owner;auto& a=f.recovery->console;
+        if(webAdmin) {f.recovery->control.scope.schema=3;f.recovery->control.transport=recovery::ControlTransport::WebAdminOnly;}
         if(scenario==1) f.failPin=true;
         if(scenario==2) f.badPost=true;
         if(scenario==3) f.native.Put<std::int32_t>(kLeechConsoleRegistryRva+12,2); // No growth branch.
@@ -188,7 +190,16 @@ void ConsoleRegistrationAndCommands() {
         const auto state=recovery::ReadConsoleRegistration(f.recovery->control);
         RS2_CHECK(state==(scenario==0 ? Registration::Available : scenario==7 ? Registration::NotRegistered : Registration::Unavailable));
         const auto calls=f.constructors;f.Register();RS2_CHECK(f.constructors==calls);
-        RS2_CHECK(f.recovery->control.latched==0 && f.recovery->control.result==static_cast<LONG>(recovery::ControlResult::Ready));
+        RS2_CHECK(f.recovery->control.latched==0 && f.recovery->control.result==static_cast<LONG>(
+            webAdmin && scenario!=0 && scenario!=7 ? recovery::ControlResult::EndpointUnavailable : recovery::ControlResult::Ready));
+        if(webAdmin && scenario!=0 && scenario!=7) {
+            RS2_CHECK(RecoveryServiceDue(f.runtime) && f.Service(Now()));
+            const auto& r=*f.recovery;
+            RS2_CHECK(r.terminal && r.value.reason==static_cast<std::uint64_t>(RecoveryReason::ControlEndpointUnavailable) &&
+                !r.value.operationSequence && !r.control.latched && !r.recipeEntered && !nativeCalls &&
+                !(r.value.flags&(RecoveryConsoleRequested|RecoveryPreflightRetryable|RecoveryRecipeEntered)));
+            RS2_CHECK(!RecoveryServiceDue(f.runtime));f.Scalar();
+        }
         if(scenario!=0) continue;
         f.runtime.pumpDepth=0;f.runtime.timingDepth=0;
         RS2_CHECK(f.Command(L"unrelated command")==0 && f.replies==0);
@@ -204,6 +215,9 @@ void ConsoleRegistrationAndCommands() {
         f.Output();f.runtime.pumpDepth=1;
         RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && !f.recovery->control.latched);
         f.runtime.pumpDepth=0;
+        StoreStatusWord(f.status.stopping,1);
+        RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && !f.recovery->control.latched);
+        StoreStatusWord(f.status.stopping,0);
         RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && f.recovery->control.latched==2);
     RS2_CHECK(!f.recovery->requested && !f.recovery->cancelEntered && f.lastReply.find(L"request queued")!=std::wstring::npos);
         RS2_CHECK(f.Command(L"rs2leech recover 0100000000000000")==1 && f.lastReply.find(L"not queued")!=std::wstring::npos);
@@ -213,6 +227,10 @@ void ConsoleRegistrationAndCommands() {
         f.throwReply=true;caught=false;
         try{f.Command(L"rs2leech status");}catch(const ConsoleFixture::Exception&){caught=true;}
         RS2_CHECK(caught && recovery::ReadConsoleRegistration(f.recovery->control)==Registration::Unavailable && !a.replying);
+        RS2_CHECK(f.recovery->control.result==static_cast<LONG>(recovery::ControlResult::Ready));
+        f.runtime.pumpDepth=1;f.runtime.timingDepth=1;
+        RS2_CHECK(f.Service(Now()) && f.recovery->terminal && !f.recovery->recipeEntered &&
+            f.recovery->value.reason==static_cast<std::uint64_t>(RecoveryReason::InvalidRequest));
     }
 #endif
 }
@@ -220,6 +238,9 @@ void ConsoleReadSelectors() {
     auto fixture=std::make_unique<ConsoleFixture>();auto& f=*fixture;DWORD error{};
 #if !defined(RS2_RECOVERY_GUARD_PROBE)
     RS2_CHECK(LeechConsoleRegistrationDue(f.runtime));
+    f.recovery->control.transport=recovery::ControlTransport::None;
+    RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));
+    f.recovery->control.transport=recovery::ControlTransport::AuthenticatedPipe;
     f.runtime.sourceReady=false;RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.runtime.sourceReady=true;
     f.runtime.sdkReady=false;RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.runtime.sdkReady=true;
     f.recovery->requested=true;RS2_CHECK(!LeechConsoleRegistrationDue(f.runtime));f.recovery->requested=false;
@@ -379,8 +400,10 @@ struct SequenceFixture : Fixture {
             "\"},{\"k\":\"BotPlayerCount\",\"v\":\""+std::to_string(Get<std::uint32_t>(0x17989F8))+"\"},{\"k\":\"MaxPlayerCount\",\"v\":\"64\"}]}";
         native.HeapString(0x14AAD48,0x1C0000,json.c_str(),4096);
     }
-    void PilotScope() {
-        recovery->control.scope={2,L"E:\\servertwo"};
+    void PilotScope(bool webAdmin=false) {
+        recovery->control.scope={webAdmin ? 3u : 2u,L"E:\\servertwo"};
+        recovery->control.transport=webAdmin ? recovery::ControlTransport::WebAdminOnly : recovery::ControlTransport::AuthenticatedPipe;
+        if(webAdmin) {recovery->control.consoleRequested=true;recovery->control.consoleRegistration=static_cast<LONG>(recovery::ConsoleRegistration::Available);}
         runtime.config.mode=Mode::Observe;status.header.configuredMode=static_cast<std::uint32_t>(Mode::Observe);
     }
     void Population(unsigned pi,unsigned humans=64) {
@@ -869,6 +892,64 @@ void PreflightRetryAndNativeBoundary() {
     r.terminal=true;r.finalPending=true;r.value.reason=static_cast<std::uint64_t>(RecoveryReason::HeartbeatUnavailable);
     FinishLeechTerminalForTest(f->runtime,r,Now());
     RS2_CHECK(!(r.value.flags&RecoveryPreflightRetryable) && r.control.latched==2 && !r.cancelEntered);
+}
+void WebAdminLifecycle() {
+    // A released preflight is explicit-request-only. Loss of the sole route
+    // must revoke retry without inventing a new operation, even after relatch.
+    for(unsigned scenario=0;scenario<3;++scenario) {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope(true);auto& r=*f->recovery;
+        r.control.enabled=true;r.control.started=1;r.control.latched=2;
+        r.qualifyingRecordSequence=1;StoreStatusWord(f->status.worker.observedSequence,1);
+        f->native.HeapPut<std::int32_t>(0x1042E0,1);
+        RS2_CHECK(f->Service(Now()) && r.terminal && (r.value.flags&RecoveryPreflightRetryable) &&
+            !r.control.latched && !r.recipeEntered && f->order.empty());
+        const auto op=r.value.operationSequence;
+        f->native.HeapPut<std::int32_t>(0x1042E0,0);
+        RS2_CHECK(!recovery::ClaimControlForTesting(r.control,recovery::RequestOrigin::Pipe) && !r.control.latched);
+        if(scenario!=1) RS2_CHECK(recovery::ClaimConsoleControlRequest(r.control));
+        if(scenario) r.control.consoleRegistration=static_cast<LONG>(recovery::ConsoleRegistration::Unavailable);
+        RS2_CHECK(RecoveryServiceDue(f->runtime) && f->Service(Now()));
+        if(scenario) {
+            RS2_CHECK(r.terminal && !(r.value.flags&RecoveryPreflightRetryable) && r.value.operationSequence==op &&
+                r.value.reason==static_cast<std::uint64_t>(RecoveryReason::ControlEndpointUnavailable) &&
+                r.control.latched==(scenario==2 ? 2 : 0) && !r.recipeEntered && f->order.empty() &&
+                !RecoveryServiceDue(f->runtime));
+        } else {
+            RS2_CHECK(!r.terminal && r.value.operationSequence==op+1 && (r.value.flags&RecoveryConsoleRequested));
+            r.recipeEntered=true;r.value.nativeStage=static_cast<std::uint64_t>(NativeStage::Descriptor);
+            r.terminal=true;r.finalPending=true;r.value.reason=static_cast<std::uint64_t>(RecoveryReason::HeartbeatUnavailable);
+            r.value.outcome=static_cast<std::uint64_t>(RecoveryOutcome::MechanicsFailed);
+            FinishLeechTerminalForTest(f->runtime,r,Now());
+            RS2_CHECK(!(r.value.flags&RecoveryPreflightRetryable) && r.control.latched==2);
+        }
+        f->Scalar();
+    }
+    {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope(true);f->Population(32,2);
+        f->native.HeapPut<std::int32_t>(0x1042F0,30);f->native.HeapPut<std::int32_t>(0x106094,30);
+        auto& r=*f->recovery;r.qualifyingRecordSequence=1;StoreStatusWord(f->status.worker.observedSequence,1);
+        RS2_CHECK(f->Service(Now()) && !r.terminal && r.source.outer.pi==32 && r.source.outer.bots==30 &&
+            !r.recipeEntered && f->order.empty());
+    }
+    for(bool wrongMode:{false,true}) {
+        auto f=std::make_unique<SequenceFixture>();f->PilotScope(true);PreparePublished(*f);auto& r=*f->recovery;
+        // Already requested native work completes/cleans up despite route loss.
+        r.control.consoleRegistration=static_cast<LONG>(recovery::ConsoleRegistration::Unavailable);
+        if(wrongMode) f->runtime.config.mode=Mode::Repair;
+        else {
+            f->Population(32,2);f->native.HeapPut<std::int32_t>(0x1042F0,30);f->native.HeapPut<std::int32_t>(0x106094,30);
+            f->native.Put<std::uint32_t>(0x17989F8,30);f->MetadataJson(32);
+        }
+        if(wrongMode) {
+            RS2_CHECK(!f->Service(Now()) && !r.terminal && !f->metadataUpdates &&
+                r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataUnavailable));
+            RS2_CHECK(f->Service(r.metadataDeadlineQpc) && r.terminal &&
+                r.value.reason==static_cast<std::uint64_t>(RecoveryReason::MetadataTimeout));
+        } else RS2_CHECK(f->Service(Now()) && r.terminal && f->metadataUpdates==1 && f->metadataDestroys==1 &&
+            r.metadataMembers.count==32 && (r.value.flags&RecoveryMetadataCoherent));
+        RS2_CHECK(r.value.phase==static_cast<std::uint64_t>(RecoveryPhase::Observed));
+        RS2_CHECK(!(r.value.flags&RecoveryPreflightRetryable));
+    }
 }
 void RevokedPreflightDoesNotStarveCleanup() {
     for(const auto phase:{RecoveryPhase::Requested,RecoveryPhase::Qualifying}) {
@@ -1414,7 +1495,7 @@ void LeechRecoveryTests() {
 #else
     NativeGuardReasons();ActiveGuardReasonCompatibility();
     RequestAdmission();FinishCallbacks();DeadlinesAndUnknownInverse();UnsupportedServicePreservesManagement();UnsupportedTerminalKeepsSuspension();TerminalQuotaAndEvidence();
-    IrreversibleSequenceSuccess();MetadataObservationWindow();MetadataRefusalsAndCleanup();PilotPopulationBounds();PreflightRetryAndNativeBoundary();RevokedPreflightDoesNotStarveCleanup();PublishedObservationFaults();SynchronousFinishError();ActualLifetimeChangesRefuse();
+    IrreversibleSequenceSuccess();MetadataObservationWindow();MetadataRefusalsAndCleanup();PilotPopulationBounds();PreflightRetryAndNativeBoundary();WebAdminLifecycle();RevokedPreflightDoesNotStarveCleanup();PublishedObservationFaults();SynchronousFinishError();ActualLifetimeChangesRefuse();
     IrreversibleOwnershipUnwind();InstanceGuardRefusals();GuardedCallbackRefusalAndUnwind();
 #endif
 }

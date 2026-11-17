@@ -29,9 +29,9 @@ $fields=[ordered]@{
     'observed_companion_sha256'=$hash;'companion_kind'='companion-reporting';
     'process_image_path'='E%3A/rs2v_trainingsrv/Binaries/Win64/VNGame.exe';
     'host_sha256'='0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393';
-    'reporting.header_valid'='true';'reporting.artifact_version'='459008';'reporting.pid'='73';
+    'reporting.header_valid'='true';'reporting.artifact_version'='459776';'reporting.pid'='73';
     'reporting.run_id'=$run;'reporting.current_ready'='true';'recovery.snapshot_result'='Coherent';
-    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459008';
+    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459776';
     'recovery.pid'='73';'recovery.run_id'=$run;'recovery.header_ready'='1';'recovery.owner_sequence'='2'
 }
 foreach ($key in $script:LeechPayloadNames) { $fields['recovery.'+$key]='0' }
@@ -51,6 +51,13 @@ try {
     Write-LeechFixtureReport
     $identity=Read-LeechInventoryIdentity $report 73 $hash $hash $hash
     Check-Leech ($identity.Pid -eq 73 -and $identity.RunId -ceq $run) 'matching current-run inventory'
+    $fullDumpHost=$fields['host_sha256']
+    $fields['host_sha256']='F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3';Write-LeechFixtureReport
+    $stockIdentity=Read-LeechInventoryIdentity $report 73 $hash $hash $hash
+    Check-Leech ($stockIdentity.Pid -eq 73 -and $stockIdentity.RunId -ceq $run) 'matching exact stock current-run inventory'
+    $fields['host_sha256']='F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC2';Write-LeechFixtureReport
+    Reject-Leech {Read-LeechInventoryIdentity $report 73 $hash $hash $hash} 'unknown near-stock hash rejected'
+    $fields['host_sha256']=$fullDumpHost;Write-LeechFixtureReport
     $initialFields=@{};foreach($key in $fields.Keys){$initialFields[$key]=$fields[$key]}
     $fields['recovery.phase']='10';$fields['recovery.flags']='2097665';$fields['recovery.reason']='40';$fields['recovery.outcome']='1'
     $fields['recovery.operation_sequence']='1';$fields['recovery.transition_sequence']='4'
@@ -116,6 +123,16 @@ try {
     }
     Reject-Leech {Assert-LeechRoot "E:\servertwo`n"} 'trailing newline is not a root terminator'
     $permissionPath=Join-Path $fixtureRoot 'RS2LeechRecovery.ini'
+    foreach ($choice in @(@('disabled','disabled'),@('manual-pilot-finish-recreate','server-admin'))) {
+      foreach ($webAdminRoot in @('E:\servertwo','auto')) {
+        $webAdminPermission="schema=3`npermission=$($choice[0])`nserver_root=$webAdminRoot`ncontrol_mode=webadmin-only`nconsole_trigger=$($choice[1])`n"
+        [IO.File]::WriteAllText($permissionPath,$webAdminPermission,[Text.Encoding]::ASCII)
+        $refusal=''
+        try { Read-LeechPermission $permissionPath 'E:\servertwo' | Out-Null } catch { $refusal=$_.Exception.Message }
+        Check-Leech ($refusal -clike '*schema 3 is WebAdmin-only*' -and $refusal.Contains('rs2leech status') -and
+            $refusal.Contains('rs2leech recover <current-run-token>')) ('SID-less permission refuses pipe with actionable WebAdmin route: '+$webAdminRoot)
+      }
+    }
     $pilotPermission="schema=2`npermission=manual-pilot-finish-recreate`nserver_root=E:\servertwo`noperator_sid=$operatorSid`n"
     [IO.File]::WriteAllText($permissionPath,$pilotPermission,[Text.Encoding]::ASCII)
     $permission=Read-LeechPermission $permissionPath 'E:\servertwo'

@@ -28,6 +28,7 @@ static_assert(std::is_trivial_v<ClientQualification> && std::is_standard_layout_
 // No SDK/game call, load, permanent pin, or hot-path rehash occurs here. The
 // separate C++ resource-owning frame must not be placed inside a SEH __try frame.
 ClientQualification QualifyLoadedSteamClient() noexcept;
+ClientQualification QualifyLoadedDepotSteamClient() noexcept;
 
 #if defined(RS2_REPORTING_TESTING)
 // Inert adapters compile only in the local test target. Production callers

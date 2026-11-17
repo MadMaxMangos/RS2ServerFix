@@ -97,7 +97,7 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     HostHashLease& hostLease, const wchar_t* directory, bool reconEligible,const NativeStartupSummary& startupSummary) noexcept {
     ConfigV3 config{}; DWORD error{};
     const auto configured=ReadConfigV3(directory,&config,&error);
-    const auto& identities=SelectedReportingIdentities();
+    auto identities=SelectedReportingIdentities(hostDigest);
     const bool hostValid=hostLease.valid() && hostDigest==identities.hostDigest &&
         hostDigest==observerProfile.hostDigest;
     if (!Header(config,configured==Reason::None || configured==Reason::ConfigDisabled,hostDigest,hostValid)) return;
@@ -123,11 +123,29 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     }
     HostHashLease sdkLease;
     observer::DispatchConfig dispatch{};
-    if (observer::QualifySdk(context,startup,observerProfile,&sdkLease,&dispatch,&error)!=observer::Reason::None) {
-        Reject(Reason::SdkMismatch); return;
+    const auto* sdkProfile=&observerProfile;
+    bool depotSdk=false;
+    auto sdkResult=observer::QualifySdk(context,startup,*sdkProfile,&sdkLease,&dispatch,&error);
+    if(sdkResult==observer::Reason::SdkIdentityMismatch) {
+        // Only the identity-mismatch result can try the second exact cohort;
+        // binding failures do not fall through. The second candidate repeats
+        // every module/header/hash/export check, not a relaxed first check.
+        // Release the rejected file lease before acquiring a fresh checked one.
+        sdkLease=HostHashLease{};
+        const auto* depotProfile=SelectedDepotReportingObserverProfile(hostDigest);
+        const auto* depotIdentities=SelectedDepotReportingIdentities(hostDigest);
+        if(depotProfile && depotIdentities && depotProfile->hostDigest==hostDigest &&
+            depotIdentities->hostDigest==hostDigest && depotProfile->sdkDigest==depotIdentities->steamApiDigest &&
+            observer::CheckColdProfile(context,startup,*depotProfile,ProductionMemoryOps(),&error)==observer::Reason::None) {
+            sdkResult=observer::QualifySdk(context,startup,*depotProfile,&sdkLease,&dispatch,&error);
+            if(sdkResult==observer::Reason::None) {
+                sdkProfile=depotProfile;identities=*depotIdentities;depotSdk=true;
+            }
+        }
     }
+    if(sdkResult!=observer::Reason::None) { Reject(Reason::SdkMismatch);return; }
     observer::ShutdownFn originalPump{};
-    if (observer::QualifyServerPump(context,startup,observerProfile,dispatch,profile.pump.slotRva,
+    if (observer::QualifyServerPump(context,startup,*sdkProfile,dispatch,profile.pump.slotRva,
         &originalPump,&error)!=observer::Reason::None ||
         reinterpret_cast<std::uintptr_t>(originalPump)!=nativePump) { Reject(Reason::SdkMismatch); return; }
 
@@ -157,7 +175,7 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     runtime.builderWrapper=reinterpret_cast<std::uintptr_t>(&BuilderEntry);
     runtime.source=SelectedSourceLayout(); runtime.prepared=SelectedPreparedLayout();
     runtime.ancestry=SelectedAncestryProfile();
-    runtime.qualifyClient=QualifyLoadedSteamClient;
+    runtime.qualifyClient=depotSdk ? QualifyLoadedDepotSteamClient : QualifyLoadedSteamClient;
     runtime.recovery=&resident->recovery;
     // P4 consumes coherent owner/worker DATA; no hook-side console formatting.
     const auto initialized=InitializeRuntime(resident->runtime,runtime,RS2SteamReport_StatusV3.header.qpcFrequency);
@@ -184,7 +202,7 @@ void StartReporting(const BootstrapContextV3& context, const StartupProfile& sta
     }
     ProfileCheck check{base,&startup,&profile}; // Synchronous transaction only.
     const observer::ServerPumpCell pump{profile.pump.slotRva,originalPump,PumpEntry,&check,Recheck};
-    const auto installed=observer::InstallObserverWithLeases(context,startup,observerProfile,
+    const auto installed=observer::InstallObserverWithLeases(context,startup,*sdkProfile,
         resident->dispatch,hostLease,sdkLease,&pump);
     if (!installed.armed) {
         Reject(Reason::InstallFailed,resident,writer);

@@ -125,7 +125,7 @@ bool CreateOwnReparse(const std::wstring& path, bool directory) {
 }
 }
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 6) { std::cerr << "usage: preflight-fixture <scanner> <stock-exe> <bootstrap> <companion> <manifest>\n"; return 2; }
+    if (argc != 6 && argc != 7) { std::cerr << "usage: preflight-fixture <scanner> <stock-exe> <bootstrap> <companion> <manifest> [reporting-companion]\n"; return 2; }
     wchar_t temp[kPathCapacity]{}; const DWORD n = GetTempPathW(static_cast<DWORD>(std::size(temp)), temp);
     RS2_CHECK(n != 0 && n < std::size(temp)); if (!n || n >= std::size(temp)) return 1;
     g_workspace = std::wstring(temp) + L"RS2ServerFix.preflight." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(GetTickCount64());
@@ -160,6 +160,21 @@ int wmain(int argc, wchar_t** argv) {
     auto none = [](PreflightInputs&, Inject&, const std::wstring&) {};
     run("positive", 0, "result=pass", none);
     run("active-stock", 1, "active-requires-current-full-dump", [](auto& in, auto&, const auto&) { in.mode = DeploymentMode::Active; });
+    run("reporting-rejects-ordinary-companion", 1, "artifact-contract-hash", [](auto& in,auto&,const auto&) {
+        in.mode=DeploymentMode::Active; in.reportingCompanion=true;
+    });
+    if (argc==7) {
+        const auto reporting=HashFileSha256(argv[6],GetTickCount64()+10000);
+        RS2_CHECK(reporting.digestValid);
+        auto reportingScope=[&](auto& in,auto&,const auto&) {
+            in.mode=DeploymentMode::Active; in.reportingCompanion=true;
+            in.companionPath=argv[6]; in.companionSha256=reporting.digest;
+        };
+        run("reporting-stock",0,"target_build_identity=current-stock",reportingScope);
+        run("reporting-unknown-host",1,"expected-one-current-target",[&](auto& in,auto& injected,const auto& host) {
+            reportingScope(in,injected,host); RS2_CHECK(MutateMachine(host));
+        });
+    }
     run("observer-passive", 2, nullptr, [](auto& in, auto&, const auto&) { in.observerCompanion = true; });
     run("observer-rejects-ordinary-companion", 1, "artifact-contract-hash", [](auto& in, auto&, const auto&) { in.observerCompanion = true; in.mode = DeploymentMode::Active; });
     run("bootstrap-hash", 1, "artifact-contract-hash", [](auto& in, auto&, const auto&) { ++in.bootstrapSha256[0]; });

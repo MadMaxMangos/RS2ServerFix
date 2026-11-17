@@ -3,7 +3,7 @@
 
 namespace rs2fix::reporting {
 inline constexpr std::uint32_t kRecoveryStatusSchemaV1 = 1;
-inline constexpr std::uint32_t kRecoveryArtifactVersion = 0x00070100U;
+inline constexpr std::uint32_t kRecoveryArtifactVersion = 0x00070400U;
 enum class RecoveryPhase : std::uint64_t {
     Disabled = 0, Armed = 1, Requested = 2, Qualifying = 3, FinishSubmitted = 4,
     FinishAccepted = 5, Recreating = 6, Published = 7, Observed = 8, Failed = 9,

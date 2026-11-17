@@ -258,6 +258,9 @@ function Read-LeechPermission([string]$Path,[string]$ExpectedRoot=$script:LeechT
             if ($fields.ContainsKey($key)) { throw 'Duplicate permission field.' }
             $fields.Add($key,$value)
         }
+        if ($fields.ContainsKey('schema') -and $fields['schema'] -ceq '3') {
+            throw 'Recovery control schema 3 is WebAdmin-only: this authenticated pipe helper cannot send its requests. Use rs2leech status, then rs2leech recover <current-run-token> in WebAdmin after an explicit server-admin opt-in.'
+        }
         if(!$fields.ContainsKey('schema') -or $fields['schema'] -cnotin '1','2') { throw 'Unsupported permission schema.' }
         $rootKey=if($fields['schema'] -ceq '1'){'training_root'}else{'server_root'}
         $permissionName=if($fields['schema'] -ceq '1'){'training-finish-recreate'}else{'manual-pilot-finish-recreate'}
@@ -300,10 +303,9 @@ function Read-LeechInventoryIdentity([string]$Path, [uint32]$ExpectedPid,
         'companion_sha256'=$ExpectedCompanionHash; 'observed_bootstrap_sha256'=$ExpectedBootstrapHash;
         'observed_companion_sha256'=$ExpectedCompanionHash; 'companion_kind'='companion-reporting';
         'process_image_path'='E%3A/rs2v_trainingsrv/Binaries/Win64/VNGame.exe';
-        'host_sha256'='0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393';
         'recovery.snapshot_result'='Coherent'; 'recovery.schema'='1'; 'recovery.bytes'='256';
-        'recovery.artifact_version'='459008'; 'recovery.pid'=[string]$ExpectedPid; 'recovery.header_ready'='1';
-        'reporting.header_valid'='true'; 'reporting.artifact_version'='459008'; 'reporting.pid'=[string]$ExpectedPid;
+        'recovery.artifact_version'='459776'; 'recovery.pid'=[string]$ExpectedPid; 'recovery.header_ready'='1';
+        'reporting.header_valid'='true'; 'reporting.artifact_version'='459776'; 'reporting.pid'=[string]$ExpectedPid;
         'reporting.current_ready'='true'
     }
     if($ExpectedImagePath) {
@@ -316,6 +318,14 @@ function Read-LeechInventoryIdentity([string]$Path, [uint32]$ExpectedPid,
     }
     foreach ($pair in $expected.GetEnumerator()) {
         if (!$fields.ContainsKey($pair.Key) -or $fields[$pair.Key] -cne $pair.Value) { throw "Runtime inventory identity rejected: $($pair.Key)" }
+    }
+    # The matched inventory has independently hashed and retained the selected
+    # process image. Only these two exact qualified reporting hosts are allowed;
+    # the exact image path/creation identity above must still match its lease.
+    if (!$fields.ContainsKey('host_sha256') -or $fields['host_sha256'] -cnotin @(
+        '0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393',
+        'F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3')) {
+        throw 'Runtime inventory identity rejected: host_sha256'
     }
     $recoveryKeys = @('snapshot_result','schema','bytes','artifact_version','pid','run_id','header_ready','owner_sequence') + $script:LeechPayloadNames
     $actualRecovery = @($fields.Keys | Where-Object { $_.StartsWith('recovery.',[StringComparison]::Ordinal) })
@@ -375,7 +385,7 @@ function Invoke-LeechRecoveryRequest {
     $inventoryPath = [IO.Path]::GetFullPath($RuntimeInventory)
     if ($inventoryPath.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase) -or
         (Get-FileHash -LiteralPath $inventoryPath -Algorithm SHA256).Hash -cne $InventorySha256 -or
-        [Diagnostics.FileVersionInfo]::GetVersionInfo($inventoryPath).FileVersion -cne '0.7.1.0') { throw 'Inventory tool identity/version rejected.' }
+        [Diagnostics.FileVersionInfo]::GetVersionInfo($inventoryPath).FileVersion -cne '0.7.4.0') { throw 'Inventory tool identity/version rejected.' }
     $permission = Read-LeechPermission ([IO.Path]::Combine($bin,'RS2LeechRecovery.ini')) $root
     if($permission.Schema -eq 2 -and !$TargetRoot){throw 'Pilot requests require an explicit -TargetRoot.'}
     $operator = [Security.Principal.WindowsIdentity]::GetCurrent()

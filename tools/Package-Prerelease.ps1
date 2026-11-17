@@ -89,8 +89,13 @@ EXPERIMENTAL READ-ONLY GUARD PROBE. The recovery native calls are compiled out.
 Reporting is observe/normal; manual recovery is disabled. Do not enable recovery
 or deploy to production from this automated build. This does not establish Steam
 outage recovery, browser-count repair, performance or production qualification.
-The manual diagnostic remains restricted to E:\rs2v_trainingsrv and requires a
-separately authorized test with its configured elevated operator SID.
+The legacy manual diagnostic remains restricted to E:\rs2v_trainingsrv and
+requires a separately authorized test with its configured elevated operator SID.
+Enabled control schema 3 (WebAdmin-only) is unsupported in this read-only probe;
+it refuses before arming and does not register a recovery console route.
+The native operator package's schema-3 server_root=auto option does not enable
+this probe or remove its diagnostic restrictions. Its disabled defaults remain
+unchanged; do not substitute a native-enabled operator configuration here.
 Keep this extracted kit and its evidence reports outside the server tree.
 Run-SteamReport.cmd needs the unchanged complete kit and -AllowedLogRoot when
 Launch.log lives outside the server tree. No timing

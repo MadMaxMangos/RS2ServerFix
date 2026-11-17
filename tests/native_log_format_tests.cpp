@@ -1,6 +1,10 @@
 #include "companion/steam_reporting_format_v3.h"
 #include "companion/steam_reporting_json.h"
 #include "shared/native_log_framing.h"
+#include "shared/selected_reporting_profile.h"
+#include "shared/steam_sdk_cohort.h"
+#include "shared/selected_recon_profile.h"
+#include "companion/marker.h"
 #include "test_framework.h"
 #include <cstring>
 #include <string>
@@ -41,6 +45,70 @@ void CheckJson(const char* message,std::size_t bytes,const NativeFormatContext& 
     wchar_t wide[native_log::kMessageLimit+1]{};
     RS2_CHECK(native_log::PrepareMessage(message,bytes,wide,std::size(wide)));
     RS2_CHECK(native_log::ValidMessage(wide,bytes));
+}
+void ExactProductionHostSelection() {
+    // Same recipes, SDKs and wire identity, but never replace a stock hash with
+    // the patched hash in marker/header/log evidence. Unknown hashes must not
+    // produce a matching profile or an accepted marker.
+    for(const auto& digest:{kCurrentStockDigest,kCurrentFullDumpDigest}) {
+        const auto& recon=SelectedReconProfile(digest);
+        const auto& identities=SelectedReportingIdentities(digest);
+        const auto& observerProfile=SelectedReportingObserverProfile(digest);
+        RS2_CHECK(recon.hostDigest==digest && identities.hostDigest==digest && observerProfile.hostDigest==digest);
+        RS2_CHECK(recon.originalDigest==kProductionReconProfile.originalDigest &&
+            recon.correctedDigest==kProductionReconProfile.correctedDigest &&
+            recon.operandRva==kProductionReconProfile.operandRva &&
+            recon.originalWindow==kProductionReconProfile.originalWindow);
+        RS2_CHECK(identities.steamApiDigest==ProductionReportingIdentities().steamApiDigest &&
+            identities.steamClientDigest==ProductionReportingIdentities().steamClientDigest &&
+            observerProfile.sdkDigest==identities.steamApiDigest);
+        RS2_CHECK(observerProfile.spans==observer::ProductionObserverProfile().spans &&
+            observerProfile.spanCount==observer::ProductionObserverProfile().spanCount);
+        const auto* depot=SelectedDepotReportingIdentities(digest);
+        const auto* depotProfile=SelectedDepotReportingObserverProfile(digest);
+        RS2_CHECK(depot && depotProfile);
+        if(!depot || !depotProfile) continue;
+        RS2_CHECK(depot->hostDigest==digest && depotProfile->hostDigest==digest &&
+            depot->steamApiDigest==depotProfile->sdkDigest);
+        RS2_CHECK(ReportingSdkPair(depot->steamApiDigest,depot->steamClientDigest) &&
+            ReportingSdkPair(identities.steamApiDigest,identities.steamClientDigest));
+        RS2_CHECK(!ReportingSdkPair(depot->steamApiDigest,identities.steamClientDigest) &&
+            !ReportingSdkPair(identities.steamApiDigest,depot->steamClientDigest));
+        auto unknownApi=depot->steamApiDigest;unknownApi[0]^=1;
+        RS2_CHECK(!ReportingSdkCohort(unknownApi) &&
+            !ReportingSdkPair(unknownApi,depot->steamClientDigest));
+        auto c=Context(); c.identities=identities;
+        std::memcpy(c.header.hostDigest,digest.data(),digest.size());
+        char output[native_log::kMessageLimit+1]{};std::size_t bytes{};
+        RS2_CHECK(FormatNativeBootstrap(c,output,sizeof(output),&bytes));
+        std::string hex;constexpr char digits[]="0123456789abcdef";
+        for(const auto byte:digest) {hex+=digits[byte>>4];hex+=digits[byte&15];}
+        RS2_CHECK(std::strstr(output,hex.c_str())!=nullptr);
+        c.identities=*depot;
+        RS2_CHECK(FormatNativeBootstrap(c,output,sizeof(output),&bytes));
+        RS2_CHECK(std::strstr(output,"473f5a312b56519f347741b63f3dea590946b96ea40ef3803d5f452c39af2f1e") &&
+            std::strstr(output,"0f2b9f92f8ff709c328f4ff8d12e4c36459597d2a65791cbdaa9d45e793221e5"));
+        c.identities=SelectedReportingIdentities(digest==kCurrentStockDigest ? kCurrentFullDumpDigest : kCurrentStockDigest);
+        RS2_CHECK(!FormatNativeBootstrap(c,output,sizeof(output),&bytes));
+        MarkerData marker{};marker.digest=digest;marker.digestValid=true;
+        marker.buildIdentity=ClassifyBuild(digest,true);marker.complete=true;
+        marker.bootstrapBesideExecutable=marker.companionBesideExecutable=marker.genuineSystem32=true;
+        marker.genuineExportsMask=kRequiredGenuineExports;marker.triggerKind=kTriggerExeCrtInitialize;
+        marker.mode=ReconMode::Active;marker.recon={ReconOutcome::Active,FixReason::None,0,true};
+        marker.initializeResult=kInitOk;
+        RS2_CHECK(MarkerStateAccepted(marker));
+        marker.buildIdentity=digest==kCurrentStockDigest ? BuildIdentity::CurrentFullDump : BuildIdentity::CurrentStock;
+        RS2_CHECK(!MarkerStateAccepted(marker));
+        marker.buildIdentity=ClassifyBuild(digest,true);marker.digest[0]^=1;
+        RS2_CHECK(!MarkerStateAccepted(marker));
+    }
+    auto unknown=kCurrentStockDigest;unknown[31]^=1;
+    RS2_CHECK(ClassifyBuild(unknown,true)==BuildIdentity::Unknown);
+    RS2_CHECK(SelectedReconProfile(unknown).hostDigest!=unknown &&
+        SelectedReportingIdentities(unknown).hostDigest!=unknown &&
+        SelectedReportingObserverProfile(unknown).hostDigest!=unknown);
+    RS2_CHECK(!SelectedDepotReportingIdentities(unknown) &&
+        !SelectedDepotReportingObserverProfile(unknown));
 }
 void Formatting() {
     auto c=Context();
@@ -238,5 +306,5 @@ void ClockArithmetic() {
     RS2_CHECK(!DeriveUtcFiletime(c.log,1,2,&utc));
 }
 }
-void NativeLogFormatTests() { Formatting(); ClockArithmetic(); RecoveryFormatting(); PreparedFormatting(); OperationalFormatting(); }
+void NativeLogFormatTests() { ExactProductionHostSelection(); Formatting(); ClockArithmetic(); RecoveryFormatting(); PreparedFormatting(); OperationalFormatting(); }
 }

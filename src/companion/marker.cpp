@@ -294,6 +294,10 @@ bool MarkerStateAccepted(const MarkerData& data) noexcept {
     const bool supportedHost =
 #if defined(RS2_STARTUP_TEST_PROFILE)
         data.digest == kFixtureReconProfile.hostDigest;
+#elif defined(RS2_STEAM_REPORTING)
+        (data.buildIdentity == BuildIdentity::CurrentStock ||
+            data.buildIdentity == BuildIdentity::CurrentFullDump) &&
+        ClassifyBuild(data.digest, data.digestValid) == data.buildIdentity;
 #else
         data.buildIdentity == BuildIdentity::CurrentFullDump &&
         ClassifyBuild(data.digest, data.digestValid) == BuildIdentity::CurrentFullDump;

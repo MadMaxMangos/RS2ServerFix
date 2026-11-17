@@ -8,8 +8,8 @@
 #include <climits>
 #include <memory>
 
-#if !defined(RS2_CURRENT_FULLDUMP_PATH)
-#error Recovery name evidence requires the authenticated full-dump image path.
+#if !defined(RS2_CURRENT_FULLDUMP_PATH) || !defined(RS2_CURRENT_STOCK_PATH)
+#error Recovery profile/name evidence requires both authenticated current image paths.
 #endif
 
 namespace rs2fix::testcases {
@@ -107,24 +107,26 @@ void MetadataProfileAndCache() {
     f.Put<std::uint8_t>(0x14AAD88,2);
     RS2_CHECK(ReadRecoveryMetadataCache(f.Context(),&cache,&error)==RecoveryNativeResult::Shape && cache.counts.pi==0);
 }
-void ImageBackedComponentNames() {
+void QualifiedImageBackedComponents(const wchar_t* path, const char* expectedHash) {
     pe::Image image{};
     std::string error;
-    const bool parsed = pe::ReadPeImage(RS2_CURRENT_FULLDUMP_PATH, &image, &error);
+    const bool parsed = pe::ReadPeImage(path, &image, &error);
     RS2_CHECK(parsed);
     if (!parsed) return;
     Sha256Digest digest{};
     const bool hashed = HashBytesSha256(image.rawBytes.data(), image.rawBytes.size(), &digest);
     RS2_CHECK(hashed);
     if (!hashed) return;
-    const bool qualified = std::strcmp(FormatSha256Upper(digest).data(),
-        "0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393") == 0;
+    const bool qualified = std::strcmp(FormatSha256Upper(digest).data(),expectedHash) == 0;
     RS2_CHECK(qualified);
     if (!qualified) return;
 
     // Independent file-backed custody, not a fixture copied from its own
-    // constants: each new executable/exception input must match the pinned PE.
-    std::vector<NativeLoggingProfile> profiles(std::begin(leech_fixture::kMetadataPartitions),std::end(leech_fixture::kMetadataPartitions));
+    // constants: base recovery, metadata and console must all match each pinned
+    // PE before treating their bytes as evidence. This includes the original
+    // Finish/Create/Start partitions, not just the later supplemental overlays.
+    std::vector<NativeLoggingProfile> profiles(std::begin(leech_fixture::kRecoveryPartitions),std::end(leech_fixture::kRecoveryPartitions));
+    profiles.insert(profiles.end(),std::begin(leech_fixture::kMetadataPartitions),std::end(leech_fixture::kMetadataPartitions));
     profiles.push_back(leech_fixture::kConsoleProduction);
     for(const auto& profile:profiles) {
         for(std::size_t i=0;i<profile.body.spanCount;++i) {
@@ -140,9 +142,21 @@ void ImageBackedComponentNames() {
         }
         for(std::size_t i=0;i<profile.body.exceptionCount;++i) {
             const auto& entry=profile.body.exceptions[i];std::vector<std::uint8_t> bytes;
+            const auto& directory=image.dataDirectories[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            const bool member=directory.size>=12 && entry.entryRva>=directory.virtualAddress &&
+                entry.entryRva-directory.virtualAddress<=directory.size-12 &&
+                (entry.entryRva-directory.virtualAddress)%12==0;
+            RS2_CHECK(member);
             RS2_CHECK(pe::ReadImageRva(image,entry.entryRva,12,&bytes,&error));
             const std::uint32_t expected[]{entry.beginRva,entry.endRva,entry.unwindRva};
             RS2_CHECK(bytes.size()==sizeof(expected) && !std::memcmp(bytes.data(),expected,sizeof(expected)));
+        }
+        for(std::size_t i=0;i<profile.importCount;++i) {
+            const auto& recipe=profile.imports[i];unsigned found{};
+            for(const auto& module:image.normalImports) for(const auto& symbol:module.symbols)
+                if(symbol.iatRva==recipe.slotRva && !_stricmp(module.name.c_str(),recipe.module) &&
+                    !symbol.byOrdinal && symbol.name==recipe.name) ++found;
+            RS2_CHECK(found==1);
         }
     }
 
@@ -182,6 +196,12 @@ void ImageBackedComponentNames() {
     RS2_CHECK(fixture.Snapshot(snapshot) == RecoveryNativeResult::Ready);
     fixture.Text(0x1490400, "AsyncDeferOperations");
     RS2_CHECK(fixture.Snapshot(snapshot) == RecoveryNativeResult::Readiness);
+}
+void ImageBackedComponentNames() {
+    QualifiedImageBackedComponents(RS2_CURRENT_FULLDUMP_PATH,
+        "0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393");
+    QualifiedImageBackedComponents(RS2_CURRENT_STOCK_PATH,
+        "F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3");
 }
 void CacheReaderContracts() {
     using R=RecoveryNativeResult;

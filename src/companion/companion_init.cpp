@@ -11,6 +11,7 @@
 #endif
 #if defined(RS2_STEAM_REPORTING)
 #include "companion/steam_reporting.h"
+#include "shared/selected_reporting_profile.h"
 #endif
 
 #include <cwchar>
@@ -187,7 +188,7 @@ DWORD RunCompanionInitialization(const BootstrapContextV3& context,
         if (host.reason != FixReason::None || !host.hash.digestValid || !lease.valid()) {
             marker.recon = {ReconOutcome::Disabled, host.reason, host.hash.error, false};
         } else {
-            marker.recon = RunReconFix(context, kSelectedStartupProfile, kSelectedReconProfile,
+            marker.recon = RunReconFix(context, kSelectedStartupProfile, SelectedReconProfile(host.hash.digest),
                 kCompiledMode, host.hash.digest, ProductionReconOps(&lease));
         }
     }
@@ -221,11 +222,7 @@ DWORD RunCompanionInitialization(const BootstrapContextV3& context,
     // The core diagnostic is already attempted, and its acceptance/result is
     // frozen. Observer failures cannot rewrite recon's marker or return value.
 #if defined(RS2_STEAM_REPORTING)
-#if defined(RS2_STARTUP_TEST_PROFILE)
-    const auto& reportingObserverProfile=observer::kFixtureObserverProfile;
-#else
-    const auto& reportingObserverProfile=observer::ProductionObserverProfile();
-#endif
+    const auto& reportingObserverProfile=reporting::SelectedReportingObserverProfile(marker.digest);
     const reporting::NativeStartupSummary reportingStartup{
         static_cast<std::uint32_t>(marker.buildIdentity),static_cast<std::uint32_t>(marker.mode),
         static_cast<std::uint32_t>(marker.recon.outcome),static_cast<std::uint32_t>(marker.recon.reason),

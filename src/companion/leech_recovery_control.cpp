@@ -10,6 +10,13 @@
 
 namespace rs2fix::recovery {
 static_assert(std::is_trivial_v<ControlState> && std::is_standard_layout_v<ControlState>);
+#ifndef RS2_REPORTING_TESTING
+struct ControlPlatformCalls {
+    bool (*administratorIdentity)(ControlSecurity*, DWORD*) noexcept;
+    ControlResult (*preparePipe)(ControlState&, DWORD*) noexcept;
+    HANDLE (*startWorker)(ControlState&, DWORD*) noexcept;
+};
+#endif
 namespace {
 bool ClaimControl(ControlState&, RequestOrigin) noexcept;
 constexpr DWORD kMutation = DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_DATA |
@@ -22,12 +29,34 @@ bool Equal(const char* bytes, std::size_t count, const char* expected) noexcept 
 bool PilotRoot(const wchar_t* root) noexcept {
     if(!root) return false;
     std::size_t length{};
-    while(length<kControlRootCharacters && root[length]) ++length;
-    if(length<4 || length>=kControlRootCharacters || root[1]!=L':' || root[2]!=L'\\' ||
+    while(length<kLegacyControlRootCharacters && root[length]) ++length;
+    if(length<4 || length>=kLegacyControlRootCharacters || root[1]!=L':' || root[2]!=L'\\' ||
         !((root[0]>=L'A' && root[0]<=L'Z') || (root[0]>=L'a' && root[0]<=L'z'))) return false;
     for(std::size_t i=3;i<length;++i) {
         const auto c=root[i];
         if(!((c>=L'A' && c<=L'Z') || (c>=L'a' && c<=L'z') || (c>=L'0' && c<=L'9') || c==L'_' || c==L'-')) return false;
+    }
+    return true;
+}
+bool DirectoryLength(const wchar_t* path,std::size_t* length) noexcept {
+    if(!path || !length) return false;
+    for(std::size_t i=0;i<kControlPathBytes;++i) if(!path[i]) {*length=i;return i!=0;}
+    return false;
+}
+bool PortableDirectory(const wchar_t* path) noexcept {
+    std::size_t length{};
+    if(!DirectoryLength(path,&length) || length<3 || path[1]!=L':' || path[2]!=L'\\' ||
+        !((path[0]>=L'A' && path[0]<=L'Z') || (path[0]>=L'a' && path[0]<=L'z'))) return false;
+    if(length==3) return true;
+    std::size_t start=3;
+    for(std::size_t i=start;i<=length;++i) {
+        const auto c=path[i];
+        if(!c || c==L'\\') {
+            // No empty/dot/dotdot or Windows trailing-dot/space aliases.
+            if(i==start || path[i-1]==L'.' || path[i-1]==L' ') return false;
+            start=i+1;
+        } else if(c<L' ' || c==L'/' || c==L':' || c==L'"' || c==L'<' || c==L'>' ||
+            c==L'|' || c==L'?' || c==L'*') return false;
     }
     return true;
 }
@@ -37,6 +66,7 @@ bool AsciiRoot(const char* bytes,std::size_t count,wchar_t (&root)[kControlRootC
     root[count]=L'\0';return PilotRoot(root);
 }
 bool ValidScope(const ControlScope& scope) noexcept {
+    if(scope.schema==3) return PortableDirectory(scope.serverRoot);
     return PilotRoot(scope.serverRoot) && (scope.schema==2 ||
         (scope.schema==1 && std::wcscmp(scope.serverRoot,kTrainingRoot)==0));
 }
@@ -109,14 +139,21 @@ bool ObserveSecurity(HANDLE file, const ControlSecurity& policy, bool permission
     LocalFree(descriptor);
     return valid;
 }
-bool AdministratorIdentity(ControlSecurity* policy, DWORD* error) noexcept {
-    // Startup permission and the new worker must use the same process identity.
-    // An impersonated startup thread cannot approve its underlying account.
+DWORD ThreadTokenPresence() noexcept {
     HANDLE threadToken{};
     if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &threadToken)) {
-        CloseHandle(threadToken); *error = ERROR_BAD_IMPERSONATION_LEVEL; return false;
+        CloseHandle(threadToken); return ERROR_SUCCESS;
     }
-    if (GetLastError() != ERROR_NO_TOKEN) { *error = GetLastError(); return false; }
+    return GetLastError();
+}
+bool StartupThreadUnimpersonated(DWORD (*presence)() noexcept, DWORD* error) noexcept {
+    const auto code=presence();
+    if(code==ERROR_NO_TOKEN) return true;
+    *error=code==ERROR_SUCCESS ? ERROR_BAD_IMPERSONATION_LEVEL : code;return false;
+}
+bool AdministratorIdentity(ControlSecurity* policy, DWORD* error) noexcept {
+    // Retain this guard in the legacy authority path as well as cold common init.
+    if(!StartupThreadUnimpersonated(ThreadTokenPresence,error)) return false;
     HANDLE token{};
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &token)) { *error = GetLastError(); return false; }
     alignas(TOKEN_USER) BYTE buffer[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
@@ -422,10 +459,25 @@ DWORD WINAPI Worker(void* parameter) noexcept {
 }
 } // namespace
 
+bool ManualPilotScope(const ControlScope& scope) noexcept {
+    return scope.schema==2 || scope.schema==3;
+}
+bool LegacyPipeScope(const ControlScope& scope,ControlTransport transport) noexcept {
+    return transport==ControlTransport::AuthenticatedPipe &&
+        (scope.schema==1 || scope.schema==2) && ValidScope(scope);
+}
+bool WebAdminOnlyScope(const ControlScope& scope,ControlTransport transport) noexcept {
+    return scope.schema==3 && transport==ControlTransport::WebAdminOnly && ValidScope(scope);
+}
+bool ConsoleControlScope(const ControlState& state) noexcept {
+    return state.consoleRequested && ((state.scope.schema==2 && LegacyPipeScope(state.scope,state.transport)) ||
+        WebAdminOnlyScope(state.scope,state.transport));
+}
 ControlResult ParseControlConfig(const char* bytes, std::size_t size, ControlConfig* output) noexcept {
     if (output) *output = {};
     if (!bytes || !size || size > kControlFileBytes || !output) return ControlResult::InvalidConfig;
-    ControlConfig parsed{}; unsigned fields{},permission{}; bool none{};
+    ControlConfig parsed{}; unsigned fields{},permission{};
+    const char* sidText{}; std::size_t sidLength{};
     for (std::size_t cursor = 0; cursor < size;) {
         const auto start = cursor;
         while (cursor < size && bytes[cursor] != '\n') {
@@ -449,6 +501,7 @@ ControlResult ParseControlConfig(const char* bytes, std::size_t size, ControlCon
             field = 1;
             if(Equal(bytes+value,last-value,"1")) parsed.scope.schema=1;
             else if(Equal(bytes+value,last-value,"2")) parsed.scope.schema=2;
+            else if(Equal(bytes+value,last-value,"3")) parsed.scope.schema=3;
             valid=parsed.scope.schema!=0;
         } else if (Equal(bytes + first, keyEnd - first, "permission")) {
             field = 2;
@@ -460,21 +513,34 @@ ControlResult ParseControlConfig(const char* bytes, std::size_t size, ControlCon
             field = 4; valid = Equal(bytes + value, last - value, "E:\\rs2v_trainingsrv") &&
                 AsciiRoot(bytes+value,last-value,parsed.scope.serverRoot);
         } else if (Equal(bytes + first, keyEnd - first, "server_root")) {
-            field = 16; valid = AsciiRoot(bytes+value,last-value,parsed.scope.serverRoot);
+            field = 16;parsed.autoRoot=Equal(bytes+value,last-value,"auto");
+            valid=parsed.autoRoot || AsciiRoot(bytes+value,last-value,parsed.scope.serverRoot);
         } else if (Equal(bytes + first, keyEnd - first, "operator_sid")) {
-            field = 8; none = Equal(bytes + value, last - value, "none");
-            valid = none || ParseSid(bytes + value, last - value, &parsed);
+            // Lexical pass first. A schema-3 SID key never invokes SID APIs.
+            field = 8; sidText=bytes+value;sidLength=last-value;valid=sidLength!=0;
         } else if (Equal(bytes + first, keyEnd - first, "console_trigger")) {
             field = 32;
             parsed.consoleRequested = Equal(bytes + value, last - value, "server-admin");
             valid = parsed.consoleRequested || Equal(bytes + value, last - value, "disabled");
+        } else if (Equal(bytes + first, keyEnd - first, "control_mode")) {
+            field=64;valid=Equal(bytes+value,last-value,"webadmin-only");
         }
         if (!field || !valid || (fields & field)) return ControlResult::InvalidConfig;
         fields |= field;
     }
-    if(!ValidScope(parsed.scope) || (fields & ~32u)!=(parsed.scope.schema==1 ? 15u : 27u) ||
-        ((fields & 32u) && parsed.scope.schema!=2) ||
-        (parsed.enabled && (none || permission!=parsed.scope.schema))) return ControlResult::InvalidConfig;
+    if(parsed.autoRoot ? parsed.scope.schema!=3 : !ValidScope(parsed.scope)) return ControlResult::InvalidConfig;
+    if(parsed.scope.schema==3) {
+        if(fields!=115u || (parsed.enabled && permission!=2) ||
+            parsed.consoleRequested!=parsed.enabled) return ControlResult::InvalidConfig;
+        parsed.transport=ControlTransport::WebAdminOnly;
+    } else {
+        if((fields & ~32u)!=(parsed.scope.schema==1 ? 15u : 27u) ||
+            ((fields & 32u) && parsed.scope.schema!=2)) return ControlResult::InvalidConfig;
+        const bool none=Equal(sidText,sidLength,"none");
+        if((!none && !ParseSid(sidText,sidLength,&parsed)) ||
+            (parsed.enabled && (none || permission!=parsed.scope.schema))) return ControlResult::InvalidConfig;
+        parsed.transport=ControlTransport::AuthenticatedPipe;
+    }
     *output = parsed;
     return parsed.enabled ? ControlResult::Ready : ControlResult::Disabled;
 }
@@ -482,7 +548,8 @@ ControlResult ParseControlRequest(const char* bytes, std::size_t size,
     const ControlRequest& identity, ControlRequest* output, const ControlScope* scope) noexcept {
     if (output) *output = {};
     const auto& expected=scope?*scope:kTrainingControlScope;
-    if (!bytes || !size || size > kControlFileBytes || !output || !ValidIdentity(identity) || !ValidScope(expected))
+    if (!bytes || !size || size > kControlFileBytes || !output || !ValidIdentity(identity) ||
+        !LegacyPipeScope(expected,ControlTransport::AuthenticatedPipe))
         return ControlResult::InvalidRequest;
     Json json{bytes, size, 0}; unsigned fields{};
     if (!json.Take('{')) return ControlResult::InvalidRequest;
@@ -516,8 +583,118 @@ ControlResult ParseControlRequest(const char* bytes, std::size_t size,
     *output = identity;
     return ControlResult::Ready;
 }
+namespace {
+HANDLE StartWorker(ControlState& state,DWORD* error) noexcept {
+    const auto thread=CreateThread(nullptr,0,Worker,&state,0,nullptr);
+    if(!thread) *error=GetLastError();return thread;
+}
+const ControlPlatformCalls kPlatform{AdministratorIdentity,PreparePipe,StartWorker};
+bool ResolveControlScope(ControlConfig& config,const wchar_t* executableDirectory,DWORD* error) noexcept {
+    std::size_t length{};
+    constexpr wchar_t suffix[]=L"\\Binaries\\Win64";
+    constexpr auto suffixLength=std::size(suffix)-1;
+    if(!PortableDirectory(executableDirectory) || !DirectoryLength(executableDirectory,&length) ||
+        length<suffixLength+2 || CompareStringOrdinal(executableDirectory+length-suffixLength,-1,
+            suffix,-1,TRUE)!=CSTR_EQUAL) {*error=ERROR_INVALID_NAME;return false;}
+    if(config.autoRoot) {
+        if(config.scope.schema!=3 || config.transport!=ControlTransport::WebAdminOnly) {
+            *error=ERROR_INVALID_DATA;return false;
+        }
+        const auto rootLength=length-suffixLength;
+        // C:\Binaries\Win64 is also rooted on a real local drive, not C:relative.
+        const auto copyLength=rootLength==2 ? 3 : rootLength;
+        std::wmemcpy(config.scope.serverRoot,executableDirectory,copyLength);
+        config.scope.serverRoot[copyLength]=L'\0';
+    }
+    wchar_t expected[kControlPathBytes]{};
+    constexpr wchar_t leaf[]=L"Binaries\\Win64";
+    if(!ValidScope(config.scope) || !AppendPathLeaf(config.scope.serverRoot,kControlRootCharacters,
+            leaf,std::size(leaf),expected,std::size(expected),error) ||
+        CompareStringOrdinal(expected,-1,executableDirectory,-1,TRUE)!=CSTR_EQUAL) {
+        *error=ERROR_INVALID_NAME;return false;
+    }
+    const wchar_t drive[]{executableDirectory[0],L':',L'\\',L'\0'};
+    if(GetDriveTypeW(drive)!=DRIVE_FIXED) {*error=ERROR_INVALID_DRIVE;return false;}
+    return true;
+}
+bool PinDirectoryTree(ControlState& state,const wchar_t* executableDirectory,DWORD* error) noexcept {
+    std::size_t length{};
+    if(!PortableDirectory(executableDirectory) || !DirectoryLength(executableDirectory,&length)) {
+        *error=ERROR_INVALID_NAME;return false;
+    }
+    wchar_t prefix[kControlPathBytes]{};
+    std::wmemcpy(prefix,executableDirectory,length+1);
+    std::size_t pinned{};
+    const auto pin=[&]() noexcept {
+        if(pinned==std::size(state.directories)) {*error=ERROR_INSUFFICIENT_BUFFER;return false;}
+        auto file=CreateFileW(prefix,FILE_READ_ATTRIBUTES|READ_CONTROL,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(file==INVALID_HANDLE_VALUE) {*error=GetLastError();return false;}
+        state.directories[pinned++]=file;
+        DWORD ignored{};return FileMetadata(file,prefix,true,&ignored,error);
+    };
+    // Pin the drive, then every ancestor, streaming one bounded prefix. No
+    // recursive discovery or unchecked reparse ancestry in the portable mode.
+    const auto first=prefix[3];prefix[3]=L'\0';
+    if(!pin()) return false;
+    prefix[3]=first;
+    for(std::size_t i=3;i<=length;++i) if(prefix[i]==L'\\' || !prefix[i]) {
+        const auto saved=prefix[i];prefix[i]=L'\0';
+        if(!pin()) return false;
+        prefix[i]=saved;
+    }
+    return true;
+}
+ControlResult PrepareControlTransport(ControlState& state,const ControlConfig& config,
+    bool allowWebAdminOnly,const ControlPlatformCalls& calls,DWORD* error) noexcept {
+    if(!config.enabled || !ValidIdentity(state.identity)) return ControlResult::InvalidIdentity;
+    if(WebAdminOnlyScope(config.scope,config.transport)) {
+        if(!config.consoleRequested || config.operatorSidBytes) return ControlResult::InvalidConfig;
+        if(!allowWebAdminOnly) return ControlResult::EndpointUnavailable;
+        // No Windows account lookup, pipe, I/O event or control worker in this mode.
+    } else if(LegacyPipeScope(config.scope,config.transport)) {
+        if(!calls.administratorIdentity || !calls.administratorIdentity(&state.security,error) ||
+            !state.security.administratorSidBytes) {
+            if(!*error) *error=ERROR_ACCESS_DENIED;return ControlResult::SecurityRejected;
+        }
+        if(!config.operatorSidBytes || !SidEqual(const_cast<BYTE*>(config.operatorSid),state.security.administratorSid)) {
+            *error=ERROR_ACCESS_DENIED;return ControlResult::InvalidIdentity;
+        }
+        state.security.operatorSidBytes=config.operatorSidBytes;
+        std::memcpy(state.security.operatorSid,config.operatorSid,sizeof(config.operatorSid));
+    } else return ControlResult::InvalidConfig;
+    state.scope=config.scope;state.transport=config.transport;state.consoleRequested=config.consoleRequested;
+    const auto result=config.transport==ControlTransport::WebAdminOnly ? ControlResult::Ready :
+        calls.preparePipe ? calls.preparePipe(state,error) : ControlResult::EndpointUnavailable;
+    state.enabled=result==ControlResult::Ready;return result;
+}
+ControlResult FinishPreparation(ControlState& state,ControlResult result,DWORD error) noexcept {
+    if(result!=ControlResult::Ready) {state.enabled=false;CloseDirectories(state);}
+    state.error=error;InterlockedExchange(&state.result,static_cast<LONG>(result));return result;
+}
+bool StartControlImpl(ControlState& state,const ControlPlatformCalls& calls,DWORD* error) noexcept {
+    if(error) *error=ERROR_SUCCESS;
+    if(!state.enabled || (!LegacyPipeScope(state.scope,state.transport) &&
+            !WebAdminOnlyScope(state.scope,state.transport)) ||
+        InterlockedCompareExchange(&state.result,0,0)!=static_cast<LONG>(ControlResult::Ready) ||
+        InterlockedCompareExchange(&state.stop,0,0) || InterlockedCompareExchange(&state.started,1,0)) {
+        if(error) *error=ERROR_INVALID_STATE;return false;
+    }
+    if(state.transport==ControlTransport::WebAdminOnly) return true;
+    DWORD localError=ERROR_SUCCESS;
+    state.thread=calls.startWorker ? calls.startWorker(state,&localError) : nullptr;
+    if(!state.thread) {
+        state.error=localError;state.enabled=false;CloseDirectories(state);
+        InterlockedExchange(&state.result,static_cast<LONG>(ControlResult::WorkerFailure));
+        if(error) *error=state.error;return false;
+    }
+    // Thread and pins remain process-resident; a stop never frees borrowed storage.
+    return true;
+}
+} // namespace
 ControlResult InitializeControl(ControlState& state, const wchar_t* executableDirectory,
-    DWORD pid, const BYTE (&runId)[16], DWORD* error, bool allowManualPilot) noexcept {
+    DWORD pid, const BYTE (&runId)[16], DWORD* error, bool allowManualPilot,
+    bool allowWebAdminOnly) noexcept {
     DWORD localError = ERROR_SUCCESS;
     if (error) *error = ERROR_SUCCESS;
     if (state.enabled || state.started || state.result != static_cast<LONG>(ControlResult::Uninitialized)) {
@@ -528,10 +705,10 @@ ControlResult InitializeControl(ControlState& state, const wchar_t* executableDi
     wchar_t configPath[kControlPathBytes]{};
     constexpr wchar_t configLeaf[] = L"RS2LeechRecovery.ini";
     if (!ValidIdentity(state.identity)) localError = ERROR_INVALID_DATA;
+    else if (!StartupThreadUnimpersonated(ThreadTokenPresence,&localError)) result=ControlResult::SecurityRejected;
     else if (!executableDirectory || !AppendPathLeaf(executableDirectory, kControlPathBytes,
             configLeaf, std::size(configLeaf), configPath, std::size(configPath), &localError))
         result = ControlResult::InvalidPath;
-    else if (!AdministratorIdentity(&state.security, &localError)) result = ControlResult::SecurityRejected;
     else {
         char bytes[kControlFileBytes]{}; DWORD count{}; ControlConfig config{};
         // Deliberately trusted-local configuration, including console opt-in.
@@ -542,66 +719,22 @@ ControlResult InitializeControl(ControlState& state, const wchar_t* executableDi
             state.configAcl, std::size(state.configAcl), &localError, false);
         if (result == ControlResult::Ready) result = ParseControlConfig(bytes, count, &config);
         if (result == ControlResult::Ready) {
-            wchar_t paths[4][kControlPathBytes]{};
-            paths[0][0]=config.scope.serverRoot[0];paths[0][1]=L':';paths[0][2]=L'\\';
-            const bool pathsReady=ValidScope(config.scope) &&
-                swprintf_s(paths[1],L"%ls",config.scope.serverRoot)>0 &&
-                swprintf_s(paths[2],L"%ls\\Binaries",config.scope.serverRoot)>0 &&
-                swprintf_s(paths[3],L"%ls\\Binaries\\Win64",config.scope.serverRoot)>0;
-            if(config.scope.schema==2 && !allowManualPilot) {
+            if(ManualPilotScope(config.scope) && !allowManualPilot) {
                 result=ControlResult::InvalidConfig;localError=ERROR_INVALID_STATE;
-            } else if(!pathsReady || GetDriveTypeW(paths[0])!=DRIVE_FIXED ||
-                CompareStringOrdinal(executableDirectory,-1,paths[3],-1,TRUE)!=CSTR_EQUAL) {
-                result = ControlResult::InvalidPath; localError = ERROR_INVALID_NAME;
-            } else if (!state.security.administratorSidBytes) {
-                result = ControlResult::SecurityRejected; localError = ERROR_ACCESS_DENIED;
-            } else if (!SidEqual(config.operatorSid, state.security.administratorSid)) {
-                result = ControlResult::InvalidIdentity; localError = ERROR_ACCESS_DENIED;
+            } else if(!ResolveControlScope(config,executableDirectory,&localError) ||
+                !PinDirectoryTree(state,executableDirectory,&localError)) {
+                result=ControlResult::InvalidPath;
             } else {
-                state.security.operatorSidBytes = config.operatorSidBytes;
-                std::memcpy(state.security.operatorSid, config.operatorSid, sizeof(config.operatorSid));
-                state.scope=config.scope;
-                state.consoleRequested=config.consoleRequested;
-                for (std::size_t i = 0; i < std::size(paths) && result == ControlResult::Ready; ++i) {
-                    auto file = CreateFileW(paths[i], FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ,
-                        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-                    if (file == INVALID_HANDLE_VALUE) { result = ControlResult::InvalidPath; localError = GetLastError(); break; }
-                    state.directories[i] = file;
-                    DWORD ignored{};
-                    if (!FileMetadata(file, paths[i], true, &ignored, &localError)) result = ControlResult::InvalidPath;
-                    // Pin exact existing paths against replacement, but their
-                    // inherited writer grants do not authorize pipe commands.
-                }
-                if (result == ControlResult::Ready) {
-                    result = PreparePipe(state, &localError);
-                    if (result == ControlResult::Ready) state.enabled = true;
-                }
+                result=PrepareControlTransport(state,config,allowWebAdminOnly,kPlatform,&localError);
             }
         }
     }
-    if (result != ControlResult::Ready) CloseDirectories(state);
-    state.error = localError;
-    InterlockedExchange(&state.result, static_cast<LONG>(result));
+    FinishPreparation(state,result,localError);
     if (error) *error = localError;
     return result;
 }
 bool StartControl(ControlState& state, DWORD* error) noexcept {
-    if (error) *error = ERROR_SUCCESS;
-    if (!state.enabled || InterlockedCompareExchange(&state.result, 0, 0) != static_cast<LONG>(ControlResult::Ready) ||
-        InterlockedCompareExchange(&state.stop, 0, 0) || InterlockedCompareExchange(&state.started, 1, 0)) {
-        if (error) *error = ERROR_INVALID_STATE;
-        return false;
-    }
-    state.thread = CreateThread(nullptr, 0, Worker, &state, 0, nullptr);
-    if (!state.thread) {
-        state.error = GetLastError(); state.enabled = false; CloseDirectories(state);
-        InterlockedExchange(&state.result, static_cast<LONG>(ControlResult::WorkerFailure));
-        if (error) *error = state.error;
-        return false;
-    }
-    // Thread and pinned directories deliberately remain process-resident. A
-    // stop signal never frees storage while the worker could still be reading.
-    return true;
+    return StartControlImpl(state,kPlatform,error);
 }
 void StopControl(ControlState& state) noexcept {
     InterlockedExchange(&state.stop, 1);
@@ -612,10 +745,10 @@ bool ClaimControl(ControlState& state, RequestOrigin origin) noexcept {
     if (!state.enabled || InterlockedCompareExchange(&state.started, 0, 0) != 1 ||
         InterlockedCompareExchange(&state.stop, 0, 0) ||
         InterlockedCompareExchange(&state.result, 0, 0) != static_cast<LONG>(ControlResult::Ready) ||
-        !ValidIdentity(state.identity) || !ValidScope(state.scope) ||
-        (origin != RequestOrigin::Pipe &&
-            (origin != RequestOrigin::ServerAdminConsole || !state.consoleRequested ||
-                ReadConsoleRegistration(state)!=ConsoleRegistration::Available || state.scope.schema!=2))) return false;
+        !ValidIdentity(state.identity) ||
+        (origin==RequestOrigin::Pipe ? !LegacyPipeScope(state.scope,state.transport) :
+            (origin!=RequestOrigin::ServerAdminConsole || !ConsoleControlScope(state) ||
+                ReadConsoleRegistration(state)!=ConsoleRegistration::Available))) return false;
     return InterlockedCompareExchange(&state.latched, static_cast<LONG>(origin), 0) == 0;
 }
 } // namespace
@@ -623,12 +756,16 @@ bool ClaimConsoleControlRequest(ControlState& state) noexcept {
     return ClaimControl(state, RequestOrigin::ServerAdminConsole);
 }
 bool ReleasePreflightClaim(ControlState& state) noexcept {
-    if (state.scope.schema != 2 || !state.enabled ||
+    if (!ManualPilotScope(state.scope) || !state.enabled ||
         InterlockedCompareExchange(&state.started, 0, 0) != 1 ||
         InterlockedCompareExchange(&state.stop, 0, 0) ||
         InterlockedCompareExchange(&state.result, 0, 0) != static_cast<LONG>(ControlResult::Ready)) return false;
     const LONG origin = InterlockedCompareExchange(&state.latched, 0, 0);
-    return (origin == static_cast<LONG>(RequestOrigin::Pipe) || origin == static_cast<LONG>(RequestOrigin::ServerAdminConsole)) &&
+    const bool legacy=LegacyPipeScope(state.scope,state.transport);
+    const bool console=ConsoleControlScope(state) &&
+        (legacy || ReadConsoleRegistration(state)==ConsoleRegistration::Available);
+    return ((origin==static_cast<LONG>(RequestOrigin::Pipe) && legacy) ||
+        (origin==static_cast<LONG>(RequestOrigin::ServerAdminConsole) && console)) &&
         InterlockedCompareExchange(&state.latched, 0, origin) == origin;
 }
 ConsoleRegistration ReadConsoleRegistration(const ControlState& state) noexcept {
@@ -640,9 +777,10 @@ bool ReadLatchedControl(const ControlState& state, ControlRequest* output, Reque
     if (origin) *origin = RequestOrigin::None;
     const auto selected = static_cast<RequestOrigin>(InterlockedCompareExchange(
         const_cast<volatile LONG*>(&state.latched), 0, 0));
-    if (!output || !ValidIdentity(state.identity) || !ValidScope(state.scope) || (selected != RequestOrigin::Pipe &&
-        (selected != RequestOrigin::ServerAdminConsole || !state.consoleRequested ||
-            ReadConsoleRegistration(state)!=ConsoleRegistration::Available || state.scope.schema!=2))) return false;
+    if (!output || !ValidIdentity(state.identity) ||
+        (selected==RequestOrigin::Pipe ? !LegacyPipeScope(state.scope,state.transport) :
+            (selected!=RequestOrigin::ServerAdminConsole || !ConsoleControlScope(state) ||
+                ReadConsoleRegistration(state)!=ConsoleRegistration::Available))) return false;
     *output = state.identity;
     if (origin) *origin = selected;
     return true;
@@ -693,6 +831,18 @@ ConsoleCommand ParseConsoleCommand(const wchar_t* text, std::size_t count,
     return cursor == count ? ConsoleCommand::Recover : ConsoleCommand::Invalid;
 }
 #ifdef RS2_REPORTING_TESTING
+ControlResult PrepareControlTransportForTesting(ControlState& state,const ControlConfig& config,
+    bool allowWebAdminOnly,const ControlPlatformCalls& calls,DWORD* error) noexcept {
+    *error=ERROR_SUCCESS;
+    const auto result=PrepareControlTransport(state,config,allowWebAdminOnly,calls,error);
+    return FinishPreparation(state,result,*error);
+}
+bool StartControlForTesting(ControlState& state,const ControlPlatformCalls& calls,DWORD* error) noexcept {
+    return StartControlImpl(state,calls,error);
+}
+bool StartupThreadUnimpersonatedForTesting(DWORD (*presence)() noexcept,DWORD* error) noexcept {
+    *error=ERROR_SUCCESS;return StartupThreadUnimpersonated(presence,error);
+}
 bool ClaimControlForTesting(ControlState& state, RequestOrigin origin) noexcept {
     return ClaimControl(state, origin);
 }

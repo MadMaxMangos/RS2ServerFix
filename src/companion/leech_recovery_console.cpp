@@ -68,6 +68,15 @@ void Unavailable(LeechConsoleAdapter& a,LeechConsoleReason reason) noexcept {
     if(a.recovery) InterlockedExchange(&a.recovery->control.consoleRegistration,
         static_cast<LONG>(recovery::ConsoleRegistration::Unavailable));
 }
+void RegistrationUnavailable(LeechConsoleAdapter& a,LeechConsoleReason reason) noexcept {
+    const bool initial=a.recovery && a.recovery->runtime && RuntimeOwner(*a.recovery->runtime) &&
+        recovery::WebAdminOnlyScope(a.recovery->control.scope,a.recovery->control.transport) &&
+        recovery::ReadConsoleRegistration(a.recovery->control)!=recovery::ConsoleRegistration::Available;
+    Unavailable(a,reason);
+    if(initial) InterlockedCompareExchange(&a.recovery->control.result,
+        static_cast<LONG>(recovery::ControlResult::EndpointUnavailable),
+        static_cast<LONG>(recovery::ControlResult::Ready));
+}
 bool Operational(LeechConsoleAdapter& a) noexcept {
     auto* r=a.recovery;
     // Thread check comes BEFORE reading owner-mutable fields or borrowed data.
@@ -244,7 +253,7 @@ const std::uintptr_t kVtable[]{reinterpret_cast<std::uintptr_t>(&Exec),reinterpr
 }
 __declspec(noinline) void Construct(LeechConsoleAdapter& a,DWORD incoming) {
 #if defined(RS2_RECOVERY_GUARD_PROBE)
-    Unavailable(a,LeechConsoleReason::Profile);SetLastError(incoming);
+    RegistrationUnavailable(a,LeechConsoleReason::Profile);SetLastError(incoming);
 #else
     bool returned=false;a.constructing=true;
     __try {
@@ -256,7 +265,7 @@ __declspec(noinline) void Construct(LeechConsoleAdapter& a,DWORD incoming) {
         returned=true;
     } __finally {
         a.constructing=false;
-        if(!returned) Unavailable(a,LeechConsoleReason::NativeException);
+        if(!returned) RegistrationUnavailable(a,LeechConsoleReason::NativeException);
         SetLastError(incoming);
     }
 #endif
@@ -297,7 +306,7 @@ bool LeechConsoleRegistrationDue(const Runtime& state) noexcept {
         ReadStatusWord(state.config.status->stopping)) return false;
     const auto* r=state.config.recovery;
     return r && r->prepared && r->controlStarted && r->control.consoleRequested &&
-        r->control.scope.schema==2 && !r->console.attempted && !r->requested &&
+        recovery::ConsoleControlScope(r->control) && !r->console.attempted && !r->requested &&
         !InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.stop),0,0) &&
         InterlockedCompareExchange(const_cast<volatile LONG*>(&r->control.result),0,0)==static_cast<LONG>(recovery::ControlResult::Ready) &&
         recovery::ReadConsoleRegistration(r->control)==recovery::ConsoleRegistration::NotRegistered;
@@ -312,19 +321,19 @@ void RegisterLeechConsole(Runtime& state,CallerClass classification,std::size_t 
     if(r.callbackDepth || r.requested || !RecoveryRuntimeSafeOwner(state)) return;
     const DWORD incoming=GetLastError();a.attempted=true;
     LeechConsoleRegistry before{},after{};DWORD error{};
-    if(!a.calls.construct || !a.calls.reply || !a.calls.pin || !Qualified(a)) Unavailable(a,LeechConsoleReason::Profile);
-    else if(!ReadLeechConsoleRegistry(r.native,&before) || before.count>=before.capacity) Unavailable(a,LeechConsoleReason::Registry);
+    if(!a.calls.construct || !a.calls.reply || !a.calls.pin || !Qualified(a)) RegistrationUnavailable(a,LeechConsoleReason::Profile);
+    else if(!ReadLeechConsoleRegistry(r.native,&before) || before.count>=before.capacity) RegistrationUnavailable(a,LeechConsoleReason::Registry);
     else if(!ReadImageRange(r.native.hostBase,r.native.hostImageSize,r.native.layout->gmalloc,&a.allocator,sizeof(a.allocator),r.native.memory,&error) ||
-        RequireRecoveryMetadataAllocator(r.native,a.allocator,&error)!=RecoveryNativeResult::Ready) Unavailable(a,LeechConsoleReason::Allocator);
-    else if(!a.calls.pin(a.companion)) Unavailable(a,LeechConsoleReason::ModulePin);
-    else if(InterlockedCompareExchangePointer(&g_console,&a,nullptr)!=nullptr) Unavailable(a,LeechConsoleReason::Publication);
+        RequireRecoveryMetadataAllocator(r.native,a.allocator,&error)!=RecoveryNativeResult::Ready) RegistrationUnavailable(a,LeechConsoleReason::Allocator);
+    else if(!a.calls.pin(a.companion)) RegistrationUnavailable(a,LeechConsoleReason::ModulePin);
+    else if(InterlockedCompareExchangePointer(&g_console,&a,nullptr)!=nullptr) RegistrationUnavailable(a,LeechConsoleReason::Publication);
     else {
         // Spare capacity avoids Add's realloc branch. The reached allocator
         // closure is nevertheless pinned by the approved metadata overlay.
         LeechConsoleRegistry finalBefore{};
         if(!ReadLeechConsoleRegistry(r.native,&finalBefore) || std::memcmp(&before,&finalBefore,sizeof(before)) ||
             RequireRecoveryMetadataAllocator(r.native,a.allocator,&error)!=RecoveryNativeResult::Ready) {
-            Unavailable(a,LeechConsoleReason::Registry);SetLastError(incoming);return;
+            RegistrationUnavailable(a,LeechConsoleReason::Registry);SetLastError(incoming);return;
         }
         Construct(a,incoming);
         const auto object=reinterpret_cast<std::uintptr_t>(&a.object);
@@ -332,11 +341,11 @@ void RegisterLeechConsole(Runtime& state,CallerClass classification,std::size_t 
             after.capacity!=before.capacity || after.data!=before.data ||
             after.entries[before.count]!=object ||
             std::memcmp(before.entries,after.entries,static_cast<std::size_t>(before.count)*8) ||
-            a.object.vtable!=kVtable) Unavailable(a,LeechConsoleReason::Postcheck);
+            a.object.vtable!=kVtable) RegistrationUnavailable(a,LeechConsoleReason::Postcheck);
         else if(InterlockedCompareExchange(&r.control.consoleRegistration,
             static_cast<LONG>(recovery::ConsoleRegistration::Available),
             static_cast<LONG>(recovery::ConsoleRegistration::NotRegistered))!=
-                static_cast<LONG>(recovery::ConsoleRegistration::NotRegistered)) Unavailable(a,LeechConsoleReason::Publication);
+                static_cast<LONG>(recovery::ConsoleRegistration::NotRegistered)) RegistrationUnavailable(a,LeechConsoleReason::Publication);
     }
     SetLastError(incoming);
 }

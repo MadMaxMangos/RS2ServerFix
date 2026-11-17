@@ -17,10 +17,12 @@ The update distinguishes prepared trial kits from published source and releases.
 
 Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
 companion is **0.3.0.0** and requires its own qualified trial package.
-Steam reporting and manual Leech recovery use the **0.7.1.0 experimental target**.
-The source includes manual WebAdmin control, compact operational diagnostics,
-schema-2 bot-tolerant admission, valid idle-heartbeat error-history acceptance
-and a 65-second metadata observation window.
+Steam reporting and manual Leech recovery use the **0.7.4.0 experimental target**.
+The source includes manual WebAdmin control, an explicitly opted-in SID-less
+WebAdmin-only mode with automatic local install-path discovery, compact operational
+diagnostics, schema-2/3 bot-tolerant admission, valid idle-heartbeat error-history
+acceptance and a 65-second metadata
+observation window.
 It retains the earlier recon and native reporting admission corrections, without
 replacing advertised counts or changing authentication. Memory, ownership and
 lifecycle safeguards remain in force. The default configuration observes reporting
@@ -63,8 +65,16 @@ known-good package. Hot unloading is not supported.
 
 ## Compatibility and deployment
 
-The active production profile currently targets one **PR3 full-dump-patched
-Win64 executable**, identified by this SHA-256:
+The **0.7.4.0 reporting/recovery companion** supports these two exact current
+Win64 executables. It preserves each host's actual hash and build identity:
+
+| Executable | SHA-256 |
+| --- | --- |
+| Current stock Steam/SteamCMD EXE | `F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3` |
+| Current PR3 full-dump-patched EXE | `0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393` |
+
+The older recon-only 0.2.0.0 and observer 0.3.0.0 artifacts still require the
+full-dump-patched EXE:
 
 ```text
 0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393
@@ -74,6 +84,24 @@ The filename alone does not establish compatibility. Other builds may be
 recognized by the inventory tools without being supported by the recon fix.
 The full-dump executable modification is separate; these DLLs do not create it,
 and proprietary game executables or SDK DLLs are not distributed here.
+
+The reporting/recovery companion selects one of these two exact Steam DLL pairs
+at startup, with either supported EXE. Pair members cannot be mixed:
+
+| Pair | `steam_api64.dll` SHA-256 | `steamclient64.dll` SHA-256 |
+| --- | --- | --- |
+| Previously qualified Steamworks 1.57 setup | `A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9` | `8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE` |
+| Preserved current untouched depot setup | `473F5A312B56519F347741B63F3DEA590946B96EA40EF3803D5F452C39AF2F1E` | `0F2B9F92F8FF709C328F4FF8D12E4C36459597D2A65791CBDAA9D45E793221E5` |
+
+The depot pair has static interface/PE qualification and local inert-test coverage;
+its new startup route still needs a controlled live training trial. Prior live
+trials do not qualify this new route, and neither pair proves Steam-outage repair.
+The previous pair's client qualification is reused, not newly remeasured here.
+Unknown or mixed pairs are rejected; no version range or INI override bypasses
+the identity checks. No Steam DLL is bundled, loaded by the evidence tests or
+installed as an upgrade. Preserve the depot's other dependencies, including
+`tier0_s64.dll` and `vstdlib_s64.dll`; arbitrary replacements are not qualified.
+The older standalone observer remains limited to its original 1.57 setup.
 
 For a first recon-only deployment (experimental variants require their own
 matched configuration and separately authorized trial):
@@ -266,9 +294,9 @@ Manual recovery is separate from the reporting `mode=repair` setting above. It
 defaults to disabled in [RS2LeechRecovery.ini](config/RS2LeechRecovery.ini), which
 must be placed beside the EXE, not in a `config` subfolder. The current
 schema-1 configuration retains the original `E:\rs2v_trainingsrv` restriction.
-Schema 2 binds an explicitly configured fixed-drive server root and operator SID;
-it requires reporting `mode=observe`. It permits a manual pilot without changing
-native counting or authentication. Each explicit pipe request uses the matched
+Schemas 2 and 3 require reporting `mode=observe` and permit a manual pilot without
+changing native counting or authentication. Schema 2 binds an explicitly configured
+fixed-drive server root and operator SID. Each explicit pipe request uses the matched
 [Request-LeechRecovery.ps1](tools/Request-LeechRecovery.ps1) helper and authenticates
 the configured operator SID through the named pipe. The server and helper must
 run as that same elevated administrator account. File permission changes are
@@ -277,19 +305,28 @@ the root and SID checks identify this server and account, not the file's author.
 A request transmission alone does not
 establish admission, native completion or browser repair.
 
-The optional schema-2 `console_trigger=server-admin` registers
+The optional schema-2 `console_trigger=server-admin`, or the explicit schema-3
+WebAdmin-only opt-in described below, registers
 `rs2leech status` and `rs2leech recover <run token>` for WebAdmin's management
 console. It ships disabled. The console route trusts existing WebAdmin admin
 privileges and local configuration; **it does not authenticate the Windows
 operator and does not protect against local file writers**. The visible run token
 checks deliberate, current-process intent; it is not an authentication credential.
 Only the qualified WebAdmin reply path can claim recovery. Local and in-game
-console output classes are not supported by this adapter. Pipe and console share
-one request at a time and one native recovery recipe per process. Schema 2 may
+console output classes are not supported by this adapter. A successful
+`rs2leech status` reply is the console route's availability witness; an Armed
+inventory state alone does not mean the adapter has registered. An unrecognised
+command means it has not registered, not that a recovery succeeded.
+A silent/empty reply can also mean a previously registered adapter has become
+unavailable. Do not infer route health from an Armed inventory state alone.
+Schema 2's pipe and console share one request at a time and one native recovery
+recipe per process. Schema 3 uses the same native opportunity through its sole
+console route. Schemas 2 and 3 may
 release the claim after a fully recorded preflight rejection that entered no
 native recipe or resource operation. Status retains the rejection reason and
-shows `retry=yes`; a later explicit request may use either route and gets a new
-operation number. **Do not resend a request while it is pending.** No automatic
+shows `retry=yes`; a later explicit request may use an available enabled route and
+gets a new operation number. Schema 3 cannot retry after losing its sole console
+route. **Do not resend a request while it is pending.** No automatic
 retry occurs, and a rejection after any native recipe entry stays spent. A bad
 pipe request can close that opportunity even without claiming the latch. A wrong
 console token does not claim it. Disable the opt-in after the pilot window.
@@ -302,15 +339,15 @@ refuses that mode even with archive or training-recovery options. Preserve the r
 log and use a fresh normal/detailed run for qualification.
 
 The pilot preserves native counts, including PI counts above capacity and the
-native bot count. Schema 2 supports bots; schema 1 retains its original two-human,
-zero-bot training policy. Both require zero spectators and retain exact
+native bot count. Schemas 2 and 3 support bots; schema 1 retains its original
+two-human, zero-bot training policy. All require zero spectators and retain exact
 source/lifetime guards. Joins or actor-array changes during recovery can cause a
 refusal requiring restart. Start with a low-population affected server. A successful
 native callback, publication or metadata check is not proof of browser repair.
 
-An inactive schema-2 configuration is shown below. The repository's supplied
-schema-1 default also disables recovery. SID-free hosting support remains a
-separate follow-up; the SID is configuration, not a hard-coded account identity.
+An inactive legacy schema-2 configuration is shown below. The repository's supplied
+schema-1 default also disables recovery. The legacy SID is configuration, not a
+hard-coded account identity. Shipped defaults remain unchanged and disabled.
 
 ```ini
 schema=2
@@ -320,25 +357,99 @@ operator_sid=none
 console_trigger=disabled
 ```
 
+#### SID-less WebAdmin-only control (0.7.4.0)
+
+Control schema 3 removes Windows account/SID lookup and the administrator-membership
+requirement for this explicitly selected console-only mode. It creates no recovery
+pipe, control I/O events or control worker. Existing reporting workers are unrelated
+and unchanged. The host still needs configuration access, the qualified executable,
+normal process file/path read permissions, a non-impersonating startup thread and
+the existing WebAdmin administration boundary. It is not an automatic recovery mode.
+Schemas 1 and 2 retain their SID authentication and pipe behavior; omitting their
+SID never selects the new mode. The PowerShell request helper refuses schema 3
+with instructions to use WebAdmin; read-only inventory remains available subject
+to normal OS process-read access.
+
+The following examples are **README-only**, not replacement sealed-kit defaults.
+Exactly these five keys are required, with no `operator_sid` or `training_root`.
+In 0.7.4.0, `server_root=auto` derives the root from the qualified running EXE's
+`Binaries\Win64` directory. No per-server path or Windows account information is
+needed. Nested folders, spaces and Unicode names are supported on a local fixed
+drive with ordinary Windows path-length installs. The private 512-character
+buffers also hold appended filenames and normalized-path prefixes, so they are
+not a promise of 512-character installation paths. UNC/device paths, junctions,
+symbolic links, dot/dotdot components and trailing-dot/space aliases remain
+unsupported. Every directory ancestor is checked and pinned; file-read access
+and `FILE_READ_ATTRIBUTES` plus `READ_CONTROL` on every ancestor remain required.
+
+Explicit schema-3 roots remain supported with the earlier one-component limit:
+1-32 characters using letters, digits, `_` or `-`, at most 35 characters including
+`E:\`. Schemas 1 and 2 do not accept `auto` and retain their existing restrictions.
+Older DLLs reject `auto`; keep the DLL, configuration and diagnostic tools matched.
+
+Inactive schema-3 example:
+
+```ini
+schema=3
+permission=disabled
+server_root=auto
+control_mode=webadmin-only
+console_trigger=disabled
+```
+
+Explicit opt-in for a separately authorized manual trial:
+
+```ini
+schema=3
+permission=manual-pilot-finish-recreate
+server_root=auto
+control_mode=webadmin-only
+console_trigger=server-admin
+```
+
+For a native-enabled operator package, copy only the matching two DLLs and two
+INIs from its separate copy-ready folder beside the stopped server's EXE. The
+manual-WebAdmin alternative explicitly opts in to the manual route; the disabled
+alternative leaves recovery off. Both use automatic root discovery. Do not mix
+them with a public read-only guard probe or put those loose deployment files inside
+the sealed diagnostic kit. Preserve the previous working files for rollback. No
+SID lookup, PowerShell session or desktop access is required to operate recovery
+through WebAdmin; operators still need file/config access and WebAdmin privileges.
+This supports the qualified executable/SDK cohort and ordinary local directory
+layouts, not every game build or hosting filesystem.
+
+Configuration is selected only at process startup. After an authorized restart,
+use `rs2leech status` in WebAdmin and use the current reply's confirmation token
+with `rs2leech recover <current-run-token>` only when deliberately requesting the
+manual operation. A token is an intent check, not a password. Restore the disabled
+permission and console setting after the trial window. Local publication, backend
+delivery and browser convergence still require separate evidence; the historical
+trials below do not qualify this new control route or establish real-outage repair.
+Enabled schema 3 is unavailable in read-only guard-probe builds: they refuse before
+arming and do not register the console route. Native builds may wait for the
+existing SDK/source/logger readiness gates before registering; this is not a blind
+registration timeout or permission to bypass those gates.
+
 For a controlled trial, use the reviewed, checksum-bound kit. To build the
 read-only guard variant from source, use a separate directory and supply the
-preserved, hash-matched full-dump EXE as a data input:
+preserved, hash-matched full-dump and stock EXEs as data inputs:
 
 ```powershell
 cmake -S . -B build-leech-probe -G Ninja -DCMAKE_BUILD_TYPE=Release `
   -DRS2_RECOVERY_GUARD_PROBE=ON `
-  "-DRS2_CURRENT_FULLDUMP_PATH=C:/evidence/VNGame_pr3.exe"
+  "-DRS2_CURRENT_FULLDUMP_PATH=C:/evidence/VNGame_pr3.exe" `
+  "-DRS2_CURRENT_STOCK_PATH=C:/evidence/VNGame_pr3.stock.exe"
 cmake --build build-leech-probe --target rs2_server_fix_companion_reporting rs2_reporting_tests rs2_pe_contract
 ctest --test-dir build-leech-probe -C Release `
   -R '^(reporting_core|pe_reporting_companion_contract)$' --no-tests=error --output-on-failure
 ```
 
-Replace the example evidence path with your preserved input. The probe DLL is
+Replace the example evidence paths with your preserved inputs. The probe DLL is
 under `build-leech-probe/diagnostic/guard-probe/Release`; its recovery native call
 sites are compiled out. A build with `RS2_RECOVERY_GUARD_PROBE=OFF` uses
 `production/reporting/Release` and can perform the native sequence only after
 explicit configuration and its authorized pipe or WebAdmin request route. Both variants retain
-FileVersion 0.7.1.0; distinguish them by their build setting and artifact hashes.
+FileVersion 0.7.4.0; distinguish them by their build setting and artifact hashes.
 Use tools and configuration from the same verified trial package. A local rebuild
 does not reproduce the kit's artifact hashes or inherit its package qualification.
 Public prereleases remain recon-only or read-only guard-probe variants.
@@ -406,9 +517,10 @@ client/browser adoption remain separate observations.
 
 Full qualification testing also requires locally supplied, preserved executable
 inputs. Set the CMake cache paths `RS2_PR1_BASELINE_PATH`,
-`RS2_CURRENT_STOCK_PATH`, `RS2_CURRENT_FULLDUMP_PATH`, and
-`RS2_OBSERVER_SDK_BASELINE_PATH` to the matching evidence files before building all
-test targets and running (the SDK path is read as data, never executed):
+`RS2_CURRENT_STOCK_PATH`, `RS2_CURRENT_FULLDUMP_PATH`,
+`RS2_OBSERVER_SDK_BASELINE_PATH`, `RS2_DEPOT_STEAM_API_PATH` and
+`RS2_DEPOT_STEAM_CLIENT_PATH` to the matching evidence files before building all
+test targets and running (SDK files are read as data, never executed):
 
 ```powershell
 cmake --build build

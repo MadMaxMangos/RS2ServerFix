@@ -1,5 +1,7 @@
 #include "companion/steam_observer_profile.h"
 #include "shared/path_identity.h"
+#include "companion/build_identity.h"
+#include "shared/steam_sdk_cohort.h"
 #include <cstring>
 #include <limits>
 
@@ -22,6 +24,24 @@ constexpr Profile kProduction{
     0x14A4B10,0x17986E0,0x17981A0,0xA2CE07,0xA2AD5E,
     "steam_api64.dll",kSpans,sizeof(kSpans)/sizeof(kSpans[0])
 };
+constexpr Profile kStockReporting=[]() constexpr {
+    auto profile=kProduction;
+    profile.hostDigest=kCurrentStockDigest;
+    return profile;
+}();
+constexpr Profile kDepotReporting=[]() constexpr {
+    auto profile=kProduction;
+    profile.sdkDigest=kDepotSteam20260827.apiDigest;
+    profile.sdkImageSize=kDepotSteam20260827.apiImageSize;
+    profile.sdkTimestamp=kDepotSteam20260827.apiTimestamp;
+    profile.sdkChecksum=kDepotSteam20260827.apiChecksum;
+    return profile;
+}();
+constexpr Profile kStockDepotReporting=[]() constexpr {
+    auto profile=kDepotReporting;
+    profile.hostDigest=kCurrentStockDigest;
+    return profile;
+}();
 constexpr const char* kExports[]{
     "SteamInternal_FindOrCreateGameServerInterface",
     "SteamGameServer_Shutdown", "SteamInternal_GameServer_Init"
@@ -163,6 +183,9 @@ bool ExportAddress(std::uintptr_t module, std::uint32_t size, const char* name,
 } // namespace
 
 const Profile& ProductionObserverProfile() noexcept { return kProduction; }
+const Profile& StockReportingObserverProfile() noexcept { return kStockReporting; }
+const Profile& DepotReportingObserverProfile() noexcept { return kDepotReporting; }
+const Profile& StockDepotReportingObserverProfile() noexcept { return kStockDepotReporting; }
 
 Reason CheckColdProfile(const BootstrapContextV3& context, const StartupProfile& startup,
     const Profile& profile, const MemoryOps& ops, DWORD* error) noexcept {

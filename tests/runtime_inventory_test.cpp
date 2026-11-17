@@ -1,6 +1,7 @@
 #include "runtime_inventory.h"
 #include "companion/sha256.h"
 #include "companion/steam_reporting_types.h"
+#include "shared/steam_sdk_cohort.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <array>
@@ -118,7 +119,8 @@ void CaptureCase(const std::function<void(Fake&)>& modify, bool expected, std::s
     inventory = {}; RS2_CHECK(f.closes == (f.openDenied ? 0U : 1U));
 }
 struct ValidationFake {
-    Sha256Digest host{kProductionReconProfile.hostDigest}, bootstrap{}, companion{}, genuine{};
+    Sha256Digest host{kProductionReconProfile.hostDigest}, bootstrap{}, companion{}, genuine{},
+        sdk{kQualifiedSteam157.apiDigest}, client{kQualifiedSteam157.clientDigest};
     bool badHash{}, badGenuine{}, badSignature{}, badContract{}, changedIdentity{}, observerContract{}, reportingContract{};
     ValidationFake() { bootstrap[0] = 1; companion[0] = 2; genuine[0] = 3; }
 };
@@ -127,8 +129,8 @@ bool VHash(void* context, const RuntimeModule& module, Sha256Digest* digest) {
     auto& f = *static_cast<ValidationFake*>(context);
     if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"host.exe")) *digest = f.host;
     else if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"RS2ServerFix.dll")) *digest = f.companion;
-    else if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"steam_api64.dll")) ParseSha256Upper("A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9", digest);
-    else if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"steamclient64.dll")) ParseSha256Upper("8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE",digest);
+    else if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"steam_api64.dll")) *digest=f.sdk;
+    else if (EqualEvidencePath(EvidenceLeaf(module.fullPath), L"steamclient64.dll")) *digest=f.client;
     else *digest = f.bootstrap;
     if (f.badHash) (*digest)[0] ^= 0x80; return true;
 }
@@ -396,7 +398,8 @@ void StatusReaderChecks() {
     }
 }
 void ValidationCase(bool proxy, bool expected,
-    const std::function<void(RuntimeInventory&, RuntimeValidationInputs&, ValidationFake&, Fake&)>& modify) {
+    const std::function<void(RuntimeInventory&, RuntimeValidationInputs&, ValidationFake&, Fake&)>& modify,
+    const char* onlyFinding=nullptr,const char* secondFinding=nullptr) {
     Fake process; RuntimeInventory inventory; std::string error;
     RS2_CHECK(CaptureStableRuntimeInventory(100, Ops(process), &inventory, &error));
     inventory.modules[0].image.normalImports.push_back({"X3DAudio1_7.dll", {{false,0,"X3DAudioInitialize",0}}});
@@ -415,7 +418,13 @@ void ValidationCase(bool proxy, bool expected,
     const bool ok = ValidateRuntimeInventoryWithOps(inventory, in, VOps(files), profile, &result);
     if (ok != expected) for (const auto& finding : result.findings) std::cerr << "validation-case: " << finding << '\n';
     RS2_CHECK(ok == expected); RS2_CHECK(result.passed == expected);
+    if (expected) RS2_CHECK(result.hostSha256 == files.host);
+    if (expected && in.reportingCompanion) {
+        RS2_CHECK(result.sdkSha256==files.sdk && result.steamClientSha256==files.client);
+    }
     if (!expected) RS2_CHECK(!result.findings.empty());
+    if (secondFinding) RS2_CHECK(result.findings.size()==2 && result.findings[0]==onlyFinding && result.findings[1]==secondFinding);
+    else if (onlyFinding) RS2_CHECK(result.findings.size()==1 && result.findings[0]==onlyFinding);
 }
 struct ReportFake { std::string bytes; bool shortWrite{}, removed{}; };
 HANDLE ReportCreate(void*, const wchar_t*, DWORD*) noexcept { return reinterpret_cast<HANDLE>(2); }
@@ -506,6 +515,53 @@ void RunRuntimeInventoryTests() {
         inv.modules.push_back(std::move(client));
     };
     ValidationCase(true,true,reporting);
+    auto depot=[&](auto& inv,auto& in,auto& files,auto& process) {
+        reporting(inv,in,files,process);
+        files.sdk=kDepotSteam20260827.apiDigest; files.client=kDepotSteam20260827.clientDigest;
+        auto& client=inv.modules.back(); client.imageSize=kDepotSteam20260827.clientImageSize;
+        client.image.sizeOfImage=client.imageSize; client.image.coffTimestamp=kDepotSteam20260827.clientTimestamp;
+        client.image.checksum=kDepotSteam20260827.clientChecksum;
+    };
+    ValidationCase(true,true,depot);
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        depot(inv,in,files,process); files.sdk=kQualifiedSteam157.apiDigest;
+    },"reporting-loaded-steamclient-identity-mismatch");
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        reporting(inv,in,files,process); files.sdk=kDepotSteam20260827.apiDigest;
+    },"reporting-loaded-steamclient-identity-mismatch");
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        depot(inv,in,files,process); ++files.sdk[0];
+    },"reporting-sdk-disk-identity-mismatch","reporting-loaded-steamclient-identity-mismatch");
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        depot(inv,in,files,process); ++files.client[0];
+    },"reporting-loaded-steamclient-identity-mismatch");
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        depot(inv,in,files,process); ++inv.modules.back().image.checksum;
+    },"reporting-loaded-steamclient-identity-mismatch");
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        observer(inv,in,files,process); files.sdk=kDepotSteam20260827.apiDigest;
+    },"observer-sdk-disk-identity-mismatch");
+    auto stock=[](auto& files) {
+        RS2_CHECK(ParseSha256Upper("F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3",&files.host));
+    };
+    ValidationCase(true,true,[&](auto& inv,auto& in,auto& files,auto& process) {
+        reporting(inv,in,files,process); stock(files);
+    });
+    ValidationCase(true,true,[&](auto& inv,auto& in,auto& files,auto& process) {
+        depot(inv,in,files,process); stock(files);
+    });
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        reporting(inv,in,files,process); stock(files); ++files.host[0];
+    });
+    ValidationCase(true,false,[&](auto&,auto& in,auto& files,auto& process) {
+        // Profile(process) snapshots the original bytes before this callback;
+        // the XOR produces its CORRECTED fixture, not corrupt code. Require the
+        // stock eligibility gate to be the sole reason for this refusal.
+        in.mode=DeploymentMode::Active; in.expectedRecon=ExpectedReconState::Corrected; process.code[0]^=1; stock(files);
+    },"active-requires-current-full-dump");
+    ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
+        observer(inv,in,files,process); stock(files);
+    },"active-requires-current-full-dump");
     ValidationCase(true,false,[&](auto& inv,auto& in,auto& files,auto& process) {
         reporting(inv,in,files,process); in.observerCompanion=true;
     });
@@ -555,7 +611,7 @@ void RunRuntimeInventoryTests() {
     inputs.reportingCompanion=true;
     result.reporting.recoveryResult=reporting::RecoverySnapshotResult::Coherent;
     auto& recovery=result.reporting.recovery.wire;
-    recovery.schema=1; recovery.bytes=256; recovery.artifactVersion=0x00070100; recovery.pid=inputs.processId;
+    recovery.schema=1; recovery.bytes=256; recovery.artifactVersion=0x00070400; recovery.pid=inputs.processId;
     recovery.runId[0]=42; recovery.headerReady=1; recovery.ownerSequence=2;
     recovery.payload.oldSdkFingerprint=UINT64_MAX;
     report.bytes.clear();

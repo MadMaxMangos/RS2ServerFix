@@ -13,8 +13,16 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Numerics
 $script:ReportHostHash = '0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393'
+$script:ReportHostIdentities = @{
+    '0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393' = @{name='current-full-dump';value=3}
+    'F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3' = @{name='current-stock';value=2}
+}
 $script:ReportSdkHash = 'A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9'
 $script:ReportClientHash = '8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE'
+$script:ReportSdkClients = @{
+    'A44E5537939AE4EEBC69000589AA9B2437A667813A1657CC779198BAE9B815A9' = '8165D2A8E82753E5CD5AD985D6D08C2379E0AA8D0340669BCF05890584F51ACE'
+    '473F5A312B56519F347741B63F3DEA590946B96EA40EF3803D5F452C39AF2F1E' = '0F2B9F92F8FF709C328F4FF8D12E4C36459597D2A65791CBDAA9D45E793221E5'
+}
 $script:RecoveryPayloadNames=@('phase','event','reason','outcome','flags','operation_sequence','transition_sequence','qpc',
     'source_epoch','sdk_epoch','owner_thread_id','resource_phase','native_stage','exception_code','request_id','callback_id',
     'callback_result','api_returned_id','old_sdk_fingerprint','new_sdk_fingerprint','old_cache_fingerprint','new_cache_fingerprint',
@@ -27,6 +35,29 @@ $script:ReportPackageFiles = @(
     'tools/Collect-SteamReport.ps1','tools/Run-SteamReport.cmd','README.md','LICENSE',
     'config/RS2LeechRecovery.ini','tools/Request-LeechRecovery.ps1',
     'tools/Collect-RS2CountProbe.ps1','tools/RS2CountProbe.cs','tools/Run-RS2CountProbe.cmd')
+
+function Get-ReportHostIdentity([string]$Hash) {
+    if ($Hash -cnotmatch '^[A-F0-9]{64}$' -or !$script:ReportHostIdentities.ContainsKey($Hash)) {
+        throw 'Unsupported exact reporting host hash.'
+    }
+    return $script:ReportHostIdentities[$Hash]
+}
+
+function Set-ReportRunIdentity($Fields) {
+    if (!$Fields.ContainsKey('host_sha256')) { throw 'Reporting host hash is absent.' }
+    $null=Get-ReportHostIdentity $Fields['host_sha256']
+    if (!$Fields.ContainsKey('sdk_sha256') -or !$Fields.ContainsKey('steamclient_sha256') -or
+        $Fields['sdk_sha256'] -cnotmatch '^[A-F0-9]{64}$' -or
+        !$script:ReportSdkClients.ContainsKey($Fields['sdk_sha256']) -or
+        $Fields['steamclient_sha256'] -cne $script:ReportSdkClients[$Fields['sdk_sha256']]) {
+        throw 'Unsupported exact reporting Steam API/client pair.'
+    }
+    # Select all identities together from the first qualified inventory. Later
+    # reads must retain that exact host and pair, not any individually known DLL.
+    $script:ReportHostHash=$Fields['host_sha256']
+    $script:ReportSdkHash=$Fields['sdk_sha256']
+    $script:ReportClientHash=$Fields['steamclient_sha256']
+}
 
 # File/path/handle custody helpers are mechanically reused from the existing
 # observer collector. This sibling is self-contained; it never loads that script
@@ -520,9 +551,9 @@ function Assert-ReportRecoveryFields($Fields) {
     if($keys.Count -ne $expected.Count){throw 'Unexpected recovery inventory key set.'}
     foreach($key in $expected){if(!$Fields.ContainsKey($key)){throw "Missing recovery inventory key: $key."}}
     if(!$coherent){return $null}
-    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459008';
+    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459776';
         'recovery.header_ready'='1';'recovery.pid'=$Fields['pid'];'recovery.run_id'=$Fields['reporting.run_id'];
-        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';'reporting.header_valid'='true';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';'reporting.header_valid'='true';
         'reporting.identity_complete'='true';'reporting.header_validity'='31';'reporting.pid'=$Fields['pid']}
     if($Fields['recovery.run_id'] -cnotmatch '^[0-9a-f]{32}$' -or $Fields['recovery.run_id'] -ceq ('0'*32)) {throw 'Invalid recovery run identity.'}
     $ownerSequence=Get-ReportScalar $Fields 'recovery.owner_sequence'
@@ -624,7 +655,7 @@ function Invoke-ReportInventory([string]$Package, $Files, [string]$ServerRoot, [
 
 function Test-ReportReady($Snapshot) {
     $f = $Snapshot.fields
-    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';
+    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';
         'reporting.log_identity_available'='true';'reporting.transport.state'='1';'reporting.transport.reason'='0';
         'reporting.transport.startupSubmitted'='1';'reporting.worker.startupObserved'='1';'reporting.worker_pause_reason'='0';
         'reporting.worker_pause_changed'='false';'reporting.fatal_transport_reason'='0'}
@@ -649,7 +680,7 @@ function Assert-ReportSnapshot($Snapshot, $First) {
     }
     Assert-ReportFields $f @{ host_sha256=$script:ReportHostHash; sdk_sha256=$script:ReportSdkHash;
         steamclient_sha256=$script:ReportClientHash; 'reporting.schema'='3'; 'reporting.bytes'='3896';
-        'reporting.artifact_version'='459008'; 'reporting.header_validity'='31';
+        'reporting.artifact_version'='459776'; 'reporting.header_validity'='31';
         'reporting.pid'=$f['pid'];'reporting.process_creation'=$f['process_creation_filetime'];
         observed_bootstrap_sha256=$f['bootstrap_sha256'];observed_companion_sha256=$f['companion_sha256'];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -741,7 +772,7 @@ function Assert-NativeReportStartup($Record,$Identity) {
     foreach($key in $strings){if($Record[$key] -isnot [string]){throw 'Startup string field has wrong type.'}}
     foreach($key in $numbers){if($Record[$key] -isnot [uint64]){throw 'Startup scalar field has wrong type.'}}
     foreach($key in $booleans){if($Record[$key] -isnot [bool]){throw 'Startup boolean field has wrong type.'}}
-    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.7.1.0';artifact_version='459008';
+    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.7.4.0';artifact_version='459776';
         sequence='0';run_id=$Identity['reporting.run_id'];pid=$Identity['pid'];process_start_filetime=$Identity['process_creation_filetime'];
         qpc_frequency=$Identity['reporting.qpc_frequency'];configured_mode=$Identity['reporting.mode'];header_validity='31';
         transport='native';durability='unknown';utc_kind='derived';record_bytes='256';ring_capacity='256';batch_limit='32';
@@ -767,6 +798,9 @@ function Assert-NativeReportStartup($Record,$Identity) {
         'initialize_result','marker_complete','marker_error','startup_accepted')
     Assert-ReportShape $startup $keys
     foreach($key in $keys){if($startup[$key] -isnot [uint64]){throw 'Invalid startup-result scalar.'}}
+    if ($startup['build_identity'] -ne (Get-ReportHostIdentity $script:ReportHostHash).value) {
+        throw 'Native startup build identity differs from its exact host hash.'
+    }
     foreach($key in @('recon_qualified','marker_complete','startup_accepted')){if($startup[$key] -gt 1){throw 'Invalid startup-result boolean.'}}
     Assert-NativeDerivedUtc $Record $Record
 }
@@ -1605,8 +1639,8 @@ function Read-ReportMarker([string]$Path, [string]$Executable, [uint32]$Selected
     if (![IO.Path]::GetFileName($plain).Equals("RS2ServerFix.loader.$SelectedId.log",[StringComparison]::OrdinalIgnoreCase)) { throw 'Loader marker PID filename mismatch.' }
     $stream=[RS2ReportCollection.Files]::Open($plain,$false); $Locks.Add($stream)
     $text=Read-ReportText $stream 8192; $fields=Read-ReportFields $text
-    $required=@{schema='3';version='0.7.1.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
-        executable_size=[string](Get-Item -LiteralPath $Executable).Length;sha256=$script:ReportHostHash;build_identity='current-full-dump';
+    $required=@{schema='3';version='0.7.4.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
+        executable_size=[string](Get-Item -LiteralPath $Executable).Length;sha256=$script:ReportHostHash;build_identity=(Get-ReportHostIdentity $script:ReportHostHash).name;
         bootstrap='X3DAudio1_7.dll';bootstrap_beside_executable='true';companion='RS2ServerFix.dll';companion_beside_executable='true';
         genuine_module='system32';genuine_initialize_present='true';genuine_calculate_present='true';trigger='exe-crt-initialize';
         mode='active';fix='recon-exclusive-scale-v1';qualification='ready';recon='active';reason='none';initialize_result='0';completion='complete'}
@@ -1709,9 +1743,10 @@ function Invoke-SteamReportCollection {
             $savedStream=[RS2ReportCollection.Files]::Open($savedPath,$false);$locks.Add($savedStream)
             $savedText=Read-ReportText $savedStream 8MB;$fields=Read-ReportFields $savedText
             Assert-ReportFields $fields @{schema='1';mode='runtime-inventory';companion_kind='companion-reporting';
-                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459008';
+                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';
                 'reporting.captured'='true';'reporting.header_valid'='true';'reporting.log_identity_available'='true'}
             $null=Assert-ReportRecoveryFields $fields
+            Set-ReportRunIdentity $fields
             if($ProcessId -and [string]$ProcessId -cne $fields['pid']){throw 'Archived inventory PID differs from selected PID.'}
             $ProcessId=[uint32](Get-ReportScalar $fields 'pid')
             Save-ReportText (Join-Path $resultDirectory 'inventory-archived.txt') $savedText
@@ -1740,6 +1775,7 @@ function Invoke-SteamReportCollection {
             Write-Host 'Archived native-log evidence retained. No current readiness or trial qualification claimed.';return
         }
         $first=Invoke-ReportInventory $package $verified.Files $server $ProcessId (Join-Path $resultDirectory 'inventory-0000.txt')
+        if ($first.fields.ContainsKey('host_sha256')) { Set-ReportRunIdentity $first.fields }
         if (!(Test-ReportReady $first) -and !($TrainingRecovery -and (Test-ReportRecoveryActive $first))) {
             $diagnostic=@{ status_file='inventory-0000.txt'; status_first=$true; log_requested=$false;
                 local_safety='UNVERIFIED';local_coverage='INCONCLUSIVE';local_performance='INCONCLUSIVE';
