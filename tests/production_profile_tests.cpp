@@ -2,12 +2,14 @@
 #include "pe_reader.h"
 #include "tool_paths.h"
 #include "companion/sha256.h"
+#include "companion/package_check_profile.h"
 #include "companion/recon_profile.h"
 #include "shared/production_startup.h"
 #include <Windows.h>
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <initializer_list>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -40,6 +42,17 @@ constexpr const char* kFullDumpHash = "0D8F3222AD796B024FB525118658BB1CE946E4357
 constexpr const char* kStockHash = "F4E38510832D1FAADA8AAD3B88CD2255B3EA49267EF0E874468E23BDE4EDFCC3";
 constexpr const char* kOriginalHash = "E58CE150747B01ED9A6BC21223061AA94F56430CEDD996D7D727B6310968BDEE";
 constexpr const char* kCorrectedHash = "F402D3262D39EC73E9B33E14CC4F74B06EC981ECDE94D59ADF67D905CC1DA2D5";
+// HandleRemoteMD5s as loaded, and with the package-check stub at its entry.
+constexpr const char* kPackageOriginalHash = "2E08BAFF7C6054D11F7732C6D0CBB07D9BE28537047E7430434DE5A4857F3B15";
+constexpr const char* kPackagePatchedHash = "035AC429666CFA61AC479C1D56EC712F77E3DDAB6B9221A04517539BCE4E977B";
+// Encoded by hand from the RVAs below; the unit test proves the builder emits it.
+constexpr std::uint8_t kPackageStub[kPackageCheckStubSize]{
+    0xC7,0x05,0x9A,0x40,0x9A,0x00,0x01,0x00,0x00,0x00,
+    0xC7,0x05,0x24,0x4F,0xC2,0x00,0x00,0x00,0x00,0x00,
+    0x44,0x8B,0x05,0xDD,0x50,0xCA,0x00,
+    0x33,0xD2,
+    0x48,0x8D,0x0D,0xCC,0x50,0xCA,0x00,
+    0xE9,0x87,0xD5,0x54,0xFF};
 
 bool ReadText(const wchar_t* leaf, std::string* text) {
     const std::wstring path = std::wstring(RS2_SOURCE_DIR) + L"/tests/evidence/" + leaf;
@@ -156,7 +169,8 @@ RelocationAudit AuditRelocations(const pe::Image& image) {
                 ++audit.slotDir64;
             }
             if (Overlap(target, 8, 0xB452D0, 641) || Overlap(target, 8, 0xB45328, 4) ||
-                Overlap(target, 8, 0x12891B0, 16)) ++audit.criticalOverlaps;
+                Overlap(target, 8, 0x12891B0, 16) || Overlap(target, 8, 0xACD860, 0x5EA))
+                ++audit.criticalOverlaps;
             for (const auto& span : kRecordedSpans)
                 if (Overlap(target, 8, span.rva, span.size)) ++audit.criticalOverlaps;
         }
@@ -177,6 +191,52 @@ std::string Hex(std::uint64_t value, int width = 8) {
     std::ostringstream stream;
     stream << std::hex << std::uppercase << std::setfill('0') << std::setw(width) << value;
     return stream.str();
+}
+void CheckPackageCheck(const pe::Image& image, bool fullDump, const std::string& hostHash) {
+    const auto& package = fullDump ? kFullDumpPackageCheckProfile : kStockPackageCheckProfile;
+    RS2_CHECK(FormatSha256Upper(package.hostDigest).data() == hostHash);
+    RS2_CHECK(package.functionRva == 0xACD860 && package.functionSize == 0x5EA);
+    RS2_CHECK(package.passedStoreRva == 0xACDA1D && package.greyStoreRva == 0xACDC9F && package.clearRva == 0xACDA24);
+    RS2_CHECK(package.passedRva == 0x1471904 && package.greyRva == 0x16F2798 &&
+        package.waitingRva == 0x1772950 && package.removeRva == 0x1AE10);
+    const auto function = ReadRange(image, 0xACD860, 0x5EA);
+    RS2_CHECK(HashText(function) == kPackageOriginalHash && Digest(function) == package.originalDigest);
+    std::size_t raw = 0;
+    RS2_CHECK(pe::MapImageRva(image, 0xACD860, 0x5EA, &raw) && raw == 0xACCC60);
+    constexpr DWORD code = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+    constexpr DWORD notCode = IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_DISCARDABLE;
+    constexpr DWORD data = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    constexpr DWORD notData = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_DISCARDABLE;
+    CheckSection(image, 0xACD860, 0x5EA, ".text", code, notCode);
+    CheckSection(image, 0x1AE10, 1, ".text", code, notCode);
+    CheckSection(image, 0x1471904, 4, ".data", data, notData);
+    CheckSection(image, 0x16F2798, 4, ".data", data, notData);
+    CheckSection(image, 0x1772950, 16, ".data", data, notData);
+    // The original's own download-failure exit names every stub target:
+    // mov [passed],r14d; mov [grey],r14d; mov r8d,[Waiting.Num]; xor edx,edx;
+    // lea rcx,[Waiting]; call TArray<FString>::Remove.
+    const auto at = [&](std::uint32_t rva, std::initializer_list<std::uint8_t> opcode) {
+        return std::equal(opcode.begin(), opcode.end(), function.begin() + (rva - 0xACD860));
+    };
+    RS2_CHECK(at(0xACDA1D, {0x44,0x89,0x35}) && RelativeTarget(image, 0xACDA1D, 7, 3) == 0x1471904);
+    RS2_CHECK(at(0xACDC9F, {0x44,0x89,0x35}) && RelativeTarget(image, 0xACDC9F, 7, 3) == 0x16F2798);
+    RS2_CHECK(at(0xACDA24, {0x44,0x8B,0x05}) && RelativeTarget(image, 0xACDA24, 7, 3) == 0x1772958);
+    RS2_CHECK(at(0xACDA2B, {0x33,0xD2}));
+    RS2_CHECK(at(0xACDA2D, {0x48,0x8D,0x0D}) && RelativeTarget(image, 0xACDA2D, 7, 3) == 0x1772950);
+    RS2_CHECK(at(0xACDA34, {0xE8}) && RelativeTarget(image, 0xACDA34, 5, 1) == 0x1AE10);
+    // The verdict starts passed in the file image; the game only ever writes 0.
+    RS2_CHECK(ReadValue<std::uint32_t>(image, 0x1471904) == 1);
+    // Stub instruction targets, decoded from the hand-encoded bytes.
+    const auto stubTarget = [](std::size_t end, std::size_t displacement) {
+        std::int32_t value{};
+        std::memcpy(&value, kPackageStub + displacement, sizeof(value));
+        return static_cast<std::uint32_t>(0xACD860 + static_cast<std::int64_t>(end) + value);
+    };
+    RS2_CHECK(stubTarget(10, 2) == 0x1471904 && stubTarget(20, 12) == 0x16F2798);
+    RS2_CHECK(stubTarget(27, 23) == 0x1772958 && stubTarget(36, 32) == 0x1772950 && stubTarget(41, 37) == 0x1AE10);
+    Bytes patched = function;
+    std::copy(std::begin(kPackageStub), std::end(kPackageStub), patched.begin());
+    RS2_CHECK(HashText(patched) == kPackagePatchedHash && Digest(patched) == package.patchedDigest);
 }
 struct SourceEvidence {
     std::string digest;
@@ -264,6 +324,7 @@ bool CheckSource(const wchar_t* path, bool fullDump, const Bytes& recordedFuncti
         }
     }
     RS2_CHECK(x3Imports == 1 && inittermImports == 1);
+    CheckPackageCheck(image, fullDump, hash);
     const auto relocations = AuditRelocations(image);
     RS2_CHECK(relocations.complete && relocations.slotDir64 == 1 && relocations.criticalOverlaps == 0);
     *evidence = {hash, image.rawBytes.size(), image.imageBase, slot, image.machine, image.optionalMagic,

@@ -551,9 +551,9 @@ function Assert-ReportRecoveryFields($Fields) {
     if($keys.Count -ne $expected.Count){throw 'Unexpected recovery inventory key set.'}
     foreach($key in $expected){if(!$Fields.ContainsKey($key)){throw "Missing recovery inventory key: $key."}}
     if(!$coherent){return $null}
-    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459776';
+    Assert-ReportFields $Fields @{'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='460032';
         'recovery.header_ready'='1';'recovery.pid'=$Fields['pid'];'recovery.run_id'=$Fields['reporting.run_id'];
-        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';'reporting.header_valid'='true';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='460032';'reporting.header_valid'='true';
         'reporting.identity_complete'='true';'reporting.header_validity'='31';'reporting.pid'=$Fields['pid']}
     if($Fields['recovery.run_id'] -cnotmatch '^[0-9a-f]{32}$' -or $Fields['recovery.run_id'] -ceq ('0'*32)) {throw 'Invalid recovery run identity.'}
     $ownerSequence=Get-ReportScalar $Fields 'recovery.owner_sequence'
@@ -655,7 +655,7 @@ function Invoke-ReportInventory([string]$Package, $Files, [string]$ServerRoot, [
 
 function Test-ReportReady($Snapshot) {
     $f = $Snapshot.fields
-    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';
+    $native=@{'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='460032';
         'reporting.log_identity_available'='true';'reporting.transport.state'='1';'reporting.transport.reason'='0';
         'reporting.transport.startupSubmitted'='1';'reporting.worker.startupObserved'='1';'reporting.worker_pause_reason'='0';
         'reporting.worker_pause_changed'='false';'reporting.fatal_transport_reason'='0'}
@@ -680,7 +680,7 @@ function Assert-ReportSnapshot($Snapshot, $First) {
     }
     Assert-ReportFields $f @{ host_sha256=$script:ReportHostHash; sdk_sha256=$script:ReportSdkHash;
         steamclient_sha256=$script:ReportClientHash; 'reporting.schema'='3'; 'reporting.bytes'='3896';
-        'reporting.artifact_version'='459776'; 'reporting.header_validity'='31';
+        'reporting.artifact_version'='460032'; 'reporting.header_validity'='31';
         'reporting.pid'=$f['pid'];'reporting.process_creation'=$f['process_creation_filetime'];
         observed_bootstrap_sha256=$f['bootstrap_sha256'];observed_companion_sha256=$f['companion_sha256'];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';
@@ -772,7 +772,7 @@ function Assert-NativeReportStartup($Record,$Identity) {
     foreach($key in $strings){if($Record[$key] -isnot [string]){throw 'Startup string field has wrong type.'}}
     foreach($key in $numbers){if($Record[$key] -isnot [uint64]){throw 'Startup scalar field has wrong type.'}}
     foreach($key in $booleans){if($Record[$key] -isnot [bool]){throw 'Startup boolean field has wrong type.'}}
-    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.7.4.0';artifact_version='459776';
+    Assert-ReportFields $Record @{schema='3';artifact='RS2ServerFix-steam-reporting';version='0.7.5.0';artifact_version='460032';
         sequence='0';run_id=$Identity['reporting.run_id'];pid=$Identity['pid'];process_start_filetime=$Identity['process_creation_filetime'];
         qpc_frequency=$Identity['reporting.qpc_frequency'];configured_mode=$Identity['reporting.mode'];header_validity='31';
         transport='native';durability='unknown';utc_kind='derived';record_bytes='256';ring_capacity='256';batch_limit='32';
@@ -1639,7 +1639,7 @@ function Read-ReportMarker([string]$Path, [string]$Executable, [uint32]$Selected
     if (![IO.Path]::GetFileName($plain).Equals("RS2ServerFix.loader.$SelectedId.log",[StringComparison]::OrdinalIgnoreCase)) { throw 'Loader marker PID filename mismatch.' }
     $stream=[RS2ReportCollection.Files]::Open($plain,$false); $Locks.Add($stream)
     $text=Read-ReportText $stream 8192; $fields=Read-ReportFields $text
-    $required=@{schema='3';version='0.7.4.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
+    $required=@{schema='3';version='0.7.5.0';pid=[string]$SelectedId;executable=[IO.Path]::GetFileName($Executable);
         executable_size=[string](Get-Item -LiteralPath $Executable).Length;sha256=$script:ReportHostHash;build_identity=(Get-ReportHostIdentity $script:ReportHostHash).name;
         bootstrap='X3DAudio1_7.dll';bootstrap_beside_executable='true';companion='RS2ServerFix.dll';companion_beside_executable='true';
         genuine_module='system32';genuine_initialize_present='true';genuine_calculate_present='true';trigger='exe-crt-initialize';
@@ -1743,7 +1743,7 @@ function Invoke-SteamReportCollection {
             $savedStream=[RS2ReportCollection.Files]::Open($savedPath,$false);$locks.Add($savedStream)
             $savedText=Read-ReportText $savedStream 8MB;$fields=Read-ReportFields $savedText
             Assert-ReportFields $fields @{schema='1';mode='runtime-inventory';companion_kind='companion-reporting';
-                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';
+                'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='460032';
                 'reporting.captured'='true';'reporting.header_valid'='true';'reporting.log_identity_available'='true'}
             $null=Assert-ReportRecoveryFields $fields
             Set-ReportRunIdentity $fields

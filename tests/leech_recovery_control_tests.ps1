@@ -29,9 +29,9 @@ $fields=[ordered]@{
     'observed_companion_sha256'=$hash;'companion_kind'='companion-reporting';
     'process_image_path'='E%3A/rs2v_trainingsrv/Binaries/Win64/VNGame.exe';
     'host_sha256'='0D8F3222AD796B024FB525118658BB1CE946E4357E35BA6E5ECD127883757393';
-    'reporting.header_valid'='true';'reporting.artifact_version'='459776';'reporting.pid'='73';
+    'reporting.header_valid'='true';'reporting.artifact_version'='460032';'reporting.pid'='73';
     'reporting.run_id'=$run;'reporting.current_ready'='true';'recovery.snapshot_result'='Coherent';
-    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459776';
+    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='460032';
     'recovery.pid'='73';'recovery.run_id'=$run;'recovery.header_ready'='1';'recovery.owner_sequence'='2'
 }
 foreach ($key in $script:LeechPayloadNames) { $fields['recovery.'+$key]='0' }

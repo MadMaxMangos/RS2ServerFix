@@ -171,7 +171,7 @@ bool FormatReportingConsoleNotice(const StatusHeader& header,const ConsoleNotice
     for(std::size_t i=0;i<16;++i) { run[i*2]=hex[header.runId[i]>>4]; run[i*2+1]=hex[header.runId[i]&15]; }
     const auto* reason=n.transportReason ? kTransportNames[n.reason] : ReasonName(static_cast<Reason>(n.reason));
     const int size=std::snprintf(output->line,sizeof(output->line),
-        "[RS2SteamReport] v0.7.4.0; status=%s; event=%s; mode=%s; pid=%u; run_id=%s; "
+        "[RS2SteamReport] v0.7.5.0; status=%s; event=%s; mode=%s; pid=%u; run_id=%s; "
         "epoch=%llu; qpc=%llu; reason_domain=%s; reason=%s; owner_transition=%llu; worker_condition=%llu\r\n",
         state,event,ModeName(static_cast<Mode>(header.configuredMode)),header.pid,run,
         static_cast<unsigned long long>(n.epoch),static_cast<unsigned long long>(n.sourceQpc),
@@ -194,7 +194,7 @@ bool FormatRecoveryConsoleNotice(const RecoveryStatusWireV1& wire,ConsoleReportC
     if (!bits) return false;
     const auto& p=wire.payload;
     const int size=std::snprintf(output->line,sizeof(output->line),
-        "[RS2LeechRecovery] v0.7.4.0%s; pid=%u; run_id=%s; phase=%s; reason=%s; transition=%llu; "
+        "[RS2LeechRecovery] v0.7.5.0%s; pid=%u; run_id=%s; phase=%s; reason=%s; transition=%llu; "
         "last_valid_qpc=%llu; restart_required=%u\r\n",kRecoveryModeSuffix,wire.pid,run,kRecoveryPhases[p.phase],kRecoveryReasons[p.reason],
         static_cast<unsigned long long>(p.transitionSequence),static_cast<unsigned long long>(p.qpc),
         (p.flags&RecoveryRestartRequired) ? 1U : 0U);
@@ -364,7 +364,7 @@ void ScheduleReportingDisabledNotice(const StatusWireV3& status,Reason reason) n
     }
     ConsoleReportContext report{};
     const int bytes=std::snprintf(report.line,sizeof(report.line),
-        "[RS2SteamReport] v0.7.4.0; status=disabled; mode=%s; reason=%s; run_id=%s; pid=%u\r\n",
+        "[RS2SteamReport] v0.7.5.0; status=disabled; mode=%s; reason=%s; run_id=%s; pid=%u\r\n",
         ModeName(header ? static_cast<Mode>(header->configuredMode) : Mode::Invalid),ReasonName(reason),
         identified ? run : "unavailable",header ? header->pid : 0);
     if (bytes>0 && static_cast<std::size_t>(bytes)<sizeof(report.line)) {

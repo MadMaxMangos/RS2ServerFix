@@ -9,15 +9,15 @@ the existing server launch command and does not rewrite the executable on disk.
 This is an independent community project, not an official Tripwire Interactive
 release. It is not a general performance patch or a fix for every server crash.
 
-For the dated operator-trial status and outstanding investigations, see the
+For the earlier operator-trial history and outstanding investigations, see the
 [28 October update for Tripwire Interactive](reference/TWI-STATUS-2026-10-28.md).
-The update distinguishes prepared trial kits from published source and releases.
+The current 0.7.5.0 rollout status is summarized below.
 
 ## What is implemented
 
 Recon-only builds remain **0.2.0.0**. The separate, experimental Steam observer
 companion is **0.3.0.0** and requires its own qualified trial package.
-Steam reporting and manual Leech recovery use the **0.7.4.0 experimental target**.
+Steam reporting and manual Leech recovery use the **0.7.5.0 experimental target**.
 The source includes manual WebAdmin control, an explicitly opted-in SID-less
 WebAdmin-only mode with automatic local install-path discovery, compact operational
 diagnostics, schema-2/3 bot-tolerant admission, valid idle-heartbeat error-history
@@ -31,10 +31,29 @@ session replacement while players remained connected. The latest bot-inclusive
 trial reached local coherence within r3's 45-second window, but showed an observed
 roughly 60-second dirty-build cadence. The timing-only extension to 65 seconds is
 not a new runtime qualification. Recovery after an actual Steam outage remains unproven;
-this is not a generally qualified production release.
+the current production use is an operator pilot, not a generally qualified release.
+
+**27 November 2026 pilot:** the opt-in ranked package-check bypass passed a
+training comparison. With `AllowAnyMutator=False`, the server requested
+`Safelist.mut` and stayed ranked through a map change. With `True`, the server
+requested `remoteconfig.rcg` but did not request `Safelist.mut`; the marker
+reported `package_check=active`, and the unlisted seed mutator loaded while
+WebAdmin and the in-game browser remained ranked. `SessionHasStats` recorded
+`bIsStatsSessionOk=1`, `GPackagesPassedMD5Checks=1`,
+`GOfficialGameServerStatus=3` and `bSessionHasStats=1`. The same 0.7.5.0
+reporting companion and opt-in configuration now run on five -=PR=- servers
+with [RS2ClientFixes v013](https://github.com/MadMaxMangos/RS2ClientFixes).
+Startup, joining and ranked status passed the rollout checks; a real
+Steam-maintenance outage and client/browser repair have not yet been proven.
 
 - **Recon crash correction** — the `recon-exclusive-scale-v1` fix, guarded by an
   exact executable hash, expected instruction bytes and startup checks.
+- **Ranked package-check bypass** (0.7.5.0 production reporting companion only,
+  opt-in with `AllowAnyMutator=True`) — keeps the server's mutator/package
+  safelist verdict at "passed" in memory, so ranked status and stats no longer
+  depend on downloading a safelist file.
+  Guard-probe builds and prereleases do not contain it. See
+  [Ranked package-check bypass](#ranked-package-check-bypass-0750).
 - **Passive mode** — performs qualification without applying the recon correction.
 - **Startup diagnostics** — a console status line and a per-process
   `RS2ServerFix.loader.<PID>.log` marker identifying the build, mode and outcome.
@@ -65,7 +84,7 @@ known-good package. Hot unloading is not supported.
 
 ## Compatibility and deployment
 
-The **0.7.4.0 reporting/recovery companion** supports these two exact current
+The **0.7.5.0 reporting/recovery companion** supports these two exact current
 Win64 executables. It preserves each host's actual hash and build identity:
 
 | Executable | SHA-256 |
@@ -124,6 +143,56 @@ guarantee of runtime compatibility.
 The `Check-*.cmd` operator wrappers in [tools](tools/) expect a complete verified
 test package, including its metadata and built utilities. A source checkout alone
 is not that package.
+
+### Ranked package-check bypass (0.7.5.0)
+
+Stock servers queue every loaded mutator/game package for a remote MD5
+safelist check. One failed or unlisted package clears the process-wide
+`GPackagesPassedMD5Checks` flag until restart, which removes ranked status and
+stops stats. When `AllowAnyMutator=True` is set, the 0.7.5.0 production
+reporting companion replaces the entry of `HandleRemoteMD5s` (the only writer of
+that verdict) with a 41-byte stub. The stub keeps the verdict passed, clears the
+greylist verdict, and empties the waiting list exactly as the function's own
+failure exit does. No safelist or greylist is downloaded, and the executable on
+disk is unchanged. Other ranked rules (player count, damage scales and so on)
+still apply.
+
+Guard-probe builds and automated guard-probe prereleases do not contain the
+bypass; the game's stock safelist check runs in them.
+
+- **Hosts:** only the two exact executables in the table above. The whole
+  1,514-byte function is hash-checked in memory, and every stub target must
+  match the original function's own references. Any mismatch leaves the stock
+  check untouched.
+- **When:** once, at startup, after recon is accepted and its marker is written.
+  It uses the same rollback rules: a failed install is rolled back, and an
+  unprovable rollback stops startup.
+- **Switch (opt-in):** create `RS2PackageCheck.ini` beside the executable:
+
+  ```ini
+  [RS2ServerFix]
+  AllowAnyMutator=True
+  ```
+
+  `True` (or `1`) installs the bypass. `False` (or `0`), no key, or no file
+  keeps the regular safelist downloads and check. The key and value are
+  case-insensitive; the section header, blank lines and `;` or `#` comment lines
+  are optional. Any other content, or an unreadable file, also keeps the regular
+  check. Changes apply at the next server start.
+- **Evidence:** each start writes one line to the console and to
+  `RS2ServerFix.packagecheck.<PID>.log` beside the executable, for example
+  `[RS2PackageCheck] v0.7.5.0 package_check=active reason=none mode=active allow_any_mutator=true host=current-full-dump pid=1234 error=0`.
+  `package_check=off` means the INI did not enable the bypass (the reason says
+  `allow_any_mutator_false`, `allow_any_mutator_absent` or `config_invalid`).
+  `skipped` means recon was not accepted. `passive`, `disabled` and
+  `rolled_back` leave the regular check running. `fatal` means startup stopped
+  because a failed install could not be safely rolled back.
+
+The in-game server browser's mutator-name tag is built from the downloaded
+safelist text, so with the bypass active it is published empty. The training
+trial confirmed ranked status and stats with the bypass; it did not prove
+behavior during an actual Steam outage. Keep a known-good rollback package
+available for each server.
 
 ## Building from source
 
@@ -357,7 +426,7 @@ operator_sid=none
 console_trigger=disabled
 ```
 
-#### SID-less WebAdmin-only control (0.7.4.0)
+#### SID-less WebAdmin-only control (since 0.7.4.0)
 
 Control schema 3 removes Windows account/SID lookup and the administrator-membership
 requirement for this explicitly selected console-only mode. It creates no recovery
@@ -372,7 +441,7 @@ to normal OS process-read access.
 
 The following examples are **README-only**, not replacement sealed-kit defaults.
 Exactly these five keys are required, with no `operator_sid` or `training_root`.
-In 0.7.4.0, `server_root=auto` derives the root from the qualified running EXE's
+Since 0.7.4.0, `server_root=auto` derives the root from the qualified running EXE's
 `Binaries\Win64` directory. No per-server path or Windows account information is
 needed. Nested folders, spaces and Unicode names are supported on a local fixed
 drive with ordinary Windows path-length installs. The private 512-character
@@ -449,7 +518,7 @@ under `build-leech-probe/diagnostic/guard-probe/Release`; its recovery native ca
 sites are compiled out. A build with `RS2_RECOVERY_GUARD_PROBE=OFF` uses
 `production/reporting/Release` and can perform the native sequence only after
 explicit configuration and its authorized pipe or WebAdmin request route. Both variants retain
-FileVersion 0.7.4.0; distinguish them by their build setting and artifact hashes.
+FileVersion 0.7.5.0; distinguish them by their build setting and artifact hashes.
 Use tools and configuration from the same verified trial package. A local rebuild
 does not reproduce the kit's artifact hashes or inherit its package qualification.
 Public prereleases remain recon-only or read-only guard-probe variants.

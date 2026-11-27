@@ -10,6 +10,7 @@
 #include "companion/steam_observer.h"
 #endif
 #if defined(RS2_STEAM_REPORTING)
+#include "companion/package_check.h"
 #include "companion/steam_reporting.h"
 #include "shared/selected_reporting_profile.h"
 #endif
@@ -218,6 +219,27 @@ DWORD RunCompanionInitialization(const BootstrapContextV3& context,
     const DWORD result = written && work->markerWrite.written &&
         work->markerWrite.cleanupError == ERROR_SUCCESS && work->markerWrite.finalError == ERROR_SUCCESS
         ? marker.initializeResult : kInitMarkerWriteFailed;
+#if defined(RS2_STEAM_REPORTING) && !defined(RS2_RECOVERY_GUARD_PROBE)
+    {
+        // Recon's marker and result are already frozen; the package-check
+        // bypass runs only after an accepted, recorded recon and cannot change
+        // either. Still the startup thread inside the exe CRT initializer.
+        ConsoleReportContext packageLine{};
+        const PackageCheckReport package = RunPackageCheckStartup(context, kSelectedStartupProfile,
+            marker, MarkerStateAccepted(marker) && result == kInitOk, &lease, work->hostDirectory,
+            &packageLine);
+        if (package.result.outcome == ReconOutcome::Fatal) {
+            DWORD consoleError{};
+            const HANDLE output = ReadyFatalConsole(nullptr, &consoleError);
+            if (output != INVALID_HANDLE_VALUE && ValidConsoleReport(packageLine)) {
+                DWORD bytesWritten{};
+                (void)ProductionConsoleStatusOps().write(nullptr, output, packageLine.line,
+                    packageLine.bytes, &bytesWritten, &consoleError);
+            }
+            FailFastRecon();
+        }
+    }
+#endif
 #if defined(RS2_STEAM_OBSERVER)
     // The core diagnostic is already attempted, and its acceptance/result is
     // frozen. Observer failures cannot rewrite recon's marker or return value.

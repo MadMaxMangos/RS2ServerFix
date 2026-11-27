@@ -304,8 +304,8 @@ function Read-LeechInventoryIdentity([string]$Path, [uint32]$ExpectedPid,
         'observed_companion_sha256'=$ExpectedCompanionHash; 'companion_kind'='companion-reporting';
         'process_image_path'='E%3A/rs2v_trainingsrv/Binaries/Win64/VNGame.exe';
         'recovery.snapshot_result'='Coherent'; 'recovery.schema'='1'; 'recovery.bytes'='256';
-        'recovery.artifact_version'='459776'; 'recovery.pid'=[string]$ExpectedPid; 'recovery.header_ready'='1';
-        'reporting.header_valid'='true'; 'reporting.artifact_version'='459776'; 'reporting.pid'=[string]$ExpectedPid;
+        'recovery.artifact_version'='460032'; 'recovery.pid'=[string]$ExpectedPid; 'recovery.header_ready'='1';
+        'reporting.header_valid'='true'; 'reporting.artifact_version'='460032'; 'reporting.pid'=[string]$ExpectedPid;
         'reporting.current_ready'='true'
     }
     if($ExpectedImagePath) {
@@ -385,7 +385,7 @@ function Invoke-LeechRecoveryRequest {
     $inventoryPath = [IO.Path]::GetFullPath($RuntimeInventory)
     if ($inventoryPath.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase) -or
         (Get-FileHash -LiteralPath $inventoryPath -Algorithm SHA256).Hash -cne $InventorySha256 -or
-        [Diagnostics.FileVersionInfo]::GetVersionInfo($inventoryPath).FileVersion -cne '0.7.4.0') { throw 'Inventory tool identity/version rejected.' }
+        [Diagnostics.FileVersionInfo]::GetVersionInfo($inventoryPath).FileVersion -cne '0.7.5.0') { throw 'Inventory tool identity/version rejected.' }
     $permission = Read-LeechPermission ([IO.Path]::Combine($bin,'RS2LeechRecovery.ini')) $root
     if($permission.Schema -eq 2 -and !$TargetRoot){throw 'Pilot requests require an explicit -TargetRoot.'}
     $operator = [Security.Principal.WindowsIdentity]::GetCurrent()

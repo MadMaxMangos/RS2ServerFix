@@ -140,7 +140,7 @@ $run=Join-Path $caseRoot ('20260917T000000Z-PID123-'+$runId)
 $identity=@{pid='123';process_creation_filetime=[string]$created;'reporting.run_id'=$runId;'reporting.ownerThreadId'='4';
     'reporting.mode'='3';'reporting.qpc_frequency'='1000000';host_sha256=$script:ReportHostHash}
 $startup=[ordered]@{schema=3;type='startup';run_id=$runId;pid=123;sequence=0;qpc=1;
-    artifact='RS2ServerFix-steam-reporting';version='0.7.4.0';artifact_version=459776;
+    artifact='RS2ServerFix-steam-reporting';version='0.7.5.0';artifact_version=460032;
     process_start_filetime=$created;qpc_frequency=1000000;mode='repair';configured_mode=3;header_validity=31;
     diagnostics='normal';anchor_interval_seconds=10;host_sha256=$script:ReportHostHash;
     qualified_steam_api_sha256=$script:ReportSdkHash;qualified_steamclient_sha256=$script:ReportClientHash;
@@ -434,9 +434,9 @@ foreach($badCase in @('phase','event','restart','reason')) {
     Reject {Read-ReportLog $badPath $identity $run 16MB 0 100 @() -TrainingRecoveryMode} 'Nonreserved recovery pause event accepted.'
 }
 $inventoryRecovery=@{pid='123';'reporting.pid'='123';'reporting.run_id'=$runId;'reporting.schema'='3';'reporting.bytes'='3896';
-    'reporting.artifact_version'='459776';'reporting.header_valid'='true';'reporting.identity_complete'='true';
+    'reporting.artifact_version'='460032';'reporting.header_valid'='true';'reporting.identity_complete'='true';
     'reporting.header_validity'='31';'reporting.qpc_frequency'='1000000';'recovery.snapshot_result'='Coherent';
-    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='459776';'recovery.pid'='123';
+    'recovery.schema'='1';'recovery.bytes'='256';'recovery.artifact_version'='460032';'recovery.pid'='123';
     'recovery.run_id'=$runId;'recovery.header_ready'='1';'recovery.owner_sequence'='2'}
 foreach($name in $script:RecoveryPayloadNames){$inventoryRecovery['recovery.'+$name]=[string]$recoveryRecord['recovery_'+$name]}
 $null=Assert-ReportRecoveryFields $inventoryRecovery
@@ -1039,7 +1039,7 @@ foreach($point in @(@($fixtureStart,0,1),@($fixtureEnd,3,9),@($fixtureFinal,4,13
         host_sha256=$script:ReportHostHash;sdk_sha256=$script:ReportSdkHash;steamclient_sha256=$script:ReportClientHash;
         observed_bootstrap_sha256=('B'*64);bootstrap_sha256=('B'*64);observed_companion_sha256=$artifact;companion_sha256=$artifact;
         'reporting.mode'='2';'reporting.qpc_frequency'=[string]$fixtureFrequency;'reporting.ownerThreadId'='4';
-        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='459776';'reporting.header_validity'='31';
+        'reporting.schema'='3';'reporting.bytes'='3896';'reporting.artifact_version'='460032';'reporting.header_validity'='31';
         'reporting.pid'='123';'reporting.process_creation'=[string]$created;
         'reporting.lastOwnerQpc'=[string]$point[0];'reporting.observed_qpc'=[string]$point[0];
         expect='proxy-pass';deployment_mode='active';expected_recon='corrected';observed_recon='corrected';

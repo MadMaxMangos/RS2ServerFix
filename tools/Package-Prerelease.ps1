@@ -86,6 +86,7 @@ foreach ($variant in @('recon','guard-probe')) {
         Write-Utf8 $probePath $probe
         $detail = @'
 EXPERIMENTAL READ-ONLY GUARD PROBE. The recovery native calls are compiled out.
+The package-check bypass is compiled out; the game's stock safelist check runs.
 Reporting is observe/normal; manual recovery is disabled. Do not enable recovery
 or deploy to production from this automated build. This does not establish Steam
 outage recovery, browser-count repair, performance or production qualification.
