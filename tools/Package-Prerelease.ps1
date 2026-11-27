@@ -26,6 +26,17 @@ $buildGenerator = $generatorEntry[0].Substring('CMAKE_GENERATOR:INTERNAL='.Lengt
 $guardDll = Join-Path $buildRoot 'diagnostic/guard-probe/Release/RS2ServerFix.dll'
 $reconDll = Join-Path $buildRoot 'production/active/Release/RS2ServerFix.dll'
 $bootstrap = Join-Path $buildRoot 'production/bootstrap/Release/X3DAudio1_7.dll'
+$guardBytes = [IO.File]::ReadAllBytes($guardDll)
+$guardAscii = [Text.Encoding]::ASCII.GetString($guardBytes)
+$guardUtf16Even = [Text.Encoding]::Unicode.GetString($guardBytes)
+$guardUtf16Odd = [Text.Encoding]::Unicode.GetString($guardBytes, 1, $guardBytes.Length - 1)
+foreach ($marker in @('RS2PackageCheck.ini','AllowAnyMutator','[RS2PackageCheck]',
+        'RS2ServerFix.packagecheck.')) {
+    if ($guardAscii.Contains($marker) -or $guardUtf16Even.Contains($marker) -or
+        $guardUtf16Odd.Contains($marker)) {
+        throw "Guard-probe DLL contains package-check bypass marker: $marker"
+    }
+}
 $shortCommit = $Commit.Substring(0,12)
 $stage = Join-Path $buildRoot ('prerelease-stage-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $stage,$outputRoot -ErrorAction Stop | Out-Null

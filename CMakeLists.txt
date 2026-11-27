@@ -469,8 +469,7 @@ set(RS2_REPORTING_SOURCES
   src/companion/steam_reporting_ancestry.cpp src/companion/steam_reporting_prepared.cpp
   src/companion/steam_reporting_capture.cpp src/companion/steam_reporting_records.cpp
   src/companion/steam_reporting_task.cpp src/companion/steam_reporting_client.cpp
-  src/companion/steam_reporting_runtime.cpp src/companion/steam_reporting_forward.cpp
-  src/companion/package_check.cpp)
+  src/companion/steam_reporting_runtime.cpp src/companion/steam_reporting_forward.cpp)
 set(RS2_REPORTING_VARIANT_DIR production/reporting)
 if(RS2_RECOVERY_GUARD_PROBE)
   set(RS2_REPORTING_VARIANT_DIR diagnostic/guard-probe)
@@ -479,6 +478,9 @@ rs2_companion(rs2_server_fix_companion_reporting ${RS2_REPORTING_VARIANT_DIR}
   "RS2ServerFix Active Recon Steam Reporting Companion" "0.7.5.0" "0,7,5,0"
   src/companion/RS2ServerFixReporting.def)
 target_sources(rs2_server_fix_companion_reporting PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
+if(NOT RS2_RECOVERY_GUARD_PROBE)
+  target_sources(rs2_server_fix_companion_reporting PRIVATE src/companion/package_check.cpp)
+endif()
 target_compile_definitions(rs2_server_fix_companion_reporting PRIVATE
   RS2_RECON_ACTIVE RS2_STEAM_OBSERVER RS2_STEAM_REPORTING)
 if(RS2_RECOVERY_GUARD_PROBE)
@@ -544,7 +546,8 @@ rs2_bootstrap(rs2_reporting_fixture_bootstrap test-reporting/bootstrap "RS2Serve
 rs2_companion(rs2_reporting_fixture_companion test-reporting/companion
   "RS2ServerFix Test Fixture Steam Reporting Companion" "0.7.5.0" "0,7,5,0"
   src/companion/RS2ServerFixReporting.def)
-target_sources(rs2_reporting_fixture_companion PRIVATE ${RS2_OBSERVER_SOURCES} ${RS2_REPORTING_SOURCES})
+target_sources(rs2_reporting_fixture_companion PRIVATE ${RS2_OBSERVER_SOURCES}
+  ${RS2_REPORTING_SOURCES} src/companion/package_check.cpp)
 target_compile_definitions(rs2_reporting_fixture_companion PRIVATE RS2_RECON_ACTIVE RS2_STEAM_OBSERVER RS2_STEAM_REPORTING)
 target_link_libraries(rs2_reporting_fixture_companion PRIVATE advapi32)
 foreach(target rs2_reporting_fixture_bootstrap rs2_reporting_fixture_companion)
